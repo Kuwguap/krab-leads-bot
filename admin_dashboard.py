@@ -4,6 +4,10 @@ from flask_cors import CORS
 from utils.database import Database
 import os
 
+# IMPORTANT: This admin dashboard does NOT use Telegram bot functionality.
+# It only manages the database (groups, drivers) via Flask web API.
+# The Telegram bot runs separately in bot.py as a background worker.
+
 app = Flask(__name__)
 CORS(app)
 db = Database()
@@ -387,8 +391,6 @@ def api_drivers():
         if db.create_driver(driver_name, driver_telegram_id, phone_number):
             return jsonify({"success": True, "message": "Driver added successfully!"})
         return jsonify({"success": False, "error": "Error adding driver"}), 500
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
