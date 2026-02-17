@@ -912,23 +912,25 @@ def main():
     # Create application
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     
-    # Check and clear webhook if set (webhooks conflict with polling)
-    # Use synchronous requests to avoid event loop issues
+    # Always delete webhook before polling (avoids 409 when webhook was set elsewhere)
     import requests
+    import time
+    bot_token = Config.TELEGRAM_BOT_TOKEN
+    delete_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
     try:
-        bot_token = Config.TELEGRAM_BOT_TOKEN
-        webhook_url = f"https://api.telegram.org/bot{bot_token}/getWebhookInfo"
-        response = requests.get(webhook_url, timeout=5)
-        if response.status_code == 200:
-            webhook_data = response.json()
-            if webhook_data.get("result", {}).get("url"):
-                logger.warning(f"Webhook detected at {webhook_data['result']['url']} - clearing it for polling mode...")
-                delete_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
-                delete_response = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=5)
-                if delete_response.status_code == 200:
-                    logger.info("Webhook cleared successfully!")
+        delete_response = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=10)
+        if delete_response.status_code == 200:
+            data = delete_response.json()
+            if data.get("ok"):
+                logger.info("Webhook cleared (or was already clear) - safe to poll.")
+            else:
+                logger.warning(f"deleteWebhook response: {data}")
+        else:
+            logger.warning(f"deleteWebhook HTTP {delete_response.status_code}: {delete_response.text}")
     except Exception as e:
-        logger.warning(f"Could not check/clear webhook: {e}")
+        logger.warning(f"Could not clear webhook: {e}")
+    # Brief delay so Telegram releases any previous consumer before we start polling
+    time.sleep(2)
     
     # Add error handler for all errors
     _conflict_logged = False  # Flag to prevent repeated logging
@@ -944,12 +946,10 @@ def main():
                 _conflict_logged = True
                 logger.error(
                     "\n" + "="*60 + "\n"
-                    "TELEGRAM CONFLICT ERROR: Multiple bot instances detected!\n\n"
-                    "Solution:\n"
-                    "1. Run: python stop_bot.py (to find running processes)\n"
-                    "2. Stop all bot instances (Ctrl+C in all terminals)\n"
-                    "3. Wait 10 seconds\n"
-                    "4. Start only ONE instance: python bot.py\n"
+                    "TELEGRAM CONFLICT ERROR: Another process is already receiving updates for this bot.\n\n"
+                    "On Render: Use only ONE Background Worker running 'python bot.py'. "
+                    "Do not run bot.py on a Web service (it can spawn multiple instances).\n"
+                    "Also: clear any webhook (e.g. run check_webhook.py once), then redeploy.\n"
                     "="*60
                 )
                 # Exit gracefully after logging

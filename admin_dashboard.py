@@ -541,6 +541,7 @@ def api_toggle_driver(driver_id):
 
 
 if __name__ == '__main__':
-    port = int(os.getenv('ADMIN_PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Render sets PORT for web services; fallback to ADMIN_PORT or 5000
+    port = int(os.getenv('PORT', os.getenv('ADMIN_PORT', 5000)))
+    app.run(host='0.0.0.0', port=port, debug=os.getenv('FLASK_DEBUG', 'false').lower() == 'true')
 
