@@ -336,6 +336,83 @@ def toggle_driver(driver_id):
         return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
 
 
+# --- JSON API for Vercel frontend (no iframe) ---
+
+def _get_json_or_form():
+    """Get request data from JSON body or form (for API and legacy)."""
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return request.form
+
+
+@app.route('/api/groups', methods=['GET', 'POST'])
+def api_groups():
+    if request.method == 'GET':
+        try:
+            groups = db.get_all_groups()
+            return jsonify(groups or [])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # POST: create group
+    try:
+        data = _get_json_or_form()
+        group_name = data.get('group_name') or request.form.get('group_name')
+        group_telegram_id = data.get('group_telegram_id') or request.form.get('group_telegram_id')
+        supervisory_telegram_id = data.get('supervisory_telegram_id') or request.form.get('supervisory_telegram_id')
+        if not all([group_name, group_telegram_id, supervisory_telegram_id]):
+            return jsonify({"success": False, "error": "Missing group_name, group_telegram_id, or supervisory_telegram_id"}), 400
+        if db.create_group(group_name, group_telegram_id, supervisory_telegram_id):
+            return jsonify({"success": True, "message": "Group added successfully!"})
+        return jsonify({"success": False, "error": "Error adding group"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/drivers', methods=['GET', 'POST'])
+def api_drivers():
+    if request.method == 'GET':
+        try:
+            drivers = db.get_all_drivers()
+            return jsonify(drivers or [])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # POST: create driver
+    try:
+        data = _get_json_or_form()
+        driver_name = data.get('driver_name') or request.form.get('driver_name')
+        driver_telegram_id = data.get('driver_telegram_id') or request.form.get('driver_telegram_id')
+        phone_number = data.get('phone_number') or request.form.get('phone_number') or None
+        if not driver_name or not driver_telegram_id:
+            return jsonify({"success": False, "error": "Missing driver_name or driver_telegram_id"}), 400
+        if db.create_driver(driver_name, driver_telegram_id, phone_number):
+            return jsonify({"success": True, "message": "Driver added successfully!"})
+        return jsonify({"success": False, "error": "Error adding driver"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/groups/<group_id>/toggle', methods=['POST'])
+def api_toggle_group(group_id):
+    """Toggle group active status."""
+    try:
+        if db.toggle_group_status(group_id):
+            return jsonify({"success": True, "message": "Group status updated!"})
+        return jsonify({"success": False, "error": "Error updating group"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/drivers/<driver_id>/toggle', methods=['POST'])
+def api_toggle_driver(driver_id):
+    """Toggle driver active status."""
+    try:
+        if db.toggle_driver_status(driver_id):
+            return jsonify({"success": True, "message": "Driver status updated!"})
+        return jsonify({"success": False, "error": "Error updating driver"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == '__main__':
