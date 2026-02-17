@@ -1,16 +1,137 @@
 """Simple Flask admin dashboard for managing groups, drivers, and supervisory IDs."""
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 from flask_cors import CORS
-from utils.database import Database
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 
-# IMPORTANT: This admin dashboard does NOT use Telegram bot functionality.
-# It only manages the database (groups, drivers) via Flask web API.
-# The Telegram bot runs separately in bot.py as a background worker.
+# Load .env file explicitly (admin dashboard doesn't need Telegram bot token)
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
+
+# Import Supabase directly - admin dashboard only needs Supabase, NOT Telegram
+from supabase import create_client, Client
 
 app = Flask(__name__)
 CORS(app)
-db = Database()
+
+# Create Supabase client directly (bypass Config to avoid Telegram dependencies)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+
+# Create a minimal database wrapper for admin dashboard
+class AdminDatabase:
+    """Minimal database wrapper for admin dashboard (no Telegram dependencies)."""
+    def __init__(self):
+        self.client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self._tables_checked = False
+        self._tables_exist = False
+    
+    def _check_tables_exist(self) -> bool:
+        """Check if required tables exist."""
+        if self._tables_checked:
+            return self._tables_exist
+        try:
+            self.client.table("groups").select("id").limit(1).execute()
+            self._tables_checked = True
+            self._tables_exist = True
+            return True
+        except Exception:
+            self._tables_checked = True
+            self._tables_exist = False
+            return False
+    
+    def get_all_groups(self) -> list:
+        """Get all groups."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            response = self.client.table("groups").select("*").order("group_name").execute()
+            return response.data or []
+        except Exception:
+            return []
+    
+    def get_all_drivers(self) -> list:
+        """Get all drivers."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            response = self.client.table("drivers").select("*").order("driver_name").execute()
+            return response.data or []
+        except Exception:
+            return []
+    
+    def create_group(self, group_name: str, group_telegram_id: str, supervisory_telegram_id: str) -> bool:
+        """Create a new group."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("groups").insert({
+                "group_name": group_name,
+                "group_telegram_id": group_telegram_id,
+                "supervisory_telegram_id": supervisory_telegram_id
+            }).execute()
+            return True
+        except Exception:
+            return False
+    
+    def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: str = None) -> bool:
+        """Create a new driver."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("drivers").insert({
+                "driver_name": driver_name,
+                "driver_telegram_id": driver_telegram_id,
+                "phone_number": phone_number
+            }).execute()
+            return True
+        except Exception:
+            return False
+    
+    def get_group_by_id(self, group_id: str):
+        """Get a group by ID."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            response = self.client.table("groups").select("*").eq("id", group_id).execute()
+            return response.data[0] if response.data else None
+        except Exception:
+            return None
+    
+    def toggle_group_status(self, group_id: str) -> bool:
+        """Toggle group active status."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            group = self.get_group_by_id(group_id)
+            if group:
+                new_status = not group.get('is_active', True)
+                self.client.table("groups").update({"is_active": new_status}).eq("id", group_id).execute()
+                return True
+            return False
+        except Exception:
+            return False
+    
+    def toggle_driver_status(self, driver_id: str) -> bool:
+        """Toggle driver active status."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            driver = self.client.table("drivers").select("*").eq("id", driver_id).execute()
+            if driver.data:
+                current_status = driver.data[0].get('is_active', True)
+                new_status = not current_status
+                self.client.table("drivers").update({"is_active": new_status}).eq("id", driver_id).execute()
+                return True
+            return False
+        except Exception:
+            return False
+
+db = AdminDatabase()
 
 # Simple HTML template for the dashboard
 DASHBOARD_HTML = """
@@ -391,6 +512,8 @@ def api_drivers():
         if db.create_driver(driver_name, driver_telegram_id, phone_number):
             return jsonify({"success": True, "message": "Driver added successfully!"})
         return jsonify({"success": False, "error": "Error adding driver"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

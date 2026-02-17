@@ -40,10 +40,10 @@ STATE_WAITING_REFERENCE_ID = 4  # Waiting for reference ID input
 STATE_WAITING_RECEIPT_CONFIRM = 5  # Waiting for receipt confirmation
 STATE_WAITING_RECEIPT_IMAGE = 6  # Waiting for receipt image upload
 
-# Services will be initialized in main() after config validation
-db = None
-ots = None
-monday = None
+# Initialize services
+db = Database()
+ots = OneTimeSecret()
+monday = MondayClient() if Config.is_monday_configured() else None
 
 
 def generate_reference_id() -> str:
@@ -128,11 +128,6 @@ def parse_phase1_structured(message_text: str) -> dict:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and initialize state."""
-    if db is None:
-        await update.message.reply_text("❌ Bot services not initialized. Please contact admin.")
-        logger.error("Database service not initialized when /start was called")
-        return ConversationHandler.END
-    
     user = update.effective_user
     user_id = user.id
     username = user.username or "Unknown"
@@ -166,10 +161,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle Phase 1: Vehicle and delivery details."""
-    if db is None:
-        await update.message.reply_text("❌ Bot services not initialized. Please contact admin.")
-        return ConversationHandler.END
-    
     user_id = update.effective_user.id
     message_text = update.message.text
     
@@ -188,10 +179,6 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle Phase 2: Phone number and price, then process the lead."""
-    if db is None or ots is None:
-        await update.message.reply_text("❌ Bot services not initialized. Please contact admin.")
-        return ConversationHandler.END
-    
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     message_text = update.message.text
@@ -913,8 +900,6 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main():
     """Main function to start the bot."""
-    global db, ots, monday
-    
     # Validate configuration
     try:
         Config.validate()
@@ -924,23 +909,8 @@ def main():
         logger.error("Missing variables should be set in the .env file in the project root directory.")
         return
     
-    # Initialize services AFTER config validation
-    try:
-        logger.info("Initializing services...")
-        db = Database()
-        ots = OneTimeSecret()
-        monday = MondayClient() if Config.is_monday_configured() else None
-        logger.info("Services initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize services: {e}", exc_info=True)
-        return
-    
     # Create application
-    try:
-        application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-    except Exception as e:
-        logger.error(f"Failed to create Telegram application: {e}", exc_info=True)
-        return
+    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     
     # Check and clear webhook if set (webhooks conflict with polling)
     # Use synchronous requests to avoid event loop issues

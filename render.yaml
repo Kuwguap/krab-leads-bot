@@ -1,6 +1,5 @@
 services:
-  # Telegram Bot - Background Worker (polling mode)
-  - type: worker
+  - type: web
     name: krabsleads-bot
     env: python
     buildCommand: pip install -r requirements.txt
@@ -26,19 +25,5 @@ services:
         sync: false
       - key: SUPERVISORY_TELEGRAM_ID
         sync: false
-
-  # Admin Dashboard - Web Service (Flask API)
-  - type: web
-    name: krabsleads-admin
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python admin_dashboard.py
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
-      - key: ADMIN_PORT
-        value: "10000"
 
 
