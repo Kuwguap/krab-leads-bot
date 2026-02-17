@@ -252,6 +252,53 @@ class Database:
             logger.error(f"Error toggling group status: {e}")
             return False
     
+    # Group assistants: Telegram IDs that send leads into this group
+    def get_group_by_assistant_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
+        """Return the group that has this telegram_id as an assistant (first if multiple)."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = self.client.table("group_assistants").select("group_id").eq("telegram_id", str(telegram_id)).limit(1).execute()
+            if not r.data:
+                return None
+            return self.get_group_by_id(r.data[0]["group_id"])
+        except Exception as e:
+            logger.error(f"Error getting group by assistant: {e}")
+            return None
+
+    def get_group_assistants(self, group_id: str) -> list:
+        """Return list of {telegram_id} for assistants assigned to this group."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("group_assistants").select("telegram_id").eq("group_id", group_id).execute()
+            return [x["telegram_id"] for x in (r.data or [])]
+        except Exception as e:
+            logger.error(f"Error getting group assistants: {e}")
+            return []
+
+    def add_group_assistant(self, group_id: str, telegram_id: str) -> bool:
+        """Assign an assistant (Telegram user ID) to a group."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_assistants").insert({"group_id": group_id, "telegram_id": str(telegram_id).strip()}).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding group assistant: {e}")
+            return False
+
+    def remove_group_assistant(self, group_id: str, telegram_id: str) -> bool:
+        """Remove an assistant from a group."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_assistants").delete().eq("group_id", group_id).eq("telegram_id", str(telegram_id).strip()).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error removing group assistant: {e}")
+            return False
+
     # Driver management methods
     def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: Optional[str] = None) -> bool:
         """Create a new driver."""

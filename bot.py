@@ -222,7 +222,6 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     reference_id = generate_reference_id()
     
     # Determine which group this lead belongs to
-    # For now, use the first active group (you can enhance this logic later)
     groups = db.get_all_groups()
     active_groups = [g for g in groups if g.get('is_active', True)]
     
@@ -230,9 +229,20 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
     
-    # Use the first active group (or implement group selection logic)
-    selected_group = active_groups[0]
-    group_id = selected_group['id']
+    # If user is an assistant for a group, use that group; else use first active group
+    user_telegram_id = str(update.effective_user.id)
+    assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
+    if assistant_group and assistant_group.get('is_active', True):
+        selected_group = assistant_group
+        group_id = selected_group['id']
+        logger.info(f"User is assistant for group '{selected_group.get('group_name')}'; using that group for lead")
+    else:
+        selected_group = active_groups[0]
+        group_id = selected_group['id']
+    logger.info(
+        f"Using group '{selected_group.get('group_name')}' (id={group_id}, "
+        f"group_telegram_id={selected_group.get('group_telegram_id')}) for lead"
+    )
     
     # Store lead data temporarily in user state (before creating lead)
     # We'll create the lead after driver selection
@@ -464,36 +474,51 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # Send to selected drivers
     assigned_count = 0
     for driver in selected_drivers:
-        driver_telegram_id = driver.get('driver_telegram_id')
-        if driver_telegram_id:
+        driver_telegram_id_raw = driver.get('driver_telegram_id')
+        if driver_telegram_id_raw:
+            try:
+                driver_chat_id = int(str(driver_telegram_id_raw).strip())
+            except (ValueError, TypeError):
+                driver_chat_id = driver_telegram_id_raw
             try:
                 # Create assignment record
                 db.create_lead_assignment(lead['id'], driver['id'], group_id)
-                
-                # Send message with accept/decline buttons
                 await context.bot.send_message(
-                    chat_id=driver_telegram_id,
+                    chat_id=driver_chat_id,
                     text=driver_request_message,
                     parse_mode="Markdown",
                     reply_markup=accept_keyboard
                 )
                 assigned_count += 1
             except Exception as e:
-                logger.error(f"Error sending to driver {driver.get('driver_name')}: {e}")
+                logger.error(f"Error sending to driver {driver.get('driver_name')} (chat_id={driver_chat_id}): {e!r}")
     
     logger.info(f"Sent lead request to {assigned_count} drivers")
     
     # Send to Group (detailed message without user, phone, and price)
-    group_telegram_id = selected_group.get('group_telegram_id')
-    if group_telegram_id:
+    group_telegram_id_raw = selected_group.get('group_telegram_id')
+    group_name = selected_group.get('group_name', 'N/A')
+    if not group_telegram_id_raw:
+        logger.warning(
+            f"No group_telegram_id for group '{group_name}' (id={selected_group.get('id')}). "
+            "Lead not sent to group. Check the group record in admin."
+        )
+    else:
+        # Telegram expects numeric chat_id as int (e.g. -1001234567890)
         try:
-            await context.bot.send_message(
-                chat_id=group_telegram_id,
-                text=group_message,
-                parse_mode="Markdown"
-            )
+            group_chat_id = int(str(group_telegram_id_raw).strip())
+        except (ValueError, TypeError):
+            group_chat_id = group_telegram_id_raw
+        try:
+            logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
+            # No parse_mode so user content (vehicle_details, etc.) can't break Markdown
+            await context.bot.send_message(chat_id=group_chat_id, text=group_message)
+            logger.info(f"Lead sent to group '{group_name}' successfully")
         except Exception as e:
-            logger.error(f"Error sending to group: {e}")
+            logger.error(
+                f"Error sending to group '{group_name}' (chat_id={group_chat_id}): {e!r}. "
+                "Ensure the bot is added to the group and has permission to post."
+            )
     
     # Supervisory message with reference ID (use group's supervisory ID)
     supervisory_telegram_id = selected_group.get('supervisory_telegram_id')
@@ -511,14 +536,18 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # Send to Supervisory (full log with phone and price)
     if supervisory_telegram_id:
         try:
+            sup_chat_id = int(str(supervisory_telegram_id).strip())
+        except (ValueError, TypeError):
+            sup_chat_id = supervisory_telegram_id
+        try:
             await context.bot.send_message(
-                chat_id=supervisory_telegram_id,
+                chat_id=sup_chat_id,
                 text=supervisory_message,
                 parse_mode="Markdown",
                 reply_markup=supervisory_keyboard
             )
         except Exception as e:
-            logger.error(f"Error sending to supervisory: {e}")
+            logger.error(f"Error sending to supervisory (chat_id={sup_chat_id}): {e!r}")
     
     # Clear user state
     db.clear_user_state(user_id)

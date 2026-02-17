@@ -5,6 +5,7 @@ const API = process.env.NEXT_PUBLIC_ADMIN_BACKEND_URL || '';
 export default function AdminPanel() {
   const [groups, setGroups] = useState([]);
   const [drivers, setDrivers] = useState([]);
+  const [assistantsByGroup, setAssistantsByGroup] = useState({});
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
   const [messageType, setMessageType] = useState('success');
@@ -35,6 +36,19 @@ export default function AdminPanel() {
     }
   }, []);
 
+  const fetchAssistantsForGroups = useCallback(async (groupList) => {
+    const next = {};
+    for (const g of groupList || []) {
+      try {
+        const res = await fetch(`${API}/api/groups/${g.id}/assistants`);
+        next[g.id] = res.ok ? await res.json() : [];
+      } catch {
+        next[g.id] = [];
+      }
+    }
+    setAssistantsByGroup(next);
+  }, []);
+
   useEffect(() => {
     if (!API) {
       setLoading(false);
@@ -43,10 +57,16 @@ export default function AdminPanel() {
     }
     (async () => {
       setLoading(true);
-      await Promise.all([fetchGroups(), fetchDrivers()]);
+      await fetchGroups();
+      await fetchDrivers();
       setLoading(false);
     })();
   }, [fetchGroups, fetchDrivers]);
+
+  useEffect(() => {
+    if (!API || groups.length === 0) return;
+    fetchAssistantsForGroups(groups);
+  }, [API, groups, fetchAssistantsForGroups]);
 
   async function handleAddGroup(e) {
     e.preventDefault();
@@ -134,6 +154,45 @@ export default function AdminPanel() {
         fetchDrivers();
       } else {
         showMessage(data.error || 'Failed to update driver', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function handleAddAssistant(groupId, telegramId) {
+    const tid = String(telegramId).trim();
+    if (!tid) {
+      showMessage('Enter assistant Telegram ID.', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`${API}/api/groups/${groupId}/assistants`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ telegram_id: tid }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Assistant added!');
+        fetchAssistantsForGroups(groups);
+      } else {
+        showMessage(data.error || 'Failed to add assistant', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function handleRemoveAssistant(groupId, telegramId) {
+    try {
+      const res = await fetch(`${API}/api/groups/${groupId}/assistants/${encodeURIComponent(String(telegramId))}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Assistant removed!');
+        setAssistantsByGroup((prev) => ({ ...prev, [groupId]: (prev[groupId] || []).filter((t) => t !== String(telegramId)) }));
+      } else {
+        showMessage(data.error || 'Failed to remove assistant', 'error');
       }
     } catch {
       showMessage('Network error.', 'error');
@@ -244,6 +303,53 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+        </section>
+
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Group Assistants</h2>
+          <p style={{ marginBottom: 16, color: '#555' }}>Assistants use the bot like normal; their leads go to the group they are assigned to.</p>
+          {groups.map((g) => (
+            <div key={g.id} style={{ marginBottom: 20, padding: 12, background: '#fff', borderRadius: 6, border: '1px solid #ddd' }}>
+              <strong>{g.group_name}</strong> — Assistants (Telegram IDs):
+              <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
+                {(assistantsByGroup[g.id] || []).length === 0 ? (
+                  <li style={{ color: '#888' }}>None yet</li>
+                ) : (
+                  (assistantsByGroup[g.id] || []).map((tid) => (
+                    <li key={tid}>
+                      <code>{tid}</code>{' '}
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveAssistant(g.id, tid)}
+                        style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger, marginLeft: 8 }}
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  ))
+                )}
+              </ul>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const input = e.target.querySelector('input[name="telegram_id"]');
+                  if (input) {
+                    handleAddAssistant(g.id, input.value);
+                    input.value = '';
+                  }
+                }}
+                style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}
+              >
+                <input
+                  type="text"
+                  name="telegram_id"
+                  placeholder="Assistant Telegram ID (e.g. 123456789)"
+                  style={{ ...styles.input, width: 220 }}
+                />
+                <button type="submit" style={styles.button}>Add Assistant</button>
+              </form>
+            </div>
+          ))}
         </section>
 
         <section style={styles.section}>

@@ -131,6 +131,37 @@ class AdminDatabase:
         except Exception:
             return False
 
+    # Group assistants (Telegram IDs that send leads into this group)
+    def get_group_assistants(self, group_id: str) -> list:
+        """Return list of telegram_id strings for assistants assigned to this group."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("group_assistants").select("telegram_id").eq("group_id", group_id).execute()
+            return [x["telegram_id"] for x in (r.data or [])]
+        except Exception:
+            return []
+
+    def add_group_assistant(self, group_id: str, telegram_id: str) -> bool:
+        """Assign an assistant (Telegram user ID) to a group."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_assistants").insert({"group_id": group_id, "telegram_id": str(telegram_id).strip()}).execute()
+            return True
+        except Exception:
+            return False
+
+    def remove_group_assistant(self, group_id: str, telegram_id: str) -> bool:
+        """Remove an assistant from a group."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_assistants").delete().eq("group_id", group_id).eq("telegram_id", str(telegram_id).strip()).execute()
+            return True
+        except Exception:
+            return False
+
 db = AdminDatabase()
 
 # Simple HTML template for the dashboard
@@ -380,6 +411,30 @@ DASHBOARD_HTML = """
             </table>
         </div>
         
+        <!-- Group Assistants: Telegram IDs that send leads into each group -->
+        <div class="section">
+            <h2>👥 Group Assistants</h2>
+            <p style="margin-bottom: 15px; color: #555;">Assistants use the bot like normal; their leads go to the group they are assigned to.</p>
+            {% for group in groups %}
+            <div style="margin-bottom: 24px; padding: 12px; background: #fff; border-radius: 6px; border: 1px solid #ddd;">
+                <strong>{{ group.group_name }}</strong> — Assistants (Telegram IDs):
+                <ul style="margin: 8px 0; padding-left: 20px;">
+                    {% for tid in (groups_assistants.get(group.id) or []) %}
+                    <li><code>{{ tid }}</code> <a href="/remove_group_assistant/{{ group.id }}/{{ tid }}" style="margin-left: 8px; color: #dc3545; font-size: 12px;">Remove</a></li>
+                    {% endfor %}
+                    {% if not (groups_assistants.get(group.id) or []) %}
+                    <li style="color: #888;">None yet</li>
+                    {% endif %}
+                </ul>
+                <form method="POST" action="/add_group_assistant" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <input type="text" name="telegram_id" placeholder="Assistant Telegram ID (e.g. 123456789)" style="width: 220px; padding: 6px 10px;">
+                    <button type="submit" style="padding: 6px 12px;">Add Assistant</button>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+        
     </div>
 </body>
 </html>
@@ -392,12 +447,15 @@ def dashboard():
     try:
         groups = db.get_all_groups()
         drivers = db.get_all_drivers()
-        
+        groups_assistants = {}
+        for g in (groups or []):
+            groups_assistants[g['id']] = db.get_group_assistants(g['id'])
         return render_template_string(
             DASHBOARD_HTML,
             groups=groups or [],
             drivers=drivers or [],
-            assignments=[],  # No longer used
+            groups_assistants=groups_assistants,
+            assignments=[],
             message=request.args.get('message'),
             message_type=request.args.get('type', 'success')
         )
@@ -461,6 +519,32 @@ def toggle_driver(driver_id):
         return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
 
 
+@app.route('/add_group_assistant', methods=['POST'])
+def add_group_assistant():
+    """Add an assistant (Telegram ID) to a group (legacy form)."""
+    try:
+        group_id = request.form.get('group_id')
+        telegram_id = (request.form.get('telegram_id') or '').strip()
+        if not group_id or not telegram_id:
+            return redirect(url_for('dashboard', message='Missing group or Telegram ID', type='error'))
+        if db.add_group_assistant(group_id, telegram_id):
+            return redirect(url_for('dashboard', message='Assistant added!', type='success'))
+        return redirect(url_for('dashboard', message='Error adding assistant', type='error'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/remove_group_assistant/<group_id>/<telegram_id>')
+def remove_group_assistant(group_id, telegram_id):
+    """Remove an assistant from a group (legacy link)."""
+    try:
+        if db.remove_group_assistant(group_id, telegram_id):
+            return redirect(url_for('dashboard', message='Assistant removed!', type='success'))
+        return redirect(url_for('dashboard', message='Error removing assistant', type='error'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
 # --- JSON API for Vercel frontend (no iframe) ---
 
 def _get_json_or_form():
@@ -514,6 +598,40 @@ def api_drivers():
         return jsonify({"success": False, "error": "Error adding driver"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/groups/<group_id>/assistants', methods=['GET'])
+def api_group_assistants(group_id):
+    """List assistants (Telegram IDs) for a group."""
+    try:
+        ids = db.get_group_assistants(group_id)
+        return jsonify(ids)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/groups/<group_id>/assistants', methods=['POST'])
+def api_add_group_assistant(group_id):
+    """Add an assistant (Telegram user ID) to a group. Body: {"telegram_id": "123456789"}."""
+    try:
+        data = _get_json_or_form()
+        telegram_id = (data.get('telegram_id') or request.form.get('telegram_id') or '').strip()
+        if not telegram_id:
+            return jsonify({"success": False, "error": "Missing telegram_id"}), 400
+        if db.add_group_assistant(group_id, telegram_id):
+            return jsonify({"success": True, "message": "Assistant added!"})
+        return jsonify({"success": False, "error": "Error adding assistant"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/groups/<group_id>/assistants/<telegram_id>', methods=['DELETE'])
+def api_remove_group_assistant(group_id, telegram_id):
+    """Remove an assistant from a group."""
+    try:
+        if db.remove_group_assistant(group_id, telegram_id):
+            return jsonify({"success": True, "message": "Assistant removed!"})
+        return jsonify({"success": False, "error": "Error removing assistant"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
