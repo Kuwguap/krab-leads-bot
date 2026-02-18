@@ -33,6 +33,7 @@ logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
 # Conversation states
 STATE_PHASE1 = 1  # Waiting for vehicle and delivery details
 STATE_PHASE2 = 2  # Waiting for phone number and price
+STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistants_choose_group is on)
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 
 # Receipt submission states
@@ -229,7 +230,33 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
     
-    # If user is an assistant for a group, use that group; else use first active group
+    assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
+    
+    if assistants_choose_group:
+        # Anyone can send; they choose driver then group. Show group picker first (order: choose group then driver).
+        # Actually user said: "choose a driver then choose a group". So order is: driver first, then group.
+        # Re-read: "assistants prefer to choose groups" and "if assistants can choose groups ... anyone at all can send data choose a driver then choose a group".
+        # So flow when toggle is on: send data → choose driver → choose group. So we need to show driver picker first, then group picker.
+        # Wait - "assistants prefer to choose groups to send the lead to. so follow that order" - so the preferred order is choose group first. Then "if assistants can choose groups ... anyone at all can send data choose a driver then choose a group" - that might mean: anyone can send, and they choose driver then choose group (as in: they do two things: choose driver and choose group). So the order could be either. I'll do: when toggle on, show GROUP picker first, then driver picker (so: choose group → choose driver). That matches "assistants prefer to choose groups" (group choice first).
+        state_data = phase1_data.copy()
+        state_data.update({
+            "phone_number": phone_number,
+            "price": price,
+            "encrypted_data": encrypted_data,
+            "reference_id": reference_id,
+            "username": username
+        })
+        db.set_user_state(user_id, "select_group", state_data)
+        group_buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"select_group_{g['id']}")] for g in active_groups]
+        group_keyboard = InlineKeyboardMarkup(group_buttons)
+        await update.message.reply_text(
+            "✅ Phone and price received!\n\n**Select which group to send this lead to:**",
+            parse_mode="Markdown",
+            reply_markup=group_keyboard
+        )
+        return STATE_SELECT_GROUP
+    
+    # Use assigned group (assistant's group or first active)
     user_telegram_id = str(update.effective_user.id)
     assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
     if assistant_group and assistant_group.get('is_active', True):
@@ -244,8 +271,6 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         f"group_telegram_id={selected_group.get('group_telegram_id')}) for lead"
     )
     
-    # Store lead data temporarily in user state (before creating lead)
-    # We'll create the lead after driver selection
     state_data = phase1_data.copy()
     state_data.update({
         "phone_number": phone_number,
@@ -258,15 +283,12 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     })
     db.set_user_state(user_id, "select_driver", state_data)
     
-    # Get all active drivers (drivers work for all groups)
     drivers = db.get_all_drivers()
     active_drivers = [d for d in drivers if d.get('is_active', True)]
-    
     if not active_drivers:
         await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
     
-    # Create inline keyboard with all drivers
     keyboard_buttons = []
     for driver in drivers:
         keyboard_buttons.append([
@@ -275,16 +297,11 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 callback_data=f"select_driver_{driver['id']}"
             )
         ])
-    
-    # Add "Send to All" option
     keyboard_buttons.append([
         InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")
     ])
-    
     driver_keyboard = InlineKeyboardMarkup(keyboard_buttons)
-    
     driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
-    
     await update.message.reply_text(
         f"✅ Phone and price received!\n\n"
         f"**Select which driver(s) to notify:**\n\n"
@@ -293,12 +310,58 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode="Markdown",
         reply_markup=driver_keyboard
     )
-    
+    return STATE_SELECT_DRIVER
+
+
+async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle group selection when assistants_choose_group is on; then show driver picker."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await query.message.reply_text("❌ Error: Lead data not found. Please start over with /start")
+        return ConversationHandler.END
+    lead_data = state.get("data", {}).copy()
+    group_id = query.data.replace("select_group_", "")
+    selected_group = db.get_group_by_id(group_id)
+    if not selected_group or not selected_group.get("is_active", True):
+        await query.message.reply_text("❌ Group not found or inactive. Please start over with /start")
+        return ConversationHandler.END
+    lead_data["group_id"] = group_id
+    lead_data["selected_group"] = selected_group
+    db.set_user_state(user_id, "select_driver", lead_data)
+    drivers = db.get_all_drivers()
+    active_drivers = [d for d in drivers if d.get("is_active", True)]
+    if not active_drivers:
+        await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
+        return ConversationHandler.END
+    keyboard_buttons = []
+    for driver in drivers:
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                f"🚗 {driver.get('driver_name', 'Unknown')}",
+                callback_data=f"select_driver_{driver['id']}"
+            )
+        ])
+    keyboard_buttons.append([
+        InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")
+    ])
+    driver_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
+    await query.message.reply_text(
+        f"✅ Group selected: **{selected_group.get('group_name', 'N/A')}**\n\n"
+        f"**Select which driver(s) to notify:**\n\n"
+        f"Available drivers:\n{driver_list}\n\n"
+        f"Click a driver below or send to all:",
+        parse_mode="Markdown",
+        reply_markup=driver_keyboard
+    )
     return STATE_SELECT_DRIVER
 
 
 async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle driver selection after Phase 2."""
+    """Handle driver selection after Phase 2 (or after group selection when assistants_choose_group)."""
     query = update.callback_query
     await query.answer()
     
@@ -1005,6 +1068,7 @@ def main():
         states={
             STATE_PHASE1: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1)],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
+            STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

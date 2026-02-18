@@ -299,6 +299,31 @@ class Database:
             logger.error(f"Error removing group assistant: {e}")
             return False
 
+    # Settings (e.g. assistants_choose_group)
+    def get_setting(self, key: str) -> Optional[str]:
+        """Get a setting value by key. Returns None if not found or table missing."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = self.client.table("settings").select("value").eq("key", key).limit(1).execute()
+            if r.data and len(r.data) > 0:
+                return (r.data[0].get("value") or "").strip()
+            return None
+        except Exception as e:
+            logger.error(f"Error getting setting {key}: {e}")
+            return None
+
+    def set_setting(self, key: str, value: str) -> bool:
+        """Set a setting value. Upserts."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting {key}: {e}")
+            return False
+
     # Driver management methods
     def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: Optional[str] = None) -> bool:
         """Create a new driver."""

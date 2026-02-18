@@ -162,6 +162,70 @@ class AdminDatabase:
         except Exception:
             return False
 
+    # Settings
+    def get_setting(self, key: str) -> str:
+        """Get setting value; returns '' if missing or table missing."""
+        if not self._check_tables_exist():
+            return ""
+        try:
+            r = self.client.table("settings").select("value").eq("key", key).limit(1).execute()
+            if r.data and len(r.data) > 0:
+                return (r.data[0].get("value") or "").strip()
+            return ""
+        except Exception:
+            return ""
+
+    def set_setting(self, key: str, value: str) -> bool:
+        """Set setting (upsert)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
+            return True
+        except Exception:
+            return False
+
+    # Lead stats: total leads, per-driver accepted and receipts
+    def get_lead_stats(self) -> dict:
+        """Return { total_leads: int, drivers: [ { driver_id, driver_name, leads_accepted, receipts_submitted } ] }."""
+        out = {"total_leads": 0, "drivers": []}
+        if not self._check_tables_exist():
+            return out
+        try:
+            r = self.client.table("leads").select("id").execute()
+            out["total_leads"] = len(r.data or [])
+        except Exception:
+            pass
+        try:
+            drivers = self.client.table("drivers").select("id, driver_name").execute()
+            assignments = self.client.table("lead_assignments").select("driver_id, lead_id").eq("status", "accepted").execute()
+            lead_ids_with_receipt = set()
+            try:
+                leads = self.client.table("leads").select("id, receipt_image_url").execute()
+                lead_ids_with_receipt = {l["id"] for l in (leads.data or []) if l.get("receipt_image_url")}
+            except Exception:
+                pass
+            by_driver = {}
+            for a in (assignments.data or []):
+                did = a.get("driver_id")
+                lid = a.get("lead_id")
+                if did not in by_driver:
+                    by_driver[did] = {"accepted": 0, "receipts": 0}
+                by_driver[did]["accepted"] += 1
+                if lid and lid in lead_ids_with_receipt:
+                    by_driver[did]["receipts"] += 1
+            for d in (drivers.data or []):
+                did = d.get("id")
+                out["drivers"].append({
+                    "driver_id": did,
+                    "driver_name": d.get("driver_name", "N/A"),
+                    "leads_accepted": by_driver.get(did, {}).get("accepted", 0),
+                    "receipts_submitted": by_driver.get(did, {}).get("receipts", 0),
+                })
+        except Exception:
+            pass
+        return out
+
 db = AdminDatabase()
 
 # Simple HTML template for the dashboard
@@ -296,6 +360,44 @@ DASHBOARD_HTML = """
         {% if message %}
         <div class="message message-{{ message_type }}">{{ message }}</div>
         {% endif %}
+        
+        <!-- Settings: Allow assistants to choose group -->
+        <div class="section">
+            <h2>⚙️ Lead flow</h2>
+            <p style="margin-bottom: 10px; color: #555;">When <strong>Allow assistants to choose group</strong> is ON, anyone can send leads and will choose a group (and then a driver). When OFF, assistants use their assigned group.</p>
+            <p style="margin-bottom: 12px;"><strong>Current:</strong> {{ 'Allow assistants to choose group' if assistants_choose_group else 'Use assigned groups only' }}</p>
+            <form method="POST" action="/set_assistants_choose_group" style="display: inline;">
+                <input type="hidden" name="value" value="{{ '0' if assistants_choose_group else '1' }}">
+                <button type="submit" style="padding: 8px 16px;">{{ 'Use assigned groups only' if assistants_choose_group else 'Allow assistants to choose group' }}</button>
+            </form>
+        </div>
+        
+        <!-- Lead stats -->
+        <div class="section">
+            <h2>📊 Lead stats</h2>
+            <p style="margin-bottom: 12px;"><strong>Total leads sent:</strong> {{ lead_stats.get('total_leads', 0) }}</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Driver</th>
+                        <th>Leads accepted</th>
+                        <th>Receipts submitted</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for d in (lead_stats.get('drivers') or []) %}
+                    <tr>
+                        <td>{{ d.driver_name }}</td>
+                        <td>{{ d.leads_accepted }}</td>
+                        <td>{{ d.receipts_submitted }}</td>
+                    </tr>
+                    {% endfor %}
+                    {% if not (lead_stats.get('drivers') or []) %}
+                    <tr><td colspan="3" style="text-align: center; color: #888;">No drivers</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
         
         <!-- Add Group Section -->
         <div class="section">
@@ -450,11 +552,15 @@ def dashboard():
         groups_assistants = {}
         for g in (groups or []):
             groups_assistants[g['id']] = db.get_group_assistants(g['id'])
+        assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
+        lead_stats = db.get_lead_stats()
         return render_template_string(
             DASHBOARD_HTML,
             groups=groups or [],
             drivers=drivers or [],
             groups_assistants=groups_assistants,
+            assistants_choose_group=assistants_choose_group,
+            lead_stats=lead_stats,
             assignments=[],
             message=request.args.get('message'),
             message_type=request.args.get('type', 'success')
@@ -515,6 +621,17 @@ def toggle_driver(driver_id):
             return redirect(url_for('dashboard', message='Driver status updated!', type='success'))
         else:
             return redirect(url_for('dashboard', message='Error updating driver', type='error'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/set_assistants_choose_group', methods=['POST'])
+def set_assistants_choose_group():
+    """Toggle setting: value=1 means allow assistants to choose group, 0 means use assigned only."""
+    try:
+        val = (request.form.get("value") or "0").strip()
+        db.set_setting("assistants_choose_group", "true" if val == "1" else "false")
+        return redirect(url_for('dashboard', message='Setting updated!', type='success'))
     except Exception as e:
         return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
 
@@ -634,6 +751,39 @@ def api_remove_group_assistant(group_id, telegram_id):
         return jsonify({"success": False, "error": "Error removing assistant"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/settings', methods=['GET'])
+def api_get_settings():
+    """Get settings (e.g. assistants_choose_group)."""
+    try:
+        val = db.get_setting("assistants_choose_group")
+        return jsonify({"assistants_choose_group": (val or "").lower() in ("true", "1", "yes")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/settings', methods=['POST'])
+def api_set_settings():
+    """Update settings. Body: { \"assistants_choose_group\": true/false }."""
+    try:
+        data = _get_json_or_form()
+        v = data.get("assistants_choose_group")
+        if v is None:
+            return jsonify({"success": False, "error": "Missing assistants_choose_group"}), 400
+        db.set_setting("assistants_choose_group", "true" if v in (True, "true", "1", "yes") else "false")
+        return jsonify({"success": True, "message": "Settings updated!"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/stats', methods=['GET'])
+def api_stats():
+    """Get lead stats: total_leads, drivers with leads_accepted and receipts_submitted."""
+    try:
+        return jsonify(db.get_lead_stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/groups/<group_id>/toggle', methods=['POST'])

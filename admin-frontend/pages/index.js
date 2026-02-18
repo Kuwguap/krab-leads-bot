@@ -6,6 +6,8 @@ export default function AdminPanel() {
   const [groups, setGroups] = useState([]);
   const [drivers, setDrivers] = useState([]);
   const [assistantsByGroup, setAssistantsByGroup] = useState({});
+  const [settings, setSettings] = useState({ assistants_choose_group: false });
+  const [stats, setStats] = useState({ total_leads: 0, drivers: [] });
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
   const [messageType, setMessageType] = useState('success');
@@ -49,6 +51,20 @@ export default function AdminPanel() {
     setAssistantsByGroup(next);
   }, []);
 
+  const fetchSettings = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/settings`);
+      if (res.ok) setSettings(await res.json());
+    } catch {}
+  }, []);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/stats`);
+      if (res.ok) setStats(await res.json());
+    } catch {}
+  }, []);
+
   useEffect(() => {
     if (!API) {
       setLoading(false);
@@ -57,11 +73,10 @@ export default function AdminPanel() {
     }
     (async () => {
       setLoading(true);
-      await fetchGroups();
-      await fetchDrivers();
+      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats()]);
       setLoading(false);
     })();
-  }, [fetchGroups, fetchDrivers]);
+  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats]);
 
   useEffect(() => {
     if (!API || groups.length === 0) return;
@@ -199,6 +214,26 @@ export default function AdminPanel() {
     }
   }
 
+  async function toggleAssistantsChooseGroup() {
+    const next = !settings.assistants_choose_group;
+    try {
+      const res = await fetch(`${API}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ assistants_choose_group: next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setSettings({ assistants_choose_group: next });
+        showMessage(data.message || 'Setting updated!');
+      } else {
+        showMessage(data.error || 'Failed to update setting', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
   if (loading) {
     return (
       <div style={styles.page}>
@@ -224,6 +259,44 @@ export default function AdminPanel() {
             {message}
           </div>
         )}
+
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Lead flow</h2>
+          <p style={{ marginBottom: 10, color: '#555' }}>
+            When <strong>Allow assistants to choose group</strong> is ON, anyone can send leads and will choose a group (then a driver). When OFF, assistants use their assigned group.
+          </p>
+          <p style={{ marginBottom: 12 }}><strong>Current:</strong> {settings.assistants_choose_group ? 'Allow assistants to choose group' : 'Use assigned groups only'}</p>
+          <button type="button" onClick={toggleAssistantsChooseGroup} style={styles.button}>
+            {settings.assistants_choose_group ? 'Use assigned groups only' : 'Allow assistants to choose group'}
+          </button>
+        </section>
+
+        <section style={styles.section}>
+          <h2 style={styles.sectionTitle}>Lead stats</h2>
+          <p style={{ marginBottom: 12 }}><strong>Total leads sent:</strong> {stats.total_leads ?? 0}</p>
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th>Driver</th>
+                <th>Leads accepted</th>
+                <th>Receipts submitted</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(stats.drivers || []).length === 0 ? (
+                <tr><td colSpan={3} style={{ textAlign: 'center', color: '#888' }}>No drivers</td></tr>
+              ) : (
+                (stats.drivers || []).map((d) => (
+                  <tr key={d.driver_id}>
+                    <td>{d.driver_name}</td>
+                    <td>{d.leads_accepted}</td>
+                    <td>{d.receipts_submitted}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </section>
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>Add New Group</h2>
