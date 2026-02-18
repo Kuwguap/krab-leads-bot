@@ -138,7 +138,8 @@ export default function AdminPanel() {
         form.reset();
         fetchDrivers();
       } else {
-        showMessage(data.error || 'Failed to add driver', 'error');
+        const msg = data.error || (res.status === 500 ? 'Server error. Check Render logs for details.' : 'Failed to add driver');
+        showMessage(msg, 'error');
       }
     } catch (err) {
       showMessage('Network error. Is the backend running?', 'error');
@@ -245,8 +246,31 @@ export default function AdminPanel() {
   }
 
   return (
-    <div style={styles.page}>
-      <div style={styles.container}>
+    <div className="admin-page" style={styles.page}>
+      <style dangerouslySetInnerHTML={{ __html: `
+        .admin-page { padding: 20px; }
+        .admin-container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 30px; }
+        .admin-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin-top: 15px; }
+        .admin-table-wrap table { min-width: 320px; }
+        .admin-section { margin-bottom: 40px; padding: 20px; background: #f8f9fa; border-radius: 8px; }
+        .admin-assistant-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .admin-assistant-form input { flex: 1; min-width: 0; }
+        @media (max-width: 768px) {
+          .admin-page { padding: 10px; }
+          .admin-container { padding: 16px; }
+          .admin-section { padding: 14px; margin-bottom: 24px; }
+          .admin-section h2 { font-size: 1rem; margin-bottom: 14px; }
+          .admin-table-wrap th, .admin-table-wrap td { padding: 10px 6px; font-size: 0.8125rem; }
+          .admin-mobile-full button { width: 100%; min-height: 48px; }
+          .admin-assistant-form { flex-direction: column; align-items: stretch; }
+          .admin-assistant-form button { width: 100%; }
+          .admin-assistant-form input { width: 100%; }
+        }
+        @media (max-width: 480px) {
+          .admin-section h2 { font-size: 0.9375rem; }
+        }
+      ` }} />
+      <div className="admin-container" style={styles.container}>
         <h1 style={styles.h1}>KrabsLeads Admin</h1>
 
         {message && (
@@ -260,20 +284,21 @@ export default function AdminPanel() {
           </div>
         )}
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Lead flow</h2>
           <p style={{ marginBottom: 10, color: '#555' }}>
             When <strong>Allow assistants to choose group</strong> is ON, anyone can send leads and will choose a group (then a driver). When OFF, assistants use their assigned group.
           </p>
           <p style={{ marginBottom: 12 }}><strong>Current:</strong> {settings.assistants_choose_group ? 'Allow assistants to choose group' : 'Use assigned groups only'}</p>
-          <button type="button" onClick={toggleAssistantsChooseGroup} style={styles.button}>
+          <button type="button" onClick={toggleAssistantsChooseGroup} className="admin-mobile-full" style={styles.button}>
             {settings.assistants_choose_group ? 'Use assigned groups only' : 'Allow assistants to choose group'}
           </button>
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Lead stats</h2>
           <p style={{ marginBottom: 12 }}><strong>Total leads sent:</strong> {stats.total_leads ?? 0}</p>
+          <div className="admin-table-wrap">
           <table style={styles.table}>
             <thead>
               <tr>
@@ -296,9 +321,10 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+          </div>
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Add New Group</h2>
           <form onSubmit={handleAddGroup} style={styles.form}>
             <div style={styles.formGroup}>
@@ -313,11 +339,11 @@ export default function AdminPanel() {
               <label>Supervisory Telegram ID</label>
               <input type="text" name="supervisory_telegram_id" required placeholder="e.g. 123456789" style={styles.input} />
             </div>
-            <button type="submit" style={styles.button}>Add Group</button>
+            <button type="submit" className="admin-mobile-full" style={styles.button}>Add Group</button>
           </form>
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Add New Driver</h2>
           <form onSubmit={handleAddDriver} style={styles.form}>
             <div style={styles.formGroup}>
@@ -332,12 +358,13 @@ export default function AdminPanel() {
               <label>Phone (optional)</label>
               <input type="text" name="phone_number" placeholder="e.g. +1234567890" style={styles.input} />
             </div>
-            <button type="submit" style={styles.button}>Add Driver</button>
+            <button type="submit" className="admin-mobile-full" style={styles.button}>Add Driver</button>
           </form>
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Groups</h2>
+          <div className="admin-table-wrap">
           <table style={styles.table}>
             <thead>
               <tr>
@@ -366,6 +393,7 @@ export default function AdminPanel() {
                       <button
                         type="button"
                         onClick={() => toggleGroup(g.id)}
+                        className="admin-mobile-full"
                         style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger }}
                       >
                         {g.is_active ? 'Deactivate' : 'Activate'}
@@ -376,9 +404,10 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+          </div>
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Group Assistants</h2>
           <p style={{ marginBottom: 16, color: '#555' }}>Assistants use the bot like normal; their leads go to the group they are assigned to.</p>
           {groups.map((g) => (
@@ -389,12 +418,13 @@ export default function AdminPanel() {
                   <li style={{ color: '#888' }}>None yet</li>
                 ) : (
                   (assistantsByGroup[g.id] || []).map((tid) => (
-                    <li key={tid}>
+                    <li key={tid} style={{ marginBottom: 6 }}>
                       <code>{tid}</code>{' '}
                       <button
                         type="button"
                         onClick={() => handleRemoveAssistant(g.id, tid)}
-                        style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger, marginLeft: 8 }}
+                        className="admin-mobile-full"
+                        style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger, marginLeft: 8, marginTop: 4 }}
                       >
                         Remove
                       </button>
@@ -403,6 +433,7 @@ export default function AdminPanel() {
                 )}
               </ul>
               <form
+                className="admin-assistant-form"
                 onSubmit={(e) => {
                   e.preventDefault();
                   const input = e.target.querySelector('input[name="telegram_id"]');
@@ -411,22 +442,22 @@ export default function AdminPanel() {
                     input.value = '';
                   }
                 }}
-                style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}
               >
                 <input
                   type="text"
                   name="telegram_id"
                   placeholder="Assistant Telegram ID (e.g. 123456789)"
-                  style={{ ...styles.input, width: 220 }}
+                  style={styles.input}
                 />
-                <button type="submit" style={styles.button}>Add Assistant</button>
+                <button type="submit" className="admin-mobile-full" style={styles.button}>Add Assistant</button>
               </form>
             </div>
           ))}
         </section>
 
-        <section style={styles.section}>
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Drivers</h2>
+          <div className="admin-table-wrap">
           <table style={styles.table}>
             <thead>
               <tr>
@@ -455,6 +486,7 @@ export default function AdminPanel() {
                       <button
                         type="button"
                         onClick={() => toggleDriver(d.id)}
+                        className="admin-mobile-full"
                         style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger }}
                       >
                         {d.is_active ? 'Deactivate' : 'Activate'}
@@ -465,6 +497,7 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+          </div>
         </section>
       </div>
     </div>
@@ -475,6 +508,7 @@ const styles = {
   page: {
     minHeight: '100vh',
     margin: 0,
+    width: '100%',
     fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif",
     background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
     padding: 20,
@@ -482,16 +516,19 @@ const styles = {
   },
   container: {
     maxWidth: 1200,
+    width: '100%',
     margin: '0 auto',
     background: 'white',
     borderRadius: 12,
     boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
     padding: 30,
+    boxSizing: 'border-box',
   },
   h1: {
     color: '#333',
     marginBottom: 30,
     textAlign: 'center',
+    fontSize: 'clamp(1.25rem, 4vw, 1.75rem)',
   },
   message: {
     padding: 12,
@@ -524,10 +561,11 @@ const styles = {
   formGroup: { marginBottom: 15 },
   input: {
     width: '100%',
-    padding: 10,
+    padding: 12,
     border: '2px solid #ddd',
     borderRadius: 6,
-    fontSize: 14,
+    fontSize: 16,
+    boxSizing: 'border-box',
   },
   button: {
     background: '#667eea',
@@ -538,6 +576,7 @@ const styles = {
     cursor: 'pointer',
     fontSize: 14,
     fontWeight: 500,
+    minHeight: 44,
   },
   buttonSmall: { padding: '6px 12px', fontSize: 12 },
   buttonDanger: { background: '#dc3545' },

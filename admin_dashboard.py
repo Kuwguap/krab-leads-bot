@@ -2,8 +2,12 @@
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 from flask_cors import CORS
 import os
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load .env file explicitly (admin dashboard doesn't need Telegram bot token)
 env_path = Path(__file__).parent / '.env'
@@ -14,6 +18,15 @@ from supabase import create_client, Client
 
 app = Flask(__name__)
 CORS(app)
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Catch unhandled exceptions and return JSON (so frontend always gets error message)."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    return jsonify({"success": False, "error": str(e)}), 500
 
 # Create Supabase client directly (bypass Config to avoid Telegram dependencies)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -79,18 +92,17 @@ class AdminDatabase:
             return False
     
     def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: str = None) -> bool:
-        """Create a new driver."""
+        """Create a new driver. Raises on failure (table missing or insert error)."""
         if not self._check_tables_exist():
-            return False
-        try:
-            self.client.table("drivers").insert({
-                "driver_name": driver_name,
-                "driver_telegram_id": driver_telegram_id,
-                "phone_number": phone_number
-            }).execute()
-            return True
-        except Exception:
-            return False
+            raise ValueError("Database tables not found. Run the schema migrations in Supabase SQL Editor.")
+        payload = {
+            "driver_name": driver_name,
+            "driver_telegram_id": str(driver_telegram_id).strip(),
+        }
+        if phone_number is not None and str(phone_number).strip():
+            payload["phone_number"] = str(phone_number).strip()
+        self.client.table("drivers").insert(payload).execute()
+        return True
     
     def get_group_by_id(self, group_id: str):
         """Get a group by ID."""
@@ -234,7 +246,7 @@ DASHBOARD_HTML = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>KrabsLeads Admin Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -243,6 +255,7 @@ DASHBOARD_HTML = """
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
+            -webkit-text-size-adjust: 100%;
         }
         .container {
             max-width: 1200px;
@@ -256,6 +269,7 @@ DASHBOARD_HTML = """
             color: #333;
             margin-bottom: 30px;
             text-align: center;
+            font-size: clamp(1.25rem, 4vw, 1.75rem);
         }
         .section {
             margin-bottom: 40px;
@@ -268,6 +282,7 @@ DASHBOARD_HTML = """
             margin-bottom: 20px;
             border-bottom: 2px solid #667eea;
             padding-bottom: 10px;
+            font-size: clamp(1rem, 3vw, 1.25rem);
         }
         .form-group {
             margin-bottom: 15px;
@@ -280,10 +295,10 @@ DASHBOARD_HTML = """
         }
         input, select {
             width: 100%;
-            padding: 10px;
+            padding: 12px 10px;
             border: 2px solid #ddd;
             border-radius: 6px;
-            font-size: 14px;
+            font-size: 16px;
             transition: border-color 0.3s;
         }
         input:focus, select:focus {
@@ -300,6 +315,7 @@ DASHBOARD_HTML = """
             font-size: 14px;
             font-weight: 500;
             transition: background 0.3s;
+            min-height: 44px;
         }
         button:hover {
             background: #5568d3;
@@ -310,15 +326,23 @@ DASHBOARD_HTML = """
         .btn-danger:hover {
             background: #c82333;
         }
+        .table-wrapper {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            margin-top: 15px;
+        }
+        .table-wrapper table {
+            min-width: 320px;
+        }
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 15px;
         }
         th, td {
-            padding: 12px;
+            padding: 12px 8px;
             text-align: left;
             border-bottom: 1px solid #ddd;
+            font-size: clamp(0.8125rem, 2.5vw, 0.9375rem);
         }
         th {
             background: #667eea;
@@ -351,6 +375,33 @@ DASHBOARD_HTML = """
             color: #721c24;
             border: 1px solid #f5c6cb;
         }
+        .assistant-form-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .assistant-form-row input {
+            flex: 1;
+            min-width: 0;
+        }
+        .assistant-form-row button {
+            flex-shrink: 0;
+        }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            .container { padding: 16px; border-radius: 8px; }
+            .section { padding: 14px; margin-bottom: 24px; }
+            .section h2 { margin-bottom: 14px; }
+            th, td { padding: 10px 6px; }
+            button { width: 100%; min-height: 48px; }
+            .assistant-form-row { flex-direction: column; align-items: stretch; }
+            .assistant-form-row button { width: 100%; }
+        }
+        @media (max-width: 480px) {
+            h1 { margin-bottom: 20px; }
+            .section h2 { font-size: 1rem; }
+        }
     </style>
 </head>
 <body>
@@ -376,6 +427,7 @@ DASHBOARD_HTML = """
         <div class="section">
             <h2>📊 Lead stats</h2>
             <p style="margin-bottom: 12px;"><strong>Total leads sent:</strong> {{ lead_stats.get('total_leads', 0) }}</p>
+            <div class="table-wrapper">
             <table>
                 <thead>
                     <tr>
@@ -397,6 +449,7 @@ DASHBOARD_HTML = """
                     {% endif %}
                 </tbody>
             </table>
+            </div>
         </div>
         
         <!-- Add Group Section -->
@@ -442,6 +495,7 @@ DASHBOARD_HTML = """
         <!-- Groups List -->
         <div class="section">
             <h2>📋 Groups</h2>
+            <div class="table-wrapper">
             <table>
                 <thead>
                     <tr>
@@ -474,11 +528,13 @@ DASHBOARD_HTML = """
                     {% endfor %}
                 </tbody>
             </table>
+            </div>
         </div>
         
         <!-- Drivers List -->
         <div class="section">
             <h2>🚗 Drivers</h2>
+            <div class="table-wrapper">
             <table>
                 <thead>
                     <tr>
@@ -511,6 +567,7 @@ DASHBOARD_HTML = """
                     {% endfor %}
                 </tbody>
             </table>
+            </div>
         </div>
         
         <!-- Group Assistants: Telegram IDs that send leads into each group -->
@@ -528,10 +585,10 @@ DASHBOARD_HTML = """
                     <li style="color: #888;">None yet</li>
                     {% endif %}
                 </ul>
-                <form method="POST" action="/add_group_assistant" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <form method="POST" action="/add_group_assistant" class="assistant-form-row">
                     <input type="hidden" name="group_id" value="{{ group.id }}">
-                    <input type="text" name="telegram_id" placeholder="Assistant Telegram ID (e.g. 123456789)" style="width: 220px; padding: 6px 10px;">
-                    <button type="submit" style="padding: 6px 12px;">Add Assistant</button>
+                    <input type="text" name="telegram_id" placeholder="Assistant Telegram ID (e.g. 123456789)">
+                    <button type="submit" style="padding: 8px 16px;">Add Assistant</button>
                 </form>
             </div>
             {% endfor %}
@@ -705,15 +762,24 @@ def api_drivers():
     # POST: create driver
     try:
         data = _get_json_or_form()
-        driver_name = data.get('driver_name') or request.form.get('driver_name')
-        driver_telegram_id = data.get('driver_telegram_id') or request.form.get('driver_telegram_id')
-        phone_number = data.get('phone_number') or request.form.get('phone_number') or None
+        driver_name = (data.get('driver_name') or request.form.get('driver_name') or '').strip()
+        driver_telegram_id = (data.get('driver_telegram_id') or request.form.get('driver_telegram_id') or '').strip()
+        phone_number = data.get('phone_number') or request.form.get('phone_number')
+        if phone_number is not None:
+            phone_number = str(phone_number).strip() or None
         if not driver_name or not driver_telegram_id:
             return jsonify({"success": False, "error": "Missing driver_name or driver_telegram_id"}), 400
-        if db.create_driver(driver_name, driver_telegram_id, phone_number):
-            return jsonify({"success": True, "message": "Driver added successfully!"})
-        return jsonify({"success": False, "error": "Error adding driver"}), 500
+        try:
+            if db.create_driver(driver_name, driver_telegram_id, phone_number):
+                return jsonify({"success": True, "message": "Driver added successfully!"})
+        except Exception as db_err:
+            err_msg = str(db_err).lower()
+            logger.exception("POST /api/drivers create_driver failed")
+            if any(x in err_msg for x in ("unique", "duplicate", "already exists", "23505", "unique constraint", "violates")):
+                return jsonify({"success": False, "error": "A driver with this Telegram ID already exists."}), 409
+            return jsonify({"success": False, "error": str(db_err)}), 500
     except Exception as e:
+        logger.exception("POST /api/drivers error")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
