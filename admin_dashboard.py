@@ -17,7 +17,25 @@ load_dotenv(dotenv_path=env_path)
 from supabase import create_client, Client
 
 app = Flask(__name__)
-CORS(app)
+# CORS: allow frontend from any origin (Vercel, localhost) so preflight and responses always have headers
+CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Content-Type", "Authorization"], "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]}})
+
+
+@app.after_request
+def add_cors_headers(response):
+    """Ensure every response (including errors) has CORS headers so browser never blocks."""
+    if request.path.startswith("/api/"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+def api_options(path):
+    """Handle CORS preflight for all /api/* so browser always gets CORS headers."""
+    return "", 204
 
 
 @app.errorhandler(Exception)

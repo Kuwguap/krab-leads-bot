@@ -141,11 +141,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     await update.message.reply_text(
         f"Welcome, @{username}! 👋\n\n"
-        "I'll help you create a dispatch lead.\n\n"
         "**Phase 1:** Please send details in this exact structure (one item per line):\n\n"
-        "1) Name\n"
-        "2) Address\n"
-        "3) City, State, ZIP\n"
+        "1) Full Name\n"
+        "2) Registration Address\n"
+        "3) Registration City, State, ZIP\n"
         "4) Delivery address\n"
         "5) Delivery city, State, ZIP\n"
         "6) VIN\n"
@@ -153,8 +152,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "8) Color\n"
         "9) Insurance company\n"
         "10) Insurance policy number\n"
-        "11) Extra info (any other notes)\n\n"
-        "Please keep this structure so drivers and supervisors can read it fast."
+        "11) Delivery Date/Time + extra\n\n"
+        "📝 Please keep this structure so drivers and supervisors can read it fast⚡️."
+        "🏁Automated🏎️Automotive"
     )
     
     return STATE_PHASE1
@@ -520,7 +520,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # NOTE: Phone number is intentionally NOT shown here; it is only revealed after driver accepts.
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
-        f"📍 Delivery Address: {phase1_data.get('delivery_details', '')}\n"
+        f"📍 Delivery (City, State, Zip): {phase1_data.get('delivery_city_state_zip', '')}\n"
         f"💰 Price: {price}\n"
         f"📋 Reference ID: `{reference_id}`\n"
         f" Delivery Time 🏷️: {phase1_data.get('extra_info', '')}\n"
@@ -716,7 +716,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "PayPal: privatedealership@gmail.com\n\n"
             "❗️Important Message:\n"
             "Please be fast, professional, polite, the client is always right. Double check all info.\n"
-            "📞Call client now to confirm time & location.\n"
+            "📞Call client now to confirm 💲PRICE, ⏱️TIME, & 📍LOCATION.\n"
             "Fasten your seatbelt, both hands on the wheel. And most importantly, upload receipt 🧾 today ✅\n"
             "🙏Thank you & 🚘Drive Safe !"
         )
