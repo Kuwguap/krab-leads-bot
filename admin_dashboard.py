@@ -215,6 +215,93 @@ class AdminDatabase:
         except Exception:
             return False
 
+    # Contact info sources (for "Select the Contact info source for this client")
+    def get_contact_info_sources(self) -> list:
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("contact_info_sources").select("*").order("sort_order").execute()
+            return r.data or []
+        except Exception:
+            return []
+
+    def create_contact_info_source(self, label: str, sort_order: int = 0) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("contact_info_sources").insert({
+                "label": label.strip(),
+                "sort_order": sort_order,
+                "is_active": True,
+            }).execute()
+            return True
+        except Exception:
+            return False
+
+    def toggle_contact_source_status(self, source_id: str) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            r = self.client.table("contact_info_sources").select("is_active").eq("id", source_id).limit(1).execute()
+            if not r.data:
+                return False
+            new_status = not (r.data[0].get("is_active", True))
+            self.client.table("contact_info_sources").update({"is_active": new_status}).eq("id", source_id).execute()
+            return True
+        except Exception:
+            return False
+
+    def get_bot_usage(self, limit: int = 100) -> list:
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("bot_usage").select("*").order("created_at", desc=True).limit(limit).execute()
+            return r.data or []
+        except Exception:
+            return []
+
+    # Driver–group assignments (group_drivers)
+    def assign_driver_to_group(self, group_id: str, driver_id: str) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_drivers").insert({"group_id": group_id, "driver_id": driver_id}).execute()
+            return True
+        except Exception:
+            return False
+
+    def get_all_assignments(self) -> list:
+        """List all group–driver assignments: { id, group_id, driver_id, group_name, driver_name }."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("group_drivers").select(
+                "id, group_id, driver_id, group:groups(group_name), driver:drivers(driver_name)"
+            ).execute()
+            out = []
+            for row in (r.data or []):
+                g = row.get("group") or {}
+                d = row.get("driver") or {}
+                out.append({
+                    "id": row.get("id"),
+                    "group_id": row.get("group_id"),
+                    "driver_id": row.get("driver_id"),
+                    "group_name": g.get("group_name", "N/A"),
+                    "driver_name": d.get("driver_name", "N/A"),
+                })
+            return out
+        except Exception:
+            return []
+
+    def remove_driver_from_group(self, assignment_id: str) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_drivers").delete().eq("id", assignment_id).execute()
+            return True
+        except Exception:
+            return False
+
     # Lead stats: total leads, per-driver accepted and receipts
     def get_lead_stats(self) -> dict:
         """Return { total_leads: int, drivers: [ { driver_id, driver_name, leads_accepted, receipts_submitted } ] }."""
@@ -441,6 +528,50 @@ DASHBOARD_HTML = """
             </form>
         </div>
         
+        <!-- ST Telegram ID: notify on every successful lead send -->
+        <div class="section">
+            <h2>📬 ST Telegram ID</h2>
+            <p style="margin-bottom: 10px; color: #555;">When a lead is successfully sent, the bot notifies this Telegram chat (user or group ID). Leave empty to disable.</p>
+            <form method="POST" action="/set_st_telegram_id">
+                <div class="form-group">
+                    <label>ST Telegram ID:</label>
+                    <input type="text" name="st_telegram_id" value="{{ st_telegram_id or '' }}" placeholder="e.g., 123456789 or -1001234567890">
+                </div>
+                <button type="submit">Save</button>
+            </form>
+        </div>
+        
+        <!-- Bot usage: who used the bot and who they sent to -->
+        <div class="section">
+            <h2>📱 Bot usage</h2>
+            <p style="margin-bottom: 10px; color: #555;">Who used the bot and which driver(s) / group they sent to (from the bot, not server logs).</p>
+            <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>User</th>
+                        <th>Group</th>
+                        <th>Sent to driver(s)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for u in (bot_usage or []) %}
+                    <tr>
+                        <td>{{ u.created_at[:19] if u.created_at else 'N/A' }}</td>
+                        <td>@{{ u.telegram_username or u.user_telegram_id }}</td>
+                        <td>{{ u.group_name or 'N/A' }}</td>
+                        <td>{{ u.driver_names or 'N/A' }}</td>
+                    </tr>
+                    {% endfor %}
+                    {% if not (bot_usage or []) %}
+                    <tr><td colspan="4" style="text-align: center; color: #888;">No usage yet</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+            </div>
+        </div>
+        
         <!-- Lead stats -->
         <div class="section">
             <h2>📊 Lead stats</h2>
@@ -488,6 +619,52 @@ DASHBOARD_HTML = """
                 </div>
                 <button type="submit">Add Group</button>
             </form>
+        </div>
+        
+        <!-- Contact info sources: "Select the Contact info source for this client" -->
+        <div class="section">
+            <h2>📋 Contact info sources</h2>
+            <p style="margin-bottom: 10px; color: #555;">Options shown in the bot after sending a lead to drivers. Users pick one per lead.</p>
+            <form method="POST" action="/add_contact_source" style="margin-bottom: 16px;">
+                <div class="form-group">
+                    <label>New option label:</label>
+                    <input type="text" name="label" required placeholder="e.g., Facebook, Referral, Website">
+                </div>
+                <button type="submit">Add</button>
+            </form>
+            <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Label</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in (contact_sources or []) %}
+                    <tr>
+                        <td>{{ s.label }}</td>
+                        <td>
+                            <span class="status-{{ 'active' if s.is_active else 'inactive' }}">
+                                {{ 'Active' if s.is_active else 'Inactive' }}
+                            </span>
+                        </td>
+                        <td>
+                            <a href="/toggle_contact_source/{{ s.id }}">
+                                <button class="btn-danger" style="padding: 6px 12px; font-size: 12px;">
+                                    {{ 'Deactivate' if s.is_active else 'Activate' }}
+                                </button>
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not (contact_sources or []) %}
+                    <tr><td colspan="3" style="text-align: center; color: #888;">No sources yet. Add one above.</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+            </div>
         </div>
         
         <!-- Add Driver Section -->
@@ -628,6 +805,9 @@ def dashboard():
         for g in (groups or []):
             groups_assistants[g['id']] = db.get_group_assistants(g['id'])
         assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
+        st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
+        contact_sources = db.get_contact_info_sources()
+        bot_usage = db.get_bot_usage()
         lead_stats = db.get_lead_stats()
         return render_template_string(
             DASHBOARD_HTML,
@@ -635,6 +815,9 @@ def dashboard():
             drivers=drivers or [],
             groups_assistants=groups_assistants,
             assistants_choose_group=assistants_choose_group,
+            st_telegram_id=st_telegram_id,
+            contact_sources=contact_sources or [],
+            bot_usage=bot_usage or [],
             lead_stats=lead_stats,
             assignments=[],
             message=request.args.get('message'),
@@ -707,6 +890,42 @@ def set_assistants_choose_group():
         val = (request.form.get("value") or "0").strip()
         db.set_setting("assistants_choose_group", "true" if val == "1" else "false")
         return redirect(url_for('dashboard', message='Setting updated!', type='success'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/set_st_telegram_id', methods=['POST'])
+def set_st_telegram_id():
+    """Set ST Telegram ID (notified when a lead is successfully sent)."""
+    try:
+        st_id = (request.form.get("st_telegram_id") or "").strip()
+        db.set_setting("st_telegram_id", st_id)
+        return redirect(url_for('dashboard', message='ST Telegram ID saved!', type='success'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/add_contact_source', methods=['POST'])
+def add_contact_source():
+    """Add a contact info source option."""
+    try:
+        label = (request.form.get("label") or "").strip()
+        if not label:
+            return redirect(url_for('dashboard', message='Label required', type='error'))
+        if db.create_contact_info_source(label):
+            return redirect(url_for('dashboard', message='Contact source added!', type='success'))
+        return redirect(url_for('dashboard', message='Error adding contact source', type='error'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/toggle_contact_source/<source_id>')
+def toggle_contact_source(source_id):
+    """Toggle contact info source active status."""
+    try:
+        if db.toggle_contact_source_status(source_id):
+            return redirect(url_for('dashboard', message='Contact source status updated!', type='success'))
+        return redirect(url_for('dashboard', message='Error updating contact source', type='error'))
     except Exception as e:
         return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
 
@@ -839,24 +1058,103 @@ def api_remove_group_assistant(group_id, telegram_id):
 
 @app.route('/api/settings', methods=['GET'])
 def api_get_settings():
-    """Get settings (e.g. assistants_choose_group)."""
+    """Get settings: assistants_choose_group, st_telegram_id."""
     try:
         val = db.get_setting("assistants_choose_group")
-        return jsonify({"assistants_choose_group": (val or "").lower() in ("true", "1", "yes")})
+        st_id = (db.get_setting("st_telegram_id") or "").strip()
+        return jsonify({
+            "assistants_choose_group": (val or "").lower() in ("true", "1", "yes"),
+            "st_telegram_id": st_id,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/settings', methods=['POST'])
 def api_set_settings():
-    """Update settings. Body: { \"assistants_choose_group\": true/false }."""
+    """Update settings. Body: { \"assistants_choose_group\": true/false, \"st_telegram_id\": \"123\" } (any key optional)."""
     try:
         data = _get_json_or_form()
-        v = data.get("assistants_choose_group")
-        if v is None:
-            return jsonify({"success": False, "error": "Missing assistants_choose_group"}), 400
-        db.set_setting("assistants_choose_group", "true" if v in (True, "true", "1", "yes") else "false")
+        if data.get("assistants_choose_group") is not None:
+            v = data.get("assistants_choose_group")
+            db.set_setting("assistants_choose_group", "true" if v in (True, "true", "1", "yes") else "false")
+        if "st_telegram_id" in data:
+            db.set_setting("st_telegram_id", str(data.get("st_telegram_id", "")).strip())
         return jsonify({"success": True, "message": "Settings updated!"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/contact_sources', methods=['GET'])
+def api_contact_sources_list():
+    """List all contact info sources."""
+    try:
+        sources = db.get_contact_info_sources()
+        return jsonify(sources or [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/contact_sources', methods=['POST'])
+def api_contact_sources_add():
+    """Add a contact source. Body: { \"label\": \"Blue FB\", \"sort_order\": 0 }."""
+    try:
+        data = _get_json_or_form()
+        label = (data.get("label") or "").strip()
+        if not label:
+            return jsonify({"success": False, "error": "Missing label"}), 400
+        sort_order = int(data.get("sort_order", 0) or 0)
+        if db.create_contact_info_source(label, sort_order):
+            return jsonify({"success": True, "message": "Contact source added!"})
+        return jsonify({"success": False, "error": "Error adding contact source"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/contact_sources/<source_id>/toggle', methods=['POST'])
+def api_contact_sources_toggle(source_id):
+    """Toggle contact source active status."""
+    try:
+        if db.toggle_contact_source_status(source_id):
+            return jsonify({"success": True, "message": "Contact source updated!"})
+        return jsonify({"success": False, "error": "Error updating contact source"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/assignments', methods=['GET'])
+def api_assignments_list():
+    """List all group–driver assignments."""
+    try:
+        assignments = db.get_all_assignments()
+        return jsonify(assignments or [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/assignments', methods=['POST'])
+def api_assignments_add():
+    """Assign a driver to a group. Body: { \"group_id\": \"uuid\", \"driver_id\": \"uuid\" }."""
+    try:
+        data = _get_json_or_form()
+        group_id = (data.get("group_id") or "").strip()
+        driver_id = (data.get("driver_id") or "").strip()
+        if not group_id or not driver_id:
+            return jsonify({"success": False, "error": "Missing group_id or driver_id"}), 400
+        if db.assign_driver_to_group(group_id, driver_id):
+            return jsonify({"success": True, "message": "Driver assigned to group!"})
+        return jsonify({"success": False, "error": "Error assigning driver (maybe already assigned)"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/assignments/<assignment_id>', methods=['DELETE'])
+def api_assignments_remove(assignment_id):
+    """Remove a driver from a group (by assignment id)."""
+    try:
+        if db.remove_driver_from_group(assignment_id):
+            return jsonify({"success": True, "message": "Driver removed from group!"})
+        return jsonify({"success": False, "error": "Error removing assignment"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

@@ -6,7 +6,9 @@ export default function AdminPanel() {
   const [groups, setGroups] = useState([]);
   const [drivers, setDrivers] = useState([]);
   const [assistantsByGroup, setAssistantsByGroup] = useState({});
-  const [settings, setSettings] = useState({ assistants_choose_group: false });
+  const [settings, setSettings] = useState({ assistants_choose_group: false, st_telegram_id: '' });
+  const [contactSources, setContactSources] = useState([]);
+  const [assignments, setAssignments] = useState([]);
   const [stats, setStats] = useState({ total_leads: 0, drivers: [] });
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
@@ -65,6 +67,26 @@ export default function AdminPanel() {
     } catch {}
   }, []);
 
+  const fetchContactSources = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/contact_sources`);
+      if (res.ok) setContactSources(await res.json());
+      else setContactSources([]);
+    } catch {
+      setContactSources([]);
+    }
+  }, []);
+
+  const fetchAssignments = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/assignments`);
+      if (res.ok) setAssignments(await res.json());
+      else setAssignments([]);
+    } catch {
+      setAssignments([]);
+    }
+  }, []);
+
   useEffect(() => {
     if (!API) {
       setLoading(false);
@@ -73,10 +95,10 @@ export default function AdminPanel() {
     }
     (async () => {
       setLoading(true);
-      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats()]);
+      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats(), fetchContactSources(), fetchAssignments()]);
       setLoading(false);
     })();
-  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats]);
+  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchContactSources, fetchAssignments]);
 
   useEffect(() => {
     if (!API || groups.length === 0) return;
@@ -225,10 +247,113 @@ export default function AdminPanel() {
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
-        setSettings({ assistants_choose_group: next });
+        setSettings((s) => ({ ...s, assistants_choose_group: next }));
         showMessage(data.message || 'Setting updated!');
       } else {
         showMessage(data.error || 'Failed to update setting', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function saveStTelegramId(e) {
+    e.preventDefault();
+    const val = (e.target.st_telegram_id?.value ?? '').trim();
+    try {
+      const res = await fetch(`${API}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ st_telegram_id: val }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setSettings((s) => ({ ...s, st_telegram_id: val }));
+        showMessage(data.message || 'ST Telegram ID saved!');
+      } else {
+        showMessage(data.error || 'Failed to save', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function handleAddContactSource(e) {
+    e.preventDefault();
+    const label = (e.target.label?.value ?? '').trim();
+    if (!label) {
+      showMessage('Enter a label.', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`${API}/api/contact_sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, sort_order: contactSources.length }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Contact source added!');
+        e.target.reset();
+        fetchContactSources();
+      } else {
+        showMessage(data.error || 'Failed to add contact source', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function toggleContactSource(sourceId) {
+    try {
+      const res = await fetch(`${API}/api/contact_sources/${sourceId}/toggle`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Contact source updated!');
+        fetchContactSources();
+      } else {
+        showMessage(data.error || 'Failed to update', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function handleAssignDriver(e) {
+    e.preventDefault();
+    const groupId = (e.target.group_id?.value ?? '').trim();
+    const driverId = (e.target.driver_id?.value ?? '').trim();
+    if (!groupId || !driverId) {
+      showMessage('Select group and driver.', 'error');
+      return;
+    }
+    try {
+      const res = await fetch(`${API}/api/assignments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: groupId, driver_id: driverId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Driver assigned!');
+        fetchAssignments();
+      } else {
+        showMessage(data.error || 'Failed to assign (maybe already assigned)', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function removeAssignment(assignmentId) {
+    try {
+      const res = await fetch(`${API}/api/assignments/${assignmentId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(data.message || 'Assignment removed!');
+        fetchAssignments();
+      } else {
+        showMessage(data.error || 'Failed to remove', 'error');
       }
     } catch {
       showMessage('Network error.', 'error');
@@ -296,6 +421,18 @@ export default function AdminPanel() {
         </section>
 
         <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>ST Telegram ID</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>Notified when a lead is successfully sent and when a driver submits a receipt.</p>
+          <form onSubmit={saveStTelegramId} style={styles.form}>
+            <div style={styles.formGroup}>
+              <label>ST Telegram ID</label>
+              <input type="text" name="st_telegram_id" defaultValue={settings.st_telegram_id} placeholder="e.g. 123456789" style={styles.input} />
+            </div>
+            <button type="submit" className="admin-mobile-full" style={styles.button}>Save</button>
+          </form>
+        </section>
+
+        <section className="admin-section" style={styles.section}>
           <h2 style={styles.sectionTitle}>Lead stats</h2>
           <p style={{ marginBottom: 12 }}><strong>Total leads sent:</strong> {stats.total_leads ?? 0}</p>
           <div className="admin-table-wrap">
@@ -321,6 +458,50 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+          </div>
+        </section>
+
+        <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>Contact info sources</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>Options shown after a lead is sent (e.g. &quot;Select the Contact info source for this client&quot;).</p>
+          <form onSubmit={handleAddContactSource} style={{ ...styles.form, marginBottom: 16 }}>
+            <div style={styles.formGroup}>
+              <label>New source label</label>
+              <input type="text" name="label" placeholder="e.g. Blue FB" style={styles.input} required />
+            </div>
+            <button type="submit" className="admin-mobile-full" style={styles.button}>Add contact source</button>
+          </form>
+          <div className="admin-table-wrap">
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th>Label</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(contactSources || []).length === 0 ? (
+                  <tr><td colSpan={3} style={{ textAlign: 'center', color: '#888' }}>No contact sources yet</td></tr>
+                ) : (
+                  (contactSources || []).map((s) => (
+                    <tr key={s.id}>
+                      <td>{s.label}</td>
+                      <td>
+                        <span style={s.is_active !== false ? styles.statusActive : styles.statusInactive}>
+                          {s.is_active !== false ? 'Active' : 'Inactive'}
+                        </span>
+                      </td>
+                      <td>
+                        <button type="button" onClick={() => toggleContactSource(s.id)} className="admin-mobile-full" style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger }}>
+                          {s.is_active !== false ? 'Deactivate' : 'Activate'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
 
@@ -360,6 +541,60 @@ export default function AdminPanel() {
             </div>
             <button type="submit" className="admin-mobile-full" style={styles.button}>Add Driver</button>
           </form>
+        </section>
+
+        <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>Assign driver to group</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>Drivers in a group can receive leads sent to that group.</p>
+          <form onSubmit={handleAssignDriver} style={{ ...styles.form, marginBottom: 16 }}>
+            <div style={styles.formGroup}>
+              <label>Group</label>
+              <select name="group_id" style={styles.input} required>
+                <option value="">— Select group —</option>
+                {(groups || []).map((g) => (
+                  <option key={g.id} value={g.id}>{g.group_name}</option>
+                ))}
+              </select>
+            </div>
+            <div style={styles.formGroup}>
+              <label>Driver</label>
+              <select name="driver_id" style={styles.input} required>
+                <option value="">— Select driver —</option>
+                {(drivers || []).map((d) => (
+                  <option key={d.id} value={d.id}>{d.driver_name}</option>
+                ))}
+              </select>
+            </div>
+            <button type="submit" className="admin-mobile-full" style={styles.button}>Assign driver to group</button>
+          </form>
+          <div className="admin-table-wrap">
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th>Group</th>
+                  <th>Driver</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(assignments || []).length === 0 ? (
+                  <tr><td colSpan={3} style={{ textAlign: 'center', color: '#888' }}>No assignments yet</td></tr>
+                ) : (
+                  (assignments || []).map((a) => (
+                    <tr key={a.id}>
+                      <td>{a.group_name}</td>
+                      <td>{a.driver_name}</td>
+                      <td>
+                        <button type="button" onClick={() => removeAssignment(a.id)} className="admin-mobile-full" style={{ ...styles.button, ...styles.buttonSmall, ...styles.buttonDanger }}>
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section className="admin-section" style={styles.section}>

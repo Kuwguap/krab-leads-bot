@@ -47,4 +47,26 @@ class OneTimeSecret:
             print(f"Error encrypting phone with OneTimeSecret: {e}")
             return None
 
-
+    def share_secret(self, secret: str) -> Optional[str]:
+        """
+        Store any secret in OneTimeSecret and return the one-time link.
+        Use for redacting phone numbers (or other sensitive text) from messages.
+        """
+        try:
+            response = requests.post(
+                self.url,
+                auth=(self.username, self.api_key),
+                data={
+                    "secret": secret.strip(),
+                    "passphrase": self.passphrase,
+                    "ttl": 2592000,
+                },
+                timeout=10,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return f"https://onetimesecret.com/secret/{data.get('secret_key')}"
+            return None
+        except Exception as e:
+            print(f"Error sharing secret with OneTimeSecret: {e}")
+            return None

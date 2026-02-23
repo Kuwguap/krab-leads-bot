@@ -31,7 +31,27 @@ class Config:
     # Supabase
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    
+
+    # AI / Vision (optional – for image → structured Phase 1)
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or None
+    OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o").strip() or "gpt-4o"
+
+    # VIN decode: choose provider in .env (nhtsa = free, api_ninjas = premium)
+    VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
+    API_NINJAS_API_KEY = (os.getenv("API_NINJAS_API_KEY") or "").strip() or None
+
+    @classmethod
+    def is_vin_lookup_configured(cls) -> bool:
+        """True if VIN lookup is available (nhtsa always, or api_ninjas when key set)."""
+        if cls.VIN_PROVIDER == "api_ninjas":
+            return bool(cls.API_NINJAS_API_KEY)
+        return True  # nhtsa or any other → assume available
+
+    @classmethod
+    def is_ai_vision_configured(cls) -> bool:
+        """Whether image upload in Phase 1 can use AI to extract details."""
+        return bool(cls.OPENAI_API_KEY)
+
     @classmethod
     def validate(cls):
         """Validate that all required environment variables are set."""

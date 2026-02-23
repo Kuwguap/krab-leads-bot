@@ -519,3 +519,181 @@ class Database:
             logger.error(f"Error getting lead assignment status: {e}")
             return None
 
+    def get_accepted_leads_without_receipt_over_24h(self) -> list:
+        """Accepted assignments where lead has no receipt and accepted_at is 24+ hours ago; reminder not yet sent."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
+            response = self.client.table("lead_assignments").select(
+                "id, lead_id, driver_id, accepted_at, "
+                "lead:leads(reference_id, receipt_image_url), "
+                "driver:drivers(driver_telegram_id, driver_name)"
+            ).eq("status", "accepted").is_("receipt_reminder_sent_at", "null").lt(
+                "accepted_at", cutoff
+            ).execute()
+            out = []
+            for row in (response.data or []):
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+                driver = row.get("driver") or {}
+                if not driver.get("driver_telegram_id"):
+                    continue
+                out.append({
+                    "assignment_id": row.get("id"),
+                    "lead_id": row.get("lead_id"),
+                    "driver_id": row.get("driver_id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "driver_telegram_id": driver.get("driver_telegram_id"),
+                    "driver_name": driver.get("driver_name", "Driver"),
+                })
+            return out
+        except Exception as e:
+            logger.error(f"Error getting overdue receipt assignments: {e}")
+            return []
+
+    def mark_receipt_reminder_sent(self, assignment_id: str) -> bool:
+        """Mark that we sent the receipt reminder for this assignment."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime
+            self.client.table("lead_assignments").update({
+                "receipt_reminder_sent_at": datetime.utcnow().isoformat() + "Z",
+            }).eq("id", assignment_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error marking receipt reminder sent: {e}")
+            return False
+
+    # Contact info sources (for "Select the Contact info source for this client")
+    def get_contact_info_sources(self) -> list:
+        """Get all active contact info sources, ordered by sort_order."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("contact_info_sources").select("*").eq(
+                "is_active", True
+            ).order("sort_order").execute()
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error getting contact info sources: {e}")
+            return []
+
+    def get_contact_info_source_by_id(self, source_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single contact info source by id."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = self.client.table("contact_info_sources").select("*").eq("id", source_id).limit(1).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error getting contact info source: {e}")
+            return None
+
+    def get_bot_usage(self, limit: int = 100) -> list:
+        """Get recent bot usage (who sent to whom) for admin view."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("bot_usage").select("*").order("created_at", desc=True).limit(limit).execute()
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error getting bot usage: {e}")
+            return []
+
+    def record_bot_usage(
+        self,
+        user_telegram_id: int,
+        telegram_username: str,
+        lead_id: Optional[str],
+        group_name: str,
+        driver_names: str,
+    ) -> bool:
+        """Record that a user sent a lead to a group and driver(s) (for admin usage view)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("bot_usage").insert({
+                "user_telegram_id": user_telegram_id,
+                "telegram_username": telegram_username or "",
+                "lead_id": lead_id,
+                "group_name": group_name or "",
+                "driver_names": driver_names or "",
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error recording bot usage: {e}")
+            return False
+
+    def get_lead_sender_telegram_ids(self) -> list:
+        """Distinct telegram user IDs who have sent at least one lead (from bot_usage)."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("bot_usage").select("user_telegram_id").execute()
+            seen = set()
+            out = []
+            for row in (r.data or []):
+                uid = row.get("user_telegram_id")
+                if uid is not None and uid not in seen:
+                    seen.add(uid)
+                    out.append(uid)
+            return out
+        except Exception as e:
+            logger.error(f"Error getting lead sender IDs: {e}")
+            return []
+
+    def get_lead_sender_stats(self) -> list:
+        """List of {user_id, last_lead_at, leads_count_7d} for lead senders (from leads table)."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            r = self.client.table("leads").select("user_id, created_at").order("created_at", desc=True).execute()
+            cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
+            by_user = {}
+            for row in (r.data or []):
+                uid = row.get("user_id")
+                if uid is None:
+                    continue
+                created = row.get("created_at") or ""
+                if uid not in by_user:
+                    by_user[uid] = {"last_lead_at": created, "leads_count_7d": 0}
+                if created >= cutoff_7d:
+                    by_user[uid]["leads_count_7d"] += 1
+            return list(by_user.values())
+        except Exception as e:
+            logger.error(f"Error getting lead sender stats: {e}")
+            return []
+
+    def get_motivation_recipients(self) -> list:
+        """For daily rotation: list of dicts with user_id, last_lead_at, leads_count_7d. Uses leads table."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            r = self.client.table("leads").select("user_id, created_at").execute()
+            cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
+            cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
+            by_user = {}
+            for row in (r.data or []):
+                uid = row.get("user_id")
+                if uid is None:
+                    continue
+                created = row.get("created_at") or ""
+                if uid not in by_user:
+                    by_user[uid] = {"user_id": uid, "last_lead_at": created, "leads_count_7d": 0}
+                if created > (by_user[uid]["last_lead_at"] or ""):
+                    by_user[uid]["last_lead_at"] = created
+                if created >= cutoff_7d:
+                    by_user[uid]["leads_count_7d"] += 1
+            out = list(by_user.values())
+            for x in out:
+                x["no_lead_24h"] = (x.get("last_lead_at") or "") < cutoff_24h
+            return out
+        except Exception as e:
+            logger.error(f"Error getting motivation recipients: {e}")
+            return []

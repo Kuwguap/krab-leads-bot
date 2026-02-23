@@ -1,8 +1,12 @@
 """Main Telegram bot application."""
+import io
 import logging
+import re
 import sys
 import secrets
 import string
+from datetime import time as dt_time
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
 from telegram.ext import (
@@ -18,6 +22,10 @@ from config import Config
 from utils.database import Database
 from utils.onetimesecret import OneTimeSecret
 from utils.monday import MondayClient
+from utils import ai_vision
+from utils import motivation
+from utils import phone_redact
+from utils import vin_lookup
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +43,8 @@ STATE_PHASE1 = 1  # Waiting for vehicle and delivery details
 STATE_PHASE2 = 2  # Waiting for phone number and price
 STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistants_choose_group is on)
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
+STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
+STATE_VIN_CHOICE = 10  # VIN checker returned different car; user picks stated vs API
 
 # Receipt submission states
 STATE_WAITING_REFERENCE_ID = 4  # Waiting for reference ID input
@@ -127,6 +137,107 @@ def parse_phase1_structured(message_text: str) -> dict:
     }
 
 
+def _apply_single_address_as_both(state_data: dict) -> None:
+    """When only one address is provided (registration or delivery), use it for both."""
+    def _has(v: str) -> bool:
+        return bool(v and str(v).strip() and str(v).strip() != "-")
+    addr = (state_data.get("address") or "").strip()
+    csz = (state_data.get("city_state_zip") or "").strip()
+    daddr = (state_data.get("delivery_address") or "").strip()
+    dcsz = (state_data.get("delivery_city_state_zip") or "").strip()
+    has_reg = _has(addr) or _has(csz)
+    has_del = _has(daddr) or _has(dcsz)
+    if has_reg and not has_del:
+        state_data["delivery_address"] = addr or "-"
+        state_data["delivery_city_state_zip"] = csz or "-"
+    elif has_del and not has_reg:
+        state_data["address"] = daddr or "-"
+        state_data["city_state_zip"] = dcsz or "-"
+    _clean_vin_and_car(state_data)
+
+
+# Exactly 17 alphanumeric: the only valid VIN structure. Never cut or truncate.
+VIN_PATTERN = re.compile(r"\b[A-Za-z0-9]{17}\b")
+
+
+def _extract_vin_17(text: str) -> Optional[str]:
+    """Return the first 17-character alphanumeric VIN found in text, or None. No truncation."""
+    if not text:
+        return None
+    m = VIN_PATTERN.search(text)
+    return m.group(0) if m else None
+
+
+def _normalize_car_for_compare(car: str) -> str:
+    """Normalize car string for comparison (lower, single spaces)."""
+    return " ".join((car or "").lower().split())
+
+
+def _vin_check_after_phase1(state_data: dict) -> tuple:
+    """
+    Run VIN lookup when we have a 17-char VIN. Uses provider from Config (.env).
+    Returns:
+      (alert_msg, conflict) where
+      alert_msg: optional warning to show before Phase 2 (no result / not 17).
+      conflict: (api_car_line, stated_car) if VIN returned different car; else None.
+    """
+    vin = (state_data.get("vin") or "").strip()
+    if not vin or vin == "-" or len(vin) != 17:
+        return ("⚠️ VIN not 17 characters; car not verified.", None)
+    if not Config.is_vin_lookup_configured():
+        return (None, None)
+    result = vin_lookup.vin_lookup(
+        vin,
+        provider=Config.VIN_PROVIDER,
+        api_key=Config.API_NINJAS_API_KEY,
+    )
+    if not result:
+        return ("⚠️ VIN returned no result. Ensure it's 17 characters.", None)
+    api_car = (result.get("car_line") or "").strip()
+    stated = (state_data.get("car") or "").strip()
+    if not api_car:
+        return (None, None)
+    if _normalize_car_for_compare(api_car) == _normalize_car_for_compare(stated):
+        return (None, None)
+    return (None, (api_car, stated))
+
+
+def _clean_vin_and_car(state_data: dict) -> None:
+    """Identify VIN only as a 17 alphanumeric string (no cutting). Clean car from phones and any stray VIN."""
+    vin_raw = (state_data.get("vin") or "").strip()
+    car_raw = (state_data.get("car") or "").strip()
+    # Search for exactly 17 alphanumeric in vin field first, then vin+car, so we never miss a merged line
+    search_for_vin = vin_raw + " " + car_raw
+    vin_17 = _extract_vin_17(phone_redact.strip_phone_patterns(search_for_vin))
+    if not vin_17:
+        vin_17 = _extract_vin_17(vin_raw + " " + car_raw)
+    state_data["vin"] = vin_17 if vin_17 else "-"
+    # Car: strip phones and remove the 17-char VIN if it ended up in the car line (so we don't duplicate or leave fragment)
+    car_cleaned = phone_redact.strip_phone_patterns(car_raw)
+    if vin_17 and vin_17 in car_cleaned:
+        car_cleaned = car_cleaned.replace(vin_17, " ", 1)
+    car_cleaned = " ".join(car_cleaned.split()).strip()
+    state_data["car"] = car_cleaned or "-"
+    # Rebuild derived fields
+    vehicle_lines = [
+        state_data.get("name"),
+        state_data.get("address"),
+        state_data.get("city_state_zip"),
+        state_data.get("vin"),
+        state_data.get("car"),
+        state_data.get("color"),
+        state_data.get("insurance_company"),
+        state_data.get("insurance_policy_number"),
+        state_data.get("extra_info"),
+    ]
+    state_data["vehicle_details"] = "\n".join([l for l in vehicle_lines if l])
+    delivery_lines = [
+        state_data.get("delivery_address"),
+        state_data.get("delivery_city_state_zip"),
+    ]
+    state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and initialize state."""
     user = update.effective_user
@@ -139,42 +250,254 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Initialize new state
     db.set_user_state(user_id, "phase1", {})
     
-    await update.message.reply_text(
-        f"Welcome, @{username}! 👋\n\n"
-        "**Phase 1:** Please send details in this exact structure (one item per line):\n\n"
-        "1) Full Name\n"
-        "2) Registration Address\n"
-        "3) Registration City, State, ZIP\n"
-        "4) Delivery address\n"
-        "5) Delivery city, State, ZIP\n"
-        "6) VIN\n"
-        "7) Car (year, make, model)\n"
-        "8) Color\n"
-        "9) Insurance company\n"
-        "10) Insurance policy number\n"
-        "11) Delivery Date/Time + extra\n\n"
-        "📝 Please keep this structure so drivers and supervisors can read it fast⚡️."
-        "🏁Automated🏎️Automotive"
+    phase1_instruction = (
+        "Congratulations 🎊\n\n"
+        "**Step 1:**\n"
+        "📤 Send me\n"
+        "👤 Name\n"
+        "🏠 Reg Addr\n"
+        "📍 Delivery Addr\n"
+        "🔢 VIN #\n"
+        "🚘 Car (Y/M/M)\n"
+        "🎨 Color\n"
+        "🛡 Insurance #\n"
+        "🕒 Date & Time\n\n"
+        "Send ✍️ Text or 📸 Screenshot\n\n"
+        f"{motivation.get_random_quote()}\n\n"
+        "🏁Automated🏎Automotive"
     )
+    await update.message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
     
     return STATE_PHASE1
 
 
-async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle Phase 1: Vehicle and delivery details."""
+def _normalize_ai_phase1_text(text: str) -> str:
+    """Strip optional leading 'N) ' from each line so parse_phase1_structured gets clean lines."""
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        # Remove leading "1) ", "2) ", ... "11) "
+        line = re.sub(r"^\d{1,2}\)\s*", "", line).strip()
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _sanitize_phones_for_send(text: str) -> str:
+    """Replace any phone numbers in user content with OneTimeSecret links (no raw numbers)."""
+    if not text or not str(text).strip():
+        return text or ""
+    return phone_redact.replace_phones_with_ots_links(str(text).strip(), ots)
+
+
+async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle Phase 1 image upload: OCR + AI extract structured fields, then same flow as text."""
     user_id = update.effective_user.id
-    message_text = update.message.text
-    
-    # Parse and store structured Phase 1 data
-    state_data = parse_phase1_structured(message_text)
+    if not Config.is_ai_vision_configured():
+        await update.message.reply_text(
+            "❌ Image extraction is not configured. Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+    await update.message.reply_text("⏳ Processing image…")
+    if not update.message.photo:
+        await update.message.reply_text("❌ No image received. Please send a screenshot or try sending as text.")
+        return STATE_PHASE1
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    bio = io.BytesIO()
+    await file.download_to_memory(out=bio)
+    image_bytes = bio.getvalue()
+    mime = "image/jpeg"
+    if file.file_path and file.file_path.lower().endswith(".png"):
+        mime = "image/png"
+    try:
+        raw_text = ai_vision.extract_structured_from_image(image_bytes, mime_type=mime)
+    except ai_vision.AIVisionQuotaError:
+        await update.message.reply_text(
+            "❌ Image extraction is temporarily unavailable (API quota exceeded). "
+            "Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+    if not raw_text or not raw_text.strip():
+        await update.message.reply_text(
+            "❌ Could not extract details from the image. Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+    normalized = _normalize_ai_phase1_text(raw_text)
+    # Use first 11 lines only so field mapping is consistent (extra lines from AI are ignored)
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
+    state_data = parse_phase1_structured(normalized_11)
+    _apply_single_address_as_both(state_data)
+    # Built-in checks: at least 11 lines, required fields (name + delivery); VIN format not enforced
+    valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
+    if not valid:
+        err_blurb = "\n• ".join(validation_errors)
+        preview = (
+            f"Name: {state_data.get('name') or '-'}\n"
+            f"VIN: {state_data.get('vin') or '-'}\n"
+            f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
+        )
+        await update.message.reply_text(
+            "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
+            "Extracted preview:\n" + preview + "\n\n"
+            "Please send the details as text in the required 11-line structure, or try another image."
+        )
+        return STATE_PHASE1
     db.set_user_state(user_id, "phase1", state_data)
-    
+    alert_msg, conflict = _vin_check_after_phase1(state_data)
+    if conflict:
+        api_car, stated_car = conflict
+        context.user_data["vin_choice_api_car"] = api_car
+        context.user_data["vin_choice_stated_car"] = stated_car
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
+            [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
+        ])
+        await update.message.reply_text(
+            "⚠️ **VIN returned different car than stated**\n\n"
+            f"• In message: {stated_car}\n"
+            f"• VIN lookup: {api_car}\n\n"
+            "Choose which to use:",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+        return STATE_VIN_CHOICE
+    if alert_msg:
+        await update.message.reply_text(alert_msg)
     await update.message.reply_text(
+        "✅ Phase 1 received (from image)!\n\n"
+        "**Phase 2:** Please provide phone number and price.\n"
+        "Format: Phone number and price (e.g., '+1234567890 $500')"
+    )
+    return STATE_PHASE2
+
+
+async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle Phase 1: Vehicle and delivery details. If AI is configured, accept any format and let model rearrange."""
+    user_id = update.effective_user.id
+    message_text = (update.message.text or "").strip()
+    if not message_text:
+        await update.message.reply_text("Please send the client/vehicle and delivery details (text or a screenshot).")
+        return STATE_PHASE1
+
+    if Config.is_ai_vision_configured():
+        await update.message.reply_text("⏳ Processing…")
+        try:
+            raw_text = ai_vision.extract_structured_from_text(message_text)
+        except ai_vision.AIVisionQuotaError:
+            await update.message.reply_text(
+                "❌ Processing is temporarily unavailable (API quota). "
+                "Please try again later or send in the 11-line structure."
+            )
+            return STATE_PHASE1
+        if not raw_text or not raw_text.strip():
+            await update.message.reply_text(
+                "❌ I couldn't extract the fields from that message. "
+                "Try rephrasing or send name, address, delivery, VIN, car, and delivery time."
+            )
+            return STATE_PHASE1
+        normalized = _normalize_ai_phase1_text(raw_text)
+        lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+        normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
+        state_data = parse_phase1_structured(normalized_11)
+        _apply_single_address_as_both(state_data)
+        valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
+        if not valid:
+            err_blurb = "\n• ".join(validation_errors)
+            await update.message.reply_text(
+                "⚠️ I couldn't find enough info:\n\n• " + err_blurb + "\n\n"
+                "Please include at least name and delivery address/city."
+            )
+            return STATE_PHASE1
+        db.set_user_state(user_id, "phase1", state_data)
+        alert_msg, conflict = _vin_check_after_phase1(state_data)
+        if conflict:
+            api_car, stated_car = conflict
+            context.user_data["vin_choice_api_car"] = api_car
+            context.user_data["vin_choice_stated_car"] = stated_car
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
+                [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
+            ])
+            await update.message.reply_text(
+                "⚠️ **VIN returned different car than stated**\n\n"
+                f"• In message: {stated_car}\n"
+                f"• VIN lookup: {api_car}\n\n"
+                "Choose which to use:",
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+            return STATE_VIN_CHOICE
+        if alert_msg:
+            await update.message.reply_text(alert_msg)
+        await update.message.reply_text(
+            "✅ Phase 1 received!\n\n"
+            "**Phase 2:** Please provide phone number and price.\n"
+            "Format: Phone number and price (e.g., '+1234567890 $500')"
+        )
+        return STATE_PHASE2
+    else:
+        # No AI: require the 11-line structure
+        state_data = parse_phase1_structured(message_text)
+        _apply_single_address_as_both(state_data)
+        db.set_user_state(user_id, "phase1", state_data)
+        alert_msg, conflict = _vin_check_after_phase1(state_data)
+        if conflict:
+            api_car, stated_car = conflict
+            context.user_data["vin_choice_api_car"] = api_car
+            context.user_data["vin_choice_stated_car"] = stated_car
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
+                [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
+            ])
+            await update.message.reply_text(
+                "⚠️ **VIN returned different car than stated**\n\n"
+                f"• In message: {stated_car}\n"
+                f"• VIN lookup: {api_car}\n\n"
+                "Choose which to use:",
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+            return STATE_VIN_CHOICE
+        if alert_msg:
+            await update.message.reply_text(alert_msg)
+        await update.message.reply_text(
+            "✅ Phase 1 received!\n\n"
+            "**Phase 2:** Please provide phone number and price.\n"
+            "Format: Phone number and price (e.g., '+1234567890 $500')"
+        )
+        return STATE_PHASE2
+
+
+async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle VIN conflict choice: use API result or keep stated car, then go to Phase 2."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if query.data == "vin_use":
+        api_car = context.user_data.get("vin_choice_api_car")
+        if api_car:
+            state = db.get_user_state(user_id)
+            if state and state.get("data"):
+                d = state["data"]
+                d["car"] = api_car
+                vehicle_lines = [
+                    d.get("name"), d.get("address"), d.get("city_state_zip"),
+                    d.get("vin"), d.get("car"), d.get("color"),
+                    d.get("insurance_company"), d.get("insurance_policy_number"), d.get("extra_info"),
+                ]
+                d["vehicle_details"] = "\n".join([l for l in vehicle_lines if l])
+                db.set_user_state(user_id, "phase1", d)
+        context.user_data.pop("vin_choice_api_car", None)
+        context.user_data.pop("vin_choice_stated_car", None)
+    else:
+        context.user_data.pop("vin_choice_api_car", None)
+        context.user_data.pop("vin_choice_stated_car", None)
+    await query.message.reply_text(
         "✅ Phase 1 received!\n\n"
         "**Phase 2:** Please provide phone number and price.\n"
         "Format: Phone number and price (e.g., '+1234567890 $500')"
     )
-    
     return STATE_PHASE2
 
 
@@ -192,24 +515,25 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     phase1_data = state.get("data", {})
     
-    # Parse phone and price (simple parsing - you may want to improve this)
-    # Expected format: phone number and price
+    # Parse phone and price: any token containing $ is the price; phone = any format accepted (digits only)
     parts = message_text.split()
-    phone_number = None
-    price = None
-    
-    for part in parts:
-        if part.startswith("+") or part.replace("-", "").replace("(", "").replace(")", "").isdigit():
-            phone_number = part
-        elif part.startswith("$"):
-            price = part
-    
-    if not phone_number or not price:
+    price = next((p for p in parts if "$" in p), None)
+    # Build text without price so we don't take digits from "$500" etc.
+    non_price_text = " ".join(p for p in parts if "$" not in p)
+    digits_only = re.sub(r"\D", "", non_price_text)
+    if len(digits_only) == 11 and digits_only.startswith("1"):
+        digits_only = digits_only[1:]
+    # If 10 digits start with 1, treat as +1 (xxx) xxx-xxx so we don't store 11234567890 in OTS
+    if len(digits_only) == 10 and digits_only.startswith("1"):
+        digits_only = digits_only[1:]
+    if len(digits_only) not in (9, 10) or not price:
         await update.message.reply_text(
             "❌ Please provide both phone number and price.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')"
+            "Phone in any format (e.g. +1 (732) 534-2659, 732-534-2659, 732 534 2659) and price with $ (e.g. $500)."
         )
         return STATE_PHASE2
+    # Normalize to +1XXXXXXXXXX for storage (no double 1)
+    phone_number = "+1" + digits_only
     
     # Encrypt phone number via OneTimeSecret
     await update.message.reply_text("🔐 Encrypting phone number...")
@@ -425,26 +749,42 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
     
+    # Build vehicle block from individual fields so VIN and car are NEVER sanitized (no link in those lines)
+    def _safe(s: str) -> str:
+        return _sanitize_phones_for_send(s or "") or "-"
+    vin_only = (phase1_data.get("vin") or "").strip() or "-"
+    car_only = (phase1_data.get("car") or "").strip() or "-"
+    vehicle_lines_display = [
+        _safe(phase1_data.get("name")),
+        _safe(phase1_data.get("address")),
+        _safe(phase1_data.get("city_state_zip")),
+        vin_only,
+        car_only,
+        _safe(phase1_data.get("color")),
+        _safe(phase1_data.get("insurance_company")),
+        _safe(phase1_data.get("insurance_policy_number")),
+        _safe(phase1_data.get("extra_info")),
+    ]
+    vehicle_safe = "\n".join(vehicle_lines_display)
+    delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
+    extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
+
     # Create item in Monday.com (if configured)
-    # Monday.com only receives: user, raw phone, and price(not limited to this only that will be sent to the moday board)
     monday_result = None
     if monday:
         await context.bot.send_message(
             chat_id=query.from_user.id,
             text="📊 Syncing with Monday.com..."
         )
-        # Prepare data for Monday.com
-        # Map Phase 1 + routing info into named fields for Monday columns
         monday_lead_data = {
             "name": phase1_data.get("name", ""),
             "phone_number": phone_number,
             "price": price,
             "delivery_address": phase1_data.get("delivery_address", ""),
             "delivery_city_state_zip": phase1_data.get("delivery_city_state_zip", ""),
-            # Text for Monday long_text__1: same structure as group message but without dates
             "group_message": (
                 "🏷NEW CLIENT❗️\n\n"
-                f"🚗 Vehicle: {phase1_data.get('vehicle_details', '')}\n"
+                f"🚗 Vehicle: {vehicle_safe}\n"
                 f"🔗 Encrypted Link: {encrypted_data.get('link')}"
             ),
             # Supervisor/group info (using group name as identifier)
@@ -495,35 +835,33 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         }
     
     # Prepare messages for distribution
-    # Full message with all details (for Supervisory)
+    # Full message with all details (for Supervisory) – phone only via encrypted link
     full_message = (
         f"👤 User: @{username}\n"
-        f"🚗 Vehicle: {phase1_data.get('vehicle_details', '')}\n"
-        f"📍 Delivery: {phase1_data.get('delivery_details', '')}\n"
-        f"📞 Phone: {phone_number}\n"
+        f"🚗 Vehicle: {vehicle_safe}\n"
+        f"📍 Delivery: {delivery_safe}\n"
+        f"📞 Phone (one-time link): {encrypted_data.get('link')}\n"
         f"💰 Price: {price}\n"
-        f"🔗 Encrypted Link: {encrypted_data.get('link')}\n"
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
-    
-    # Group message (without user, phone, price, or delivery) - starts with "NEW CLIENT"
+
+    # Group message – no raw phone; vehicle content sanitized
     group_message = (
         f"🏷NEW CLIENT❗️\n\n"
-        f"🚗 Vehicle: {phase1_data.get('vehicle_details', '')}\n"
+        f"🚗 Vehicle: {vehicle_safe}\n"
         f"🔗 Encrypted Link: {encrypted_data.get('link')}\n"
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
     
     # Driver assignment message (sent to selected drivers with accept/decline)
-    # NOTE: Phone number is intentionally NOT shown here; it is only revealed after driver accepts.
+    # NOTE: Phone and price are only revealed after driver accepts.
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
         f"📍 Delivery (City, State, Zip): {phase1_data.get('delivery_city_state_zip', '')}\n"
-        f"💰 Price: {price}\n"
         f"📋 Reference ID: `{reference_id}`\n"
-        f" Delivery Time 🏷️: {phase1_data.get('extra_info', '')}\n"
+        f" Delivery Time 🏷️: {extra_safe}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅")
     
     # Create accept/decline keyboard for driver assignment
@@ -612,24 +950,112 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             logger.error(f"Error sending to supervisory (chat_id={sup_chat_id}): {e!r}")
     
-    # Clear user state
+    driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+    contact_sources = db.get_contact_info_sources()
+    
+    if contact_sources:
+        db.set_user_state(
+            user_id,
+            "select_contact_source",
+            {
+                "lead_id": lead["id"],
+                "reference_id": reference_id,
+                "driver_names": driver_names,
+                "group_name": selected_group.get("group_name", "N/A"),
+                "username": username,
+            },
+        )
+        buttons = [
+            [InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"contact_source_{s['id']}")]
+            for s in contact_sources
+        ]
+        await query.message.reply_text(
+            "📋 **Select the Contact info source for this client:**",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return STATE_SELECT_CONTACT_SOURCE
+    
+    await _finish_lead_send(
+        context, query.message, user_id, username, lead["id"], reference_id,
+        driver_names, selected_group.get("group_name", "N/A"), contact_source_label=None,
+    )
+    return ConversationHandler.END
+
+
+async def _finish_lead_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    user_id: int,
+    username: str,
+    lead_id: str,
+    reference_id: str,
+    driver_names: str,
+    group_name: str,
+    contact_source_label: Optional[str] = None,
+) -> None:
+    """Update lead contact source (if any), sync Monday, notify ST, record usage, send success message."""
+    lead = db.get_lead_by_id(lead_id)
+    if contact_source_label and lead:
+        db.update_lead(lead_id, {"contact_info_source": contact_source_label})
+        monday_item_id = lead.get("monday_item_id")
+        if monday and monday_item_id:
+            try:
+                monday.update_item_contact_source(int(monday_item_id), contact_source_label)
+            except Exception as e:
+                logger.error(f"Error updating Monday contact source: {e}")
+    st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
+    if st_telegram_id:
+        try:
+            st_chat_id = int(st_telegram_id.strip())
+            await context.bot.send_message(
+                chat_id=st_chat_id,
+                text=f"📬 New lead sent\n\nReference: {reference_id}\nGroup: {group_name}\nDriver(s): {driver_names}\nBy: @{username}",
+            )
+        except Exception as e:
+            logger.error(f"Error sending to ST (chat_id={st_telegram_id}): {e}")
+    db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
+    success_text = (
+        f"✅ **Lead sent successfully**\n\n"
+        f"• Sent to driver(s): **{driver_names}**\n"
+        f"• Group: {group_name}\n"
+        f"• Reference ID: `{reference_id}`\n\n"
+        "Use /start to create another lead."
+    )
+    await message.reply_text(success_text, parse_mode="Markdown")
+    # CORE: motivation after client submission (Pro Mode)
+    try:
+        motivation_text = motivation.core_after_submission()
+        await message.reply_text(motivation_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("Could not send motivation after lead: %s", e)
     db.clear_user_state(user_id)
-    
-    # Build success message
-    success_parts = [
-        "✅ Lead processed successfully!\n\n",
-        "Your lead has been:\n",
-        "• Encrypted and stored\n"
-    ]
-    
-    if monday and monday_result:
-        success_parts.append("• Synced to Monday.com\n")
-    
-    success_parts.append("• Sent to selected driver(s)\n\n")
-    success_parts.append("Use /start to create another lead.")
-    
-    await query.message.reply_text("".join(success_parts))
-    
+
+
+async def handle_contact_source_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle contact info source selection after lead was sent to drivers."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    username = query.from_user.username or "Unknown"
+    raw = query.data.replace("contact_source_", "")
+    source_id = raw.strip()
+    state = db.get_user_state(user_id)
+    if not state or state.get("state") != "select_contact_source":
+        await query.message.reply_text("❌ Session expired. Use /start to begin again.")
+        db.clear_user_state(user_id)
+        return ConversationHandler.END
+    data = state.get("data") or {}
+    lead_id = data.get("lead_id")
+    reference_id = data.get("reference_id", "")
+    driver_names = data.get("driver_names", "")
+    group_name = data.get("group_name", "N/A")
+    source = db.get_contact_info_source_by_id(source_id)
+    label = source.get("label", "") if source else ""
+    await _finish_lead_send(
+        context, query.message, user_id, username, lead_id, reference_id,
+        driver_names, group_name, contact_source_label=label or None,
+    )
     return ConversationHandler.END
 
 
@@ -699,12 +1125,14 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 logger.error(f"Error updating Monday.com driver column: {e}")
         
-        # Send confirmation to driver with full details (including extra info)
+        # Send confirmation to driver – phone only via one-time link; sanitize user content
+        delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
+        extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
         confirmation_message = (
             "✅ **Lead Accepted!**\n\n"
-            f"📍 Delivery Address: {lead.get('delivery_details', 'N/A')}\n"
-            f"📝 Extra info: {lead.get('extra_info', '')}\n"
-            f"📞 Phone: {lead.get('phone_number', 'N/A')}\n"
+            f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
+            f"📝 Extra info: {extra_safe}\n"
+            f"📞 Phone (one-time link): {lead.get('encrypted_link', 'N/A')}\n"
             f"💰 Price: {lead.get('price', 'N/A')}\n"
             f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`\n\n"
             "Security 🚨 client must pay dealership directly\n"
@@ -741,10 +1169,11 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             group_telegram_id = group.get('group_telegram_id')
             if group_telegram_id:
                 try:
+                    extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
                     acceptance_message = (
                         "✅ **Lead Accepted**\n\n"
                         f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
-                        f"📝 Extra info: {lead.get('extra_info', '')}\n"
+                        f"📝 Extra info: {extra_safe}\n"
                         f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
                     )
                     await context.bot.send_message(
@@ -830,11 +1259,12 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     context.user_data['receipt_reference_id'] = reference_id
     context.user_data['receipt_monday_item_id'] = lead.get('monday_item_id')
     
-    # Show lead details for confirmation
+    # Show lead details for confirmation – phone only via one-time link
+    delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
     confirmation_message = (
         f"✅ **Lead Found**\n\n"
-        f"📍 Delivery Address: {lead.get('delivery_details', 'N/A')}\n"
-        f"📞 Phone: {lead.get('phone_number', 'N/A')}\n"
+        f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
+        f"📞 Phone (one-time link): {lead.get('encrypted_link', 'N/A')}\n"
         f"📋 Reference ID: `{reference_id}`\n\n"
         f"Please confirm this is the correct lead, then upload the receipt image."
     )
@@ -962,6 +1392,48 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             "Status updated to 'PAID RECEIPT' in Monday.com."
         )
         
+        # Notify ST Telegram ID and Supervisory Telegram ID (group that received this lead)
+        group_id = lead.get("group_id")
+        group_name = "—"
+        if group_id:
+            group = db.get_group_by_id(group_id)
+            if group:
+                group_name = group.get("group_name") or group_name
+                supervisory_telegram_id = (group.get("supervisory_telegram_id") or "").strip()
+                if supervisory_telegram_id:
+                    try:
+                        sup_chat_id = int(supervisory_telegram_id.strip())
+                        await context.bot.send_message(
+                            chat_id=sup_chat_id,
+                            text=(
+                                f"🧾 **Receipt submitted**\n\n"
+                                f"Driver **{driver_name}** submitted a receipt for Reference ID `{reference_id}`\n"
+                                f"Group: **{group_name}**"
+                            ),
+                            parse_mode="Markdown",
+                        )
+                    except (ValueError, TypeError) as e:
+                        logger.warning("Invalid supervisory_telegram_id for group %s: %s", group_id, e)
+                    except Exception as e:
+                        logger.warning("Could not send receipt notification to supervisory %s: %s", supervisory_telegram_id, e)
+        st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
+        if st_telegram_id:
+            try:
+                st_chat_id = int(st_telegram_id.strip())
+                await context.bot.send_message(
+                    chat_id=st_chat_id,
+                    text=(
+                        f"🧾 **Receipt submitted**\n\n"
+                        f"Driver **{driver_name}** submitted a receipt for Reference ID `{reference_id}`\n"
+                        f"Group: **{group_name}**"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning("Invalid st_telegram_id: %s", e)
+            except Exception as e:
+                logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e)
+        
         # Send completion message via @krabsenderbot to driver_name
         try:
             completion_message = (
@@ -992,6 +1464,9 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def main():
     """Main function to start the bot."""
+    logger.info("Bot starting...")
+    sys.stdout.flush()
+    sys.stderr.flush()
     # Validate configuration
     try:
         Config.validate()
@@ -1010,7 +1485,8 @@ def main():
     bot_token = Config.TELEGRAM_BOT_TOKEN
     delete_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
     try:
-        delete_response = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=10)
+        logger.info("Clearing webhook...")
+        delete_response = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=5)
         if delete_response.status_code == 200:
             data = delete_response.json()
             if data.get("ok"):
@@ -1020,9 +1496,8 @@ def main():
         else:
             logger.warning(f"deleteWebhook HTTP {delete_response.status_code}: {delete_response.text}")
     except Exception as e:
-        logger.warning(f"Could not clear webhook: {e}")
-    # Brief delay so Telegram releases any previous consumer before we start polling
-    time.sleep(2)
+        logger.warning(f"Could not clear webhook (continuing anyway): {e}")
+    time.sleep(1)
     
     # Add error handler for all errors
     _conflict_logged = False  # Flag to prevent repeated logging
@@ -1066,12 +1541,17 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            STATE_PHASE1: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1)],
+            STATE_PHASE1: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
+                MessageHandler(filters.PHOTO, handle_phase1_photo),
+            ],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
+            STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep)$")],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_")],
+            STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     
     # Create conversation handler for receipt submission
@@ -1082,7 +1562,7 @@ def main():
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
             STATE_WAITING_RECEIPT_IMAGE: [MessageHandler(filters.PHOTO, handle_receipt_image)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     
     # Add handlers
@@ -1093,13 +1573,88 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
     
-    # Start the bot
-    logger.info("Bot starting...")
+    # Receipt reminder: every hour, send a reminder to drivers who accepted 24+ hours ago and haven't submitted receipt
+    async def send_receipt_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            overdue = db.get_accepted_leads_without_receipt_over_24h()
+            for item in overdue:
+                ref = item.get("reference_id") or "N/A"
+                chat_id = item.get("driver_telegram_id")
+                assignment_id = item.get("assignment_id")
+                if not chat_id or not assignment_id:
+                    continue
+                try:
+                    chat_id_int = int(str(chat_id).strip())
+                except (ValueError, TypeError):
+                    chat_id_int = chat_id
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id_int,
+                        text=f"🧾 **Receipt reminder**\n\nReference ID: `{ref}`\n\nPlease submit your receipt when you can.",
+                        parse_mode="Markdown",
+                    )
+                    db.mark_receipt_reminder_sent(assignment_id)
+                    logger.info("Receipt reminder sent to driver for ref %s", ref)
+                except Exception as e:
+                    logger.warning("Could not send receipt reminder to %s: %s", chat_id, e)
+        except Exception as e:
+            logger.error("Receipt reminder job failed: %s", e)
+    if application.job_queue:
+        application.job_queue.run_repeating(send_receipt_reminders, interval=3600, first=60)
+        logger.info("Receipt reminder job scheduled (every hour, first in 60s)")
+
+    # Daily motivation (Pro Mode): morning PSYCHOLOGY, evening AGGRESSIVE, no-lead-24h AGGRESSIVE, top performer BONUS
+    async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            user_ids = db.get_lead_sender_telegram_ids()
+            text = motivation.morning_psychology()
+            for uid in user_ids:
+                try:
+                    chat_id = int(uid) if isinstance(uid, str) else uid
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("Morning motivation to %s: %s", uid, e)
+        except Exception as e:
+            logger.error("Morning motivation job failed: %s", e)
+
+    async def send_evening_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            recipients = db.get_motivation_recipients()
+            top_count = max((r.get("leads_count_7d") or 0) for r in recipients) if recipients else 0
+            top_performer_uid = None
+            if top_count > 0:
+                for r in recipients:
+                    if (r.get("leads_count_7d") or 0) == top_count:
+                        top_performer_uid = r.get("user_id")
+                        break
+            for r in recipients:
+                uid = r.get("user_id")
+                if not uid:
+                    continue
+                try:
+                    chat_id = int(uid) if isinstance(uid, str) else uid
+                    if r.get("no_lead_24h"):
+                        text = motivation.no_clients_24h_aggressive()
+                    else:
+                        text = motivation.evening_aggressive()
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                    if uid == top_performer_uid and top_count > 0:
+                        bonus = motivation.top_performer_bonus()
+                        await context.bot.send_message(chat_id=chat_id, text=bonus, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("Evening motivation to %s: %s", uid, e)
+        except Exception as e:
+            logger.error("Evening motivation job failed: %s", e)
+
+    if application.job_queue:
+        application.job_queue.run_daily(send_morning_motivation, time=dt_time(hour=13, minute=0))   # ~8 AM ET
+        application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=23, minute=0))  # ~6 PM ET
+        logger.info("Daily motivation jobs scheduled (morning ~8 AM ET, evening ~6 PM ET)")
+
     logger.info("Make sure only ONE instance of the bot is running!")
-    
+    logger.info("Starting polling - bot is live. Press Ctrl+C to stop.")
+
     try:
-        # Use drop_pending_updates to avoid conflicts
-        # The application will automatically check and clear webhooks if needed
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True

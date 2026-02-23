@@ -293,7 +293,44 @@ class MondayClient:
         except Exception as e:
             print(f"Error updating Monday.com driver column: {e}")
             return False
-    
+
+    def update_item_contact_source(self, item_id: int, contact_source_label: str) -> bool:
+        """Update the contact info source column (text_mm0ske02) on the Monday board.
+        Text columns require change_simple_column_value with a plain string value, not JSON."""
+        if not self.is_configured():
+            return False
+        # Escape for GraphQL string: backslash and double-quote
+        safe = (contact_source_label or "").replace('\\', '\\\\').replace('"', '\\"')
+        mutation = f"""
+        mutation {{
+            change_simple_column_value(
+                board_id: {self.board_id},
+                item_id: {item_id},
+                column_id: "text_mm0ske02",
+                value: "{safe}"
+            ) {{
+                id
+            }}
+        }}
+        """
+        try:
+            response = requests.post(
+                self.api_url,
+                headers=self.headers,
+                json={"query": mutation},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if "errors" in data:
+                    print(f"Monday.com GraphQL errors (contact source): {data['errors']}")
+                    return False
+                return True
+            return False
+        except Exception as e:
+            print(f"Error updating Monday.com contact source column: {e}")
+            return False
+
     def update_item_receipt(self, item_id: int, file_name: str, file_content: bytes) -> bool:
         """
         Upload a receipt image file to the Monday.com files4 column for the item.
