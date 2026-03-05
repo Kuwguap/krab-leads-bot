@@ -6,6 +6,7 @@ import sys
 import secrets
 import string
 from datetime import time as dt_time
+import pytz
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
@@ -45,6 +46,9 @@ STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistan
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
 STATE_VIN_CHOICE = 10  # VIN checker returned different car; user picks stated vs API
+STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
+STATE_ADD_FILES = 12  # Ask "Do you want to add files?"
+STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
 
 # Receipt submission states
 STATE_WAITING_REFERENCE_ID = 4  # Waiting for reference ID input
@@ -364,12 +368,15 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         return STATE_VIN_CHOICE
     if alert_msg:
         await update.message.reply_text(alert_msg)
-    await update.message.reply_text(
-        "✅ Phase 1 received (from image)!\n\n"
-        "**Phase 2:** Please provide phone number and price.\n"
-        "Format: Phone number and price (e.g., '+1234567890 $500')"
-    )
-    return STATE_PHASE2
+    missing = ai_vision.detect_missing_fields(state_data, normalized_11 or "")
+    if missing:
+        prompts = ai_vision.MISSING_FIELD_PROMPTS
+        msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
+        context.user_data["missing_fields"] = missing
+        context.user_data["missing_field_state_data"] = state_data.copy()
+        await update.message.reply_text(msg)
+        return STATE_MISSING_FIELD
+    return await _ask_add_files(update.message, context)
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -430,12 +437,15 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             return STATE_VIN_CHOICE
         if alert_msg:
             await update.message.reply_text(alert_msg)
-        await update.message.reply_text(
-            "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide phone number and price.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')"
-        )
-        return STATE_PHASE2
+        missing = ai_vision.detect_missing_fields(state_data, message_text)
+        if missing:
+            prompts = ai_vision.MISSING_FIELD_PROMPTS
+            msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
+            context.user_data["missing_fields"] = missing
+            context.user_data["missing_field_state_data"] = state_data.copy()
+            await update.message.reply_text(msg)
+            return STATE_MISSING_FIELD
+        return await _ask_add_files(update.message, context)
     else:
         # No AI: require the 11-line structure
         state_data = parse_phase1_structured(message_text)
@@ -461,12 +471,146 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             return STATE_VIN_CHOICE
         if alert_msg:
             await update.message.reply_text(alert_msg)
-        await update.message.reply_text(
+        missing = ai_vision.detect_missing_fields(state_data, message_text)
+        if missing:
+            prompts = ai_vision.MISSING_FIELD_PROMPTS
+            msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
+            context.user_data["missing_fields"] = missing
+            context.user_data["missing_field_state_data"] = state_data.copy()
+            await update.message.reply_text(msg)
+            return STATE_MISSING_FIELD
+        return await _ask_add_files(update.message, context)
+
+
+async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask user if they want to add files; returns STATE_ADD_FILES."""
+    context.user_data["phase1_attached_files"] = context.user_data.get("phase1_attached_files") or []
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data="add_files_yes")],
+        [InlineKeyboardButton("No", callback_data="add_files_no")],
+    ])
+    await message.reply_text("Do you want to add files?", reply_markup=keyboard)
+    return STATE_ADD_FILES
+
+
+async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle add_files_yes / add_files_no."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if query.data == "add_files_no":
+        state = db.get_user_state(user_id)
+        if state and state.get("data"):
+            d = state["data"].copy()
+            d["attached_files"] = context.user_data.get("phase1_attached_files") or []
+            db.set_user_state(user_id, "phase1", d)
+        await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide phone number and price.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')"
         )
         return STATE_PHASE2
+    # add_files_yes
+    await query.message.reply_text("📎 Send the file (photo or document).")
+    return STATE_WAITING_FILE
+
+
+async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User sent text instead of file; remind them."""
+    await update.message.reply_text(
+        "Please send a photo or document to attach. If you're done, tap No on the previous message."
+    )
+    return STATE_WAITING_FILE
+
+
+async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle file (photo/document) when in STATE_WAITING_FILE."""
+    files = context.user_data.get("phase1_attached_files") or []
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        files.append({"type": "photo", "file_id": file_id})
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        files.append({"type": "document", "file_id": file_id})
+    context.user_data["phase1_attached_files"] = files
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
+        [InlineKeyboardButton("No", callback_data="another_file_no")],
+    ])
+    await update.message.reply_text("Do you want to send another file?", reply_markup=keyboard)
+    return STATE_WAITING_FILE
+
+
+async def handle_another_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle another_file_yes / another_file_no."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    if query.data == "another_file_no":
+        state = db.get_user_state(user_id)
+        if state and state.get("data"):
+            d = state["data"].copy()
+            d["attached_files"] = context.user_data.get("phase1_attached_files") or []
+            db.set_user_state(user_id, "phase1", d)
+        await query.message.reply_text(
+            "✅ Phase 1 received!\n\n"
+            "**Phase 2:** Please provide phone number and price.\n"
+            "Format: Phone number and price (e.g., '+1234567890 $500')"
+        )
+        return STATE_PHASE2
+    await query.message.reply_text("📎 Send the file (photo or document).")
+    return STATE_WAITING_FILE
+
+
+# Maps API field names to state_data keys (e.g. delivery_date -> extra_info)
+MISSING_FIELD_TO_STATE_KEY = {"delivery_date": "extra_info"}
+
+
+async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user reply when we asked for a missing field (e.g. color)."""
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Please send the missing value.")
+        return STATE_MISSING_FIELD
+    missing_fields = context.user_data.get("missing_fields") or []
+    state_data = context.user_data.get("missing_field_state_data") or {}
+    field = missing_fields[0] if missing_fields else "color"
+    state_key = MISSING_FIELD_TO_STATE_KEY.get(field, field)
+    state_data[state_key] = text
+    missing_fields = missing_fields[1:]
+    context.user_data["missing_fields"] = missing_fields
+    context.user_data["missing_field_state_data"] = state_data
+    if missing_fields:
+        next_field = missing_fields[0]
+        prompts = ai_vision.MISSING_FIELD_PROMPTS
+        msg = prompts.get(next_field, (f"You missed out {next_field}. Can you add it?", next_field))[0]
+        await update.message.reply_text(msg)
+        return STATE_MISSING_FIELD
+    db.set_user_state(user_id, "phase1", state_data)
+    context.user_data.pop("missing_fields", None)
+    context.user_data.pop("missing_field_state_data", None)
+    alert_msg, conflict = _vin_check_after_phase1(state_data)
+    if conflict:
+        api_car, stated_car = conflict
+        context.user_data["vin_choice_api_car"] = api_car
+        context.user_data["vin_choice_stated_car"] = stated_car
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
+            [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
+        ])
+        await update.message.reply_text(
+            "⚠️ **VIN returned different car than stated**\n\n"
+            f"• In message: {stated_car}\n"
+            f"• VIN lookup: {api_car}\n\n"
+            "Choose which to use:",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+        return STATE_VIN_CHOICE
+    if alert_msg:
+        await update.message.reply_text(alert_msg)
+    return await _ask_add_files(update.message, context)
 
 
 async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -493,12 +637,7 @@ async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAU
     else:
         context.user_data.pop("vin_choice_api_car", None)
         context.user_data.pop("vin_choice_stated_car", None)
-    await query.message.reply_text(
-        "✅ Phase 1 received!\n\n"
-        "**Phase 2:** Please provide phone number and price.\n"
-        "Format: Phone number and price (e.g., '+1234567890 $500')"
-    )
-    return STATE_PHASE2
+    return await _ask_add_files(query.message, context)
 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -949,6 +1088,33 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             )
         except Exception as e:
             logger.error(f"Error sending to supervisory (chat_id={sup_chat_id}): {e!r}")
+    
+    # Forward attached files to group and supervisory
+    attached_files = phase1_data.get("attached_files") or []
+    try:
+        _group_cid = int(str(group_telegram_id_raw).strip()) if group_telegram_id_raw else None
+    except (ValueError, TypeError):
+        _group_cid = None
+    try:
+        _sup_cid = int(str(supervisory_telegram_id).strip()) if supervisory_telegram_id else None
+    except (ValueError, TypeError):
+        _sup_cid = None
+    for f in attached_files:
+        ftype = f.get("type")
+        fid = f.get("file_id")
+        if not fid:
+            continue
+        try:
+            if ftype == "photo" and _group_cid:
+                await context.bot.send_photo(chat_id=_group_cid, photo=fid)
+            elif ftype == "document" and _group_cid:
+                await context.bot.send_document(chat_id=_group_cid, document=fid)
+            if ftype == "photo" and _sup_cid:
+                await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
+            elif ftype == "document" and _sup_cid:
+                await context.bot.send_document(chat_id=_sup_cid, document=fid)
+        except Exception as e:
+            logger.warning("Could not forward attached file to group/supervisory: %s", e)
     
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
     contact_sources = db.get_contact_info_sources()
@@ -1545,6 +1711,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
             ],
+            STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
+            STATE_ADD_FILES: [CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$")],
+            STATE_WAITING_FILE: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file_upload),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_file_text),
+                CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
+            ],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep)$")],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
@@ -1647,9 +1820,10 @@ def main():
             logger.error("Evening motivation job failed: %s", e)
 
     if application.job_queue:
-        application.job_queue.run_daily(send_morning_motivation, time=dt_time(hour=13, minute=0))   # ~8 AM ET
-        application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=23, minute=0))  # ~6 PM ET
-        logger.info("Daily motivation jobs scheduled (morning ~8 AM ET, evening ~6 PM ET)")
+        eastern = pytz.timezone("America/New_York")
+        application.job_queue.run_daily(send_morning_motivation, time=dt_time(hour=8, minute=0, tzinfo=eastern))
+        application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=18, minute=0, tzinfo=eastern))
+        logger.info("Daily motivation jobs scheduled (8 AM ET, 6 PM ET)")
 
     logger.info("Make sure only ONE instance of the bot is running!")
     logger.info("Starting polling - bot is live. Press Ctrl+C to stop.")

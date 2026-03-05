@@ -525,7 +525,11 @@ class Database:
             return []
         try:
             from datetime import datetime, timedelta
-            cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
+            import pytz
+            eastern = pytz.timezone("America/New_York")
+            now_eastern = datetime.now(eastern)
+            cutoff_dt = (now_eastern - timedelta(hours=24)).astimezone(pytz.UTC)
+            cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             response = self.client.table("lead_assignments").select(
                 "id, lead_id, driver_id, accepted_at, "
                 "lead:leads(reference_id, receipt_image_url), "
@@ -560,8 +564,11 @@ class Database:
             return False
         try:
             from datetime import datetime
+            import pytz
+            now_eastern = datetime.now(pytz.timezone("America/New_York"))
+            now_utc = now_eastern.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             self.client.table("lead_assignments").update({
-                "receipt_reminder_sent_at": datetime.utcnow().isoformat() + "Z",
+                "receipt_reminder_sent_at": now_utc,
             }).eq("id", assignment_id).execute()
             return True
         except Exception as e:
@@ -652,8 +659,10 @@ class Database:
             return []
         try:
             from datetime import datetime, timedelta
+            import pytz
+            now_eastern = datetime.now(pytz.timezone("America/New_York"))
+            cutoff_7d = (now_eastern - timedelta(days=7)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             r = self.client.table("leads").select("user_id, created_at").order("created_at", desc=True).execute()
-            cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
             by_user = {}
             for row in (r.data or []):
                 uid = row.get("user_id")
@@ -675,9 +684,11 @@ class Database:
             return []
         try:
             from datetime import datetime, timedelta
+            import pytz
+            now_eastern = datetime.now(pytz.timezone("America/New_York"))
+            cutoff_7d = (now_eastern - timedelta(days=7)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            cutoff_24h = (now_eastern - timedelta(hours=24)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             r = self.client.table("leads").select("user_id, created_at").execute()
-            cutoff_7d = (datetime.utcnow() - timedelta(days=7)).isoformat() + "Z"
-            cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
             by_user = {}
             for row in (r.data or []):
                 uid = row.get("user_id")

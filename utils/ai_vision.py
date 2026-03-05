@@ -207,3 +207,68 @@ def validate_phase1_extraction(normalized_text: str, state_data: dict) -> tuple[
     # VIN format is not enforced – whatever the AI extracted is kept (no block on "Bronx New York" etc.)
 
     return (len(errors) == 0, errors)
+
+
+# Field labels for user-friendly missing-field prompts
+MISSING_FIELD_PROMPTS = {
+    "color": ("You missed out the vehicle color. Can you add it?", "color"),
+    "vin": ("You missed out the VIN. Can you add it?", "vin"),
+    "car": ("You missed out the car (year/make/model). Can you add it?", "car"),
+    "insurance_company": ("You missed out the insurance company. Can you add it?", "insurance_company"),
+    "delivery_date": ("You missed out the delivery date/time. Can you add it?", "extra_info"),
+}
+
+
+def detect_missing_fields(state_data: dict, raw_input: str) -> list[str]:
+    """
+    Detect important missing fields. Uses quick check first, then OpenAI if configured.
+    Returns list of field keys (e.g. ["color"]). Uses OPENAI_API_KEY for AI detection.
+    """
+    def _has_val(key: str) -> bool:
+        v = (state_data.get(key) or "").strip()
+        return bool(v and v != "-")
+
+    # Quick check: color is commonly missed
+    if not _has_val("color"):
+        return ["color"]
+
+    # Use OpenAI to scan for other missing fields (if API configured)
+    try:
+        from config import Config
+        if not Config.OPENAI_API_KEY or not str(Config.OPENAI_API_KEY).strip():
+            return []
+    except Exception:
+        return []
+
+    prompt = (
+        "Vehicle/lead info extracted:\n"
+        f"Name: {state_data.get('name') or '-'}\n"
+        f"VIN: {state_data.get('vin') or '-'}\n"
+        f"Car: {state_data.get('car') or '-'}\n"
+        f"Color: {state_data.get('color') or '-'}\n"
+        f"Insurance: {state_data.get('insurance_company') or '-'}\n"
+        f"Extra/Delivery time: {state_data.get('extra_info') or '-'}\n\n"
+        "Raw message: " + (raw_input[:400] or "") + "\n\n"
+        "Reply with ONLY a comma-separated list of missing fields: color, vin, car, insurance_company, delivery_date. "
+        "Only list fields that are clearly missing (blank or dash). If none missing, reply: none"
+    )
+    try:
+        out = _call_openai_text([{"role": "user", "content": prompt}])
+        if not out or not out.strip():
+            return []
+        out = out.strip().lower()
+        if "none" in out:
+            return []
+        missing = []
+        for w in out.replace(",", " ").split():
+            w = w.strip()
+            if w in ("color", "vin", "car", "insurance_company", "delivery_date") and w not in missing:
+                if w == "delivery_date" and _has_val("extra_info"):
+                    continue
+                if w in ("vin", "car", "insurance_company") and _has_val(w):
+                    continue
+                missing.append(w)
+        return missing
+    except Exception as e:
+        logger.warning("detect_missing_fields: %s", e)
+        return []
