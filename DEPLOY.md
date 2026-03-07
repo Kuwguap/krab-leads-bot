@@ -1,8 +1,32 @@
 # Deployment Guide
 
-## Environment Variables for Render
+## Render Blueprint Deployment
 
-Add these in your Render dashboard for the **krabsleads-bot** worker:
+This project includes a `render.yaml` Blueprint for one-click deployment.
+
+### Deploy from Blueprint
+
+1. **Push your repo to GitHub/GitLab** (must be connected to Render).
+
+2. **Create Blueprint in Render:**
+   - Go to [Render Dashboard](https://dashboard.render.com) → **Blueprints**
+   - **New** → **Create Blueprint**
+   - Connect your repo and select the branch
+   - Render reads `render.yaml` and provisions:
+     - **krabsleads-admin** (web service) – Flask admin dashboard
+     - **krabsleads-bot** (worker) – Telegram bot
+
+3. **Set environment variables** when prompted (or in each service's Environment tab):
+   - All vars use `sync: false` – you must add values in the Render dashboard
+   - See table below
+
+4. **Supabase:** Run `database/schema.sql` and `database/schema_multi_group.sql` in your Supabase SQL Editor before the bot receives leads.
+
+### Environment Variables for Render
+
+**krabsleads-admin (web):** SUPABASE_URL, SUPABASE_KEY
+
+**krabsleads-bot (worker):** Add these in the Render dashboard:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -16,7 +40,8 @@ Add these in your Render dashboard for the **krabsleads-bot** worker:
 | DRIVER_TELEGRAM_ID | Optional | Legacy driver ID |
 | GROUP_TELEGRAM_ID | Optional | Legacy group ID |
 | SUPERVISORY_TELEGRAM_ID | Optional | Legacy supervisory ID |
-| **OPENAI_API_KEY** | **Yes (for AI)** | OpenAI API key for AI vision extraction and missing-field detection (color, VIN, etc.) |
+| **OPENAI_API_KEY** | **Yes (for AI)** | OpenAI API key for AI vision and missing-field detection |
+| API_NINJAS_API_KEY | Optional | For premium VIN lookup (VIN_PROVIDER=api_ninjas) |
 
 **OPENAI_API_KEY** is required for:
 - AI vision (screenshot/image extraction)
@@ -27,7 +52,7 @@ Add these in your Render dashboard for the **krabsleads-bot** worker:
 1. **Push to Git:**
    ```bash
    git add .
-   git commit -m "Add missing-field detection, file attachments, Eastern timezone"
+   git commit -m "Your message"
    git push origin main
    ```
 

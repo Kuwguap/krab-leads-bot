@@ -46,6 +46,7 @@ STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistan
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
 STATE_VIN_CHOICE = 10  # VIN checker returned different car; user picks stated vs API
+STATE_VIN_RETYPE = 14  # User chose to retype VIN; waiting for new VIN input
 STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
 STATE_ADD_FILES = 12  # Ask "Do you want to add files?"
 STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
@@ -206,6 +207,18 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
     return (None, (api_car, stated))
 
 
+def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
+    """Build keyboard for VIN conflict: keep driver details, use VIN search result, or retype VIN."""
+    def _t(s: str, n: int = 35) -> str:
+        s = s or ""
+        return (s[:n] + "…") if len(s) > n else s
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Keep driver details in lead data: {_t(stated_car)}", callback_data="vin_keep")],
+        [InlineKeyboardButton(f"Use VIN found in search: {_t(api_car)}", callback_data="vin_use")],
+        [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
+    ])
+
+
 def _clean_vin_and_car(state_data: dict) -> None:
     """Identify VIN only as a 17 alphanumeric string (no cutting). Clean car from phones and any stray VIN."""
     vin_raw = (state_data.get("vin") or "").strip()
@@ -353,14 +366,11 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         api_car, stated_car = conflict
         context.user_data["vin_choice_api_car"] = api_car
         context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
-            [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
-        ])
+        keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
             "⚠️ **VIN returned different car than stated**\n\n"
-            f"• In message: {stated_car}\n"
-            f"• VIN lookup: {api_car}\n\n"
+            f"• Driver details in lead: {stated_car}\n"
+            f"• VIN lookup result: {api_car}\n\n"
             "Choose which to use:",
             reply_markup=keyboard,
             parse_mode="Markdown",
@@ -422,14 +432,11 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             api_car, stated_car = conflict
             context.user_data["vin_choice_api_car"] = api_car
             context.user_data["vin_choice_stated_car"] = stated_car
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
-                [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
-            ])
+            keyboard = _vin_choice_keyboard(api_car, stated_car)
             await update.message.reply_text(
                 "⚠️ **VIN returned different car than stated**\n\n"
-                f"• In message: {stated_car}\n"
-                f"• VIN lookup: {api_car}\n\n"
+                f"• Driver details in lead: {stated_car}\n"
+                f"• VIN lookup result: {api_car}\n\n"
                 "Choose which to use:",
                 reply_markup=keyboard,
                 parse_mode="Markdown",
@@ -456,14 +463,11 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             api_car, stated_car = conflict
             context.user_data["vin_choice_api_car"] = api_car
             context.user_data["vin_choice_stated_car"] = stated_car
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
-                [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
-            ])
+            keyboard = _vin_choice_keyboard(api_car, stated_car)
             await update.message.reply_text(
                 "⚠️ **VIN returned different car than stated**\n\n"
-                f"• In message: {stated_car}\n"
-                f"• VIN lookup: {api_car}\n\n"
+                f"• Driver details in lead: {stated_car}\n"
+                f"• VIN lookup result: {api_car}\n\n"
                 "Choose which to use:",
                 reply_markup=keyboard,
                 parse_mode="Markdown",
@@ -595,14 +599,11 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         api_car, stated_car = conflict
         context.user_data["vin_choice_api_car"] = api_car
         context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Use VIN: {api_car[:40]}…" if len(api_car) > 40 else f"Use VIN: {api_car}", callback_data="vin_use")],
-            [InlineKeyboardButton(f"Keep stated: {stated_car[:40]}…" if len(stated_car) > 40 else f"Keep stated: {stated_car}", callback_data="vin_keep")],
-        ])
+        keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
             "⚠️ **VIN returned different car than stated**\n\n"
-            f"• In message: {stated_car}\n"
-            f"• VIN lookup: {api_car}\n\n"
+            f"• Driver details in lead: {stated_car}\n"
+            f"• VIN lookup result: {api_car}\n\n"
             "Choose which to use:",
             reply_markup=keyboard,
             parse_mode="Markdown",
@@ -614,10 +615,13 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle VIN conflict choice: use API result or keep stated car, then go to Phase 2."""
+    """Handle VIN conflict choice: use API result, keep stated car, or retype VIN."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    if query.data == "vin_retype":
+        await query.message.reply_text("Please type the correct VIN (17 characters):")
+        return STATE_VIN_RETYPE
     if query.data == "vin_use":
         api_car = context.user_data.get("vin_choice_api_car")
         if api_car:
@@ -638,6 +642,44 @@ async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAU
         context.user_data.pop("vin_choice_api_car", None)
         context.user_data.pop("vin_choice_stated_car", None)
     return await _ask_add_files(query.message, context)
+
+
+async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user's new VIN input; re-run lookup and either proceed or show choice again."""
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+    vin_new = _extract_vin_17(text)
+    if not vin_new or len(vin_new) != 17:
+        await update.message.reply_text(
+            "Please send a valid 17-character VIN (letters and numbers only)."
+        )
+        return STATE_VIN_RETYPE
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"].copy()
+    state_data["vin"] = vin_new
+    _clean_vin_and_car(state_data)
+    db.set_user_state(user_id, "phase1", state_data)
+    alert_msg, conflict = _vin_check_after_phase1(state_data)
+    if conflict:
+        api_car, stated_car = conflict
+        context.user_data["vin_choice_api_car"] = api_car
+        context.user_data["vin_choice_stated_car"] = stated_car
+        keyboard = _vin_choice_keyboard(api_car, stated_car)
+        await update.message.reply_text(
+            "⚠️ **VIN returned different car than stated**\n\n"
+            f"• Driver details in lead: {stated_car}\n"
+            f"• VIN lookup result: {api_car}\n\n"
+            "Choose which to use:",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+        return STATE_VIN_CHOICE
+    if alert_msg:
+        await update.message.reply_text(alert_msg)
+    return await _ask_add_files(update.message, context)
 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1719,7 +1761,8 @@ def main():
                 CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
             ],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
-            STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep)$")],
+            STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
+            STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],

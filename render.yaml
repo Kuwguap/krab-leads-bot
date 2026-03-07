@@ -1,10 +1,9 @@
-# Two separate services so only ONE process runs the Telegram bot (avoids 409 Conflict).
-# - Web: admin dashboard API (no Telegram).
-# - Worker: Telegram bot (single instance, no scaling).
+# Render Blueprint: KrabsLeads
+# Web: admin dashboard API (Flask). Worker: Telegram bot (single instance; do not scale to avoid 409 Conflict).
 services:
   - type: web
     name: krabsleads-admin
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python admin_dashboard.py
     envVars:
@@ -14,7 +13,7 @@ services:
         sync: false
   - type: worker
     name: krabsleads-bot
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -39,4 +38,6 @@ services:
       - key: SUPERVISORY_TELEGRAM_ID
         sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: API_NINJAS_API_KEY
         sync: false
