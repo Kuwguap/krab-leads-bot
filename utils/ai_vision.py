@@ -209,9 +209,15 @@ def validate_phase1_extraction(normalized_text: str, state_data: dict) -> tuple[
     return (len(errors) == 0, errors)
 
 
+# Values we treat as "no real color" (placeholders / unknowns)
+COLOR_PLACEHOLDERS = frozenset({
+    "-", "n/a", "na", "?", "??", "unknown", "none", "n/a", "tbd", "pending",
+    "not specified", "not provided", "blank", "x", "xx", "xxx",
+})
+
 # Field labels for user-friendly missing-field prompts
 MISSING_FIELD_PROMPTS = {
-    "color": ("You missed out the vehicle color. Can you add it?", "color"),
+    "color": ("You missed out the vehicle color. Please provide the exact vehicle color for accurate data.", "color"),
     "vin": ("You missed out the VIN. Can you add it?", "vin"),
     "car": ("You missed out the car (year/make/model). Can you add it?", "car"),
     "insurance_company": ("You missed out the insurance company. Can you add it?", "insurance_company"),
@@ -219,18 +225,67 @@ MISSING_FIELD_PROMPTS = {
 }
 
 
+def _ai_check_color_in_raw(extracted_color: str, raw_input: str) -> bool:
+    """
+    Use AI to check if vehicle color is genuinely in the raw message.
+    Returns True if color is missing/placeholder (we should prompt for it).
+    """
+    try:
+        from config import Config
+        if not Config.OPENAI_API_KEY or not str(Config.OPENAI_API_KEY).strip():
+            return False
+    except Exception:
+        return False
+    prompt = (
+        "In the following raw message from a user submitting vehicle/lead info, "
+        "was the VEHICLE COLOR explicitly stated? "
+        "Consider it MISSING if: not mentioned, or only placeholders like -, N/A, ?, unknown, TBD.\n\n"
+        f"Extracted color field: '{extracted_color}'\n\n"
+        f"Raw message:\n{raw_input[:500]}\n\n"
+        "Reply with exactly: missing (if color not clearly provided) or ok (if a real color like Silver, Black, White is given)"
+    )
+    try:
+        out = _call_openai_text([{"role": "user", "content": prompt}])
+        if not out:
+            return False
+        return "missing" in out.strip().lower()
+    except Exception:
+        return False
+
+
+def _has_valid_color(val: str) -> bool:
+    """True if color field has a real value (not blank, dash, or placeholder)."""
+    v = (val or "").strip().lower()
+    if not v:
+        return False
+    if v in COLOR_PLACEHOLDERS:
+        return False
+    # Reject very short/generic values
+    if len(v) < 2:
+        return False
+    return True
+
+
 def detect_missing_fields(state_data: dict, raw_input: str) -> list[str]:
     """
-    Detect important missing fields. Uses quick check first, then OpenAI if configured.
-    Returns list of field keys (e.g. ["color"]). Uses OPENAI_API_KEY for AI detection.
+    Detect important missing fields. Color is checked first (often missed).
+    Uses OPENAI_API_KEY for AI verification when color is ambiguous.
+    Returns list of field keys (e.g. ["color"]).
     """
     def _has_val(key: str) -> bool:
         v = (state_data.get(key) or "").strip()
         return bool(v and v != "-")
 
-    # Quick check: color is commonly missed
-    if not _has_val("color"):
+    # Color: strict check – reject placeholders (N/A, ?, unknown, etc.)
+    color_val = (state_data.get("color") or "").strip()
+    if not _has_valid_color(color_val):
         return ["color"]
+
+    # Optional: use AI to double-check – sometimes AI extraction puts wrong value in color
+    if raw_input:
+        _missing_from_ai = _ai_check_color_in_raw(color_val, raw_input)
+        if _missing_from_ai:
+            return ["color"]
 
     # Use OpenAI to scan for other missing fields (if API configured)
     try:
@@ -248,9 +303,10 @@ def detect_missing_fields(state_data: dict, raw_input: str) -> list[str]:
         f"Color: {state_data.get('color') or '-'}\n"
         f"Insurance: {state_data.get('insurance_company') or '-'}\n"
         f"Extra/Delivery time: {state_data.get('extra_info') or '-'}\n\n"
-        "Raw message: " + (raw_input[:400] or "") + "\n\n"
-        "Reply with ONLY a comma-separated list of missing fields: color, vin, car, insurance_company, delivery_date. "
-        "Only list fields that are clearly missing (blank or dash). If none missing, reply: none"
+        "Raw message: " + (raw_input[:600] or "") + "\n\n"
+        "Which fields are MISSING or invalid? Consider color missing if it's -, N/A, ?, unknown, TBD, or any placeholder. "
+        "Reply with ONLY a comma-separated list: color, vin, car, insurance_company, delivery_date. "
+        "If none missing, reply: none"
     )
     try:
         out = _call_openai_text([{"role": "user", "content": prompt}])
