@@ -2,7 +2,7 @@
 
 ## Render Blueprint Deployment
 
-This project includes a `render.yaml` Blueprint for one-click deployment.
+This project includes a `render.yaml` Blueprint at the repo root for one-click deployment to Render.
 
 ### Deploy from Blueprint
 
@@ -41,7 +41,9 @@ This project includes a `render.yaml` Blueprint for one-click deployment.
 | GROUP_TELEGRAM_ID | Optional | Legacy group ID |
 | SUPERVISORY_TELEGRAM_ID | Optional | Legacy supervisory ID |
 | **OPENAI_API_KEY** | **Yes (for AI)** | OpenAI API key for AI vision and missing-field detection |
+| OPENAI_VISION_MODEL | Optional | Model for AI (default: gpt-4o) |
 | API_NINJAS_API_KEY | Optional | For premium VIN lookup (VIN_PROVIDER=api_ninjas) |
+| VIN_PROVIDER | Optional | `nhtsa` (free, default) or `api_ninjas` |
 
 **OPENAI_API_KEY** is required for:
 - AI vision (screenshot/image extraction)

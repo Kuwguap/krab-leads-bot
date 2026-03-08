@@ -2072,6 +2072,13 @@ def main():
                 reference_id = item.get("reference_id", "N/A")
                 drivers = item.get("drivers") or []
                 driver_names = ", ".join(d.get("driver_name", "?") for d in drivers)
+                # Mark FIRST to prevent spam: if mark fails (e.g. migration not run), skip sending
+                if not db.mark_driver_timeout_notified(lead_id):
+                    logger.error(
+                        "Driver timeout: could not mark lead %s as notified (run database/migration_driver_timeout.sql). Skipping send to avoid spam.",
+                        lead_id,
+                    )
+                    continue
                 try:
                     user_chat = int(user_id) if isinstance(user_id, (int, str)) else user_id
                 except (ValueError, TypeError):
@@ -2106,7 +2113,6 @@ def main():
                     )
                 except Exception as e:
                     logger.warning("User timeout notify: %s", e)
-                db.mark_driver_timeout_notified(lead_id)
                 logger.info("Driver timeout notified for lead %s ref %s", lead_id, reference_id)
         except Exception as e:
             logger.error("Driver timeout job failed: %s", e)
