@@ -558,6 +558,97 @@ class Database:
             logger.error(f"Error getting overdue receipt assignments: {e}")
             return []
 
+    def get_leads_pending_driver_timeout(self, minutes: int = 10) -> list:
+        """Leads where all assignments are still pending, oldest assignment 10+ min ago, timeout not yet notified."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+            eastern = pytz.timezone("America/New_York")
+            now_eastern = datetime.now(eastern)
+            cutoff_dt = (now_eastern - timedelta(minutes=minutes)).astimezone(pytz.UTC)
+            cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            r = self.client.table("lead_assignments").select(
+                "lead_id, created_at, driver:drivers(driver_telegram_id, driver_name)"
+            ).eq("status", "pending").lt("created_at", cutoff).execute()
+            if not r.data:
+                return []
+            by_lead = {}
+            for row in r.data or []:
+                lid = row.get("lead_id")
+                if lid not in by_lead:
+                    by_lead[lid] = {"drivers": [], "min_created": row.get("created_at")}
+                driver = row.get("driver") or {}
+                by_lead[lid]["drivers"].append({
+                    "driver_telegram_id": driver.get("driver_telegram_id"),
+                    "driver_name": driver.get("driver_name", "Driver"),
+                })
+                c = row.get("created_at")
+                if c and (not by_lead[lid]["min_created"] or c < by_lead[lid]["min_created"]):
+                    by_lead[lid]["min_created"] = c
+            out = []
+            for lead_id, info in by_lead.items():
+                lead = self.get_lead_by_id(lead_id)
+                if not lead:
+                    continue
+                if lead.get("driver_timeout_notified_at"):
+                    continue
+                accepted = self.client.table("lead_assignments").select("id").eq(
+                    "lead_id", lead_id
+                ).eq("status", "accepted").execute()
+                if accepted.data:
+                    continue
+                out.append({
+                    "lead_id": lead_id,
+                    "user_id": lead.get("user_id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "drivers": info["drivers"],
+                })
+            return out
+        except Exception as e:
+            logger.error("get_leads_pending_driver_timeout: %s", e)
+            return []
+
+    def mark_driver_timeout_notified(self, lead_id: str) -> bool:
+        """Mark that we sent driver timeout notification for this lead."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime
+            import pytz
+            now_utc = datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            self.client.table("leads").update({
+                "driver_timeout_notified_at": now_utc
+            }).eq("id", lead_id).execute()
+            return True
+        except Exception as e:
+            logger.error("mark_driver_timeout_notified: %s", e)
+            return False
+
+    def get_driver_pending_receipts(self, driver_id: str) -> list:
+        """Accepted assignments for this driver where lead has no receipt. Returns list of {reference_id, lead_id, lead}."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("lead_assignments").select(
+                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info)"
+            ).eq("driver_id", driver_id).eq("status", "accepted").execute()
+            out = []
+            for row in r.data or []:
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+                out.append({
+                    "lead_id": row.get("lead_id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "lead": lead,
+                })
+            return out
+        except Exception as e:
+            logger.error("get_driver_pending_receipts: %s", e)
+            return []
+
     def mark_receipt_reminder_sent(self, assignment_id: str) -> bool:
         """Mark that we sent the receipt reminder for this assignment."""
         if not self._check_tables_exist():

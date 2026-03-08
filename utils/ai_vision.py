@@ -25,6 +25,7 @@ STRICT RULES:
 - Each line must contain ONLY the value for that field. No phone numbers in any line (phone is collected separately later). No URLs, no extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
+- Line 8 (Color): ONLY the vehicle color (e.g. Silver, Black). If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
 - If a value is missing or unreadable, put a single dash "-" for that line.
 
 Order (one value per line, no labels):
@@ -63,6 +64,7 @@ STRICT RULES:
 - Each line must contain ONLY the value for that field. Do NOT put phone numbers in any of these 11 lines (phone is collected separately). No URLs. No extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else on that line.
+- Line 8 (Color): ONLY the vehicle color (e.g. Silver, Black, White). If the user did NOT state a color, use "-". Never put city names (e.g. Brick, Jersey), addresses, or insurance names in the color field.
 - If something is missing, put a single dash "-" for that line.
 
 Order of the 11 lines (one value per line, no labels):
@@ -209,10 +211,14 @@ def validate_phase1_extraction(normalized_text: str, state_data: dict) -> tuple[
     return (len(errors) == 0, errors)
 
 
-# Values we treat as "no real color" (placeholders / unknowns)
+# Values we treat as "no real color" – placeholders, unknowns, or common mis-extractions
+# (e.g. "brick" from "Brick New Jersey", "road", "avenue", insurance/city names)
 COLOR_PLACEHOLDERS = frozenset({
-    "-", "n/a", "na", "?", "??", "unknown", "none", "n/a", "tbd", "pending",
+    "-", "n/a", "na", "?", "??", "unknown", "none", "tbd", "pending",
     "not specified", "not provided", "blank", "x", "xx", "xxx",
+    "brick", "road", "avenue", "island", "delivery", "jersey", "new",
+    "safeco", "state", "farm", "geico", "progressive", "allstate",
+    "address", "street", "number", "digits", "vin",
 })
 
 # Field labels for user-friendly missing-field prompts
@@ -228,7 +234,7 @@ MISSING_FIELD_PROMPTS = {
 def _ai_check_color_in_raw(extracted_color: str, raw_input: str) -> bool:
     """
     Use AI to check if vehicle color is genuinely in the raw message.
-    Returns True if color is missing/placeholder (we should prompt for it).
+    Returns True if color is missing (we should prompt for it).
     """
     try:
         from config import Config
@@ -237,12 +243,13 @@ def _ai_check_color_in_raw(extracted_color: str, raw_input: str) -> bool:
     except Exception:
         return False
     prompt = (
-        "In the following raw message from a user submitting vehicle/lead info, "
-        "was the VEHICLE COLOR explicitly stated? "
-        "Consider it MISSING if: not mentioned, or only placeholders like -, N/A, ?, unknown, TBD.\n\n"
-        f"Extracted color field: '{extracted_color}'\n\n"
-        f"Raw message:\n{raw_input[:500]}\n\n"
-        "Reply with exactly: missing (if color not clearly provided) or ok (if a real color like Silver, Black, White is given)"
+        "In the raw message below, was the VEHICLE COLOR (e.g. Silver, Black, White, Red, Blue) explicitly stated?\n\n"
+        "STRICT: Reply 'missing' if the user did NOT clearly provide a vehicle color. "
+        "Reply 'missing' if the extracted value is a city name (e.g. Brick, Jersey), address word (road, avenue, island), "
+        "insurance name (Safeco), or any placeholder. Only reply 'ok' if a REAL vehicle color like Silver/Black/White/Red is clearly given.\n\n"
+        f"Extracted color: '{extracted_color}'\n\n"
+        f"Raw message:\n{raw_input[:600]}\n\n"
+        "Reply with exactly: missing  OR  ok"
     )
     try:
         out = _call_openai_text([{"role": "user", "content": prompt}])

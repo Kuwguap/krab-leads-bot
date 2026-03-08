@@ -20,7 +20,7 @@ This project includes a `render.yaml` Blueprint for one-click deployment.
    - All vars use `sync: false` – you must add values in the Render dashboard
    - See table below
 
-4. **Supabase:** Run `database/schema.sql` and `database/schema_multi_group.sql` in your Supabase SQL Editor before the bot receives leads.
+4. **Supabase:** Run `database/schema.sql`, `database/schema_multi_group.sql`, and `database/migration_driver_timeout.sql` in your Supabase SQL Editor before the bot receives leads.
 
 ### Environment Variables for Render
 

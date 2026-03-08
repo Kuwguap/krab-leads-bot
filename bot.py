@@ -62,6 +62,48 @@ ots = OneTimeSecret()
 monday = MondayClient() if Config.is_monday_configured() else None
 
 
+SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
+
+
+def _get_suspended_driver_ids() -> set:
+    """Driver IDs with 3+ pending receipts (suspended)."""
+    suspended = set()
+    try:
+        drivers = db.get_all_drivers()
+        for d in drivers:
+            pending = db.get_driver_pending_receipts(d["id"])
+            if len(pending) >= SUSPENSION_THRESHOLD:
+                suspended.add(d["id"])
+    except Exception as e:
+        logger.warning("_get_suspended_driver_ids: %s", e)
+    return suspended
+
+
+def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, include_all: bool = True):
+    """Build driver selection keyboard. Suspended drivers get driver_suspended_X callback and (PENALTY) label."""
+    suspended = _get_suspended_driver_ids() if exclude_suspended else set()
+    buttons = []
+    for d in drivers:
+        did = d.get("id")
+        name = d.get("driver_name", "Unknown")
+        if did in suspended:
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🚫 {name} (PENALTY)",
+                    callback_data=f"driver_suspended_{did}"
+                )
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton(f"🚗 {name}", callback_data=f"select_driver_{did}")
+            ])
+    if include_all:
+        elig = [d for d in drivers if d.get("id") not in suspended]
+        if elig:
+            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def generate_reference_id() -> str:
     """Generate a unique reference ID for lead tracking."""
     # Generate 8-character alphanumeric ID
@@ -261,8 +303,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = user.id
     username = user.username or "Unknown"
     
-    # Clear any existing state
+    # Clear any existing state and attached files from previous leads
     db.clear_user_state(user_id)
+    if context.user_data:
+        context.user_data.pop("phase1_attached_files", None)
     
     # Initialize new state
     db.set_user_state(user_id, "phase1", {})
@@ -488,7 +532,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ask user if they want to add files; returns STATE_ADD_FILES."""
-    context.user_data["phase1_attached_files"] = context.user_data.get("phase1_attached_files") or []
+    context.user_data["phase1_attached_files"] = []
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Yes", callback_data="add_files_yes")],
         [InlineKeyboardButton("No", callback_data="add_files_no")],
@@ -794,18 +838,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
     
-    keyboard_buttons = []
-    for driver in drivers:
-        keyboard_buttons.append([
-            InlineKeyboardButton(
-                f"🚗 {driver.get('driver_name', 'Unknown')}",
-                callback_data=f"select_driver_{driver['id']}"
-            )
-        ])
-    keyboard_buttons.append([
-        InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")
-    ])
-    driver_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
     driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
     await update.message.reply_text(
         f"✅ Phone and price received!\n\n"
@@ -841,18 +874,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     if not active_drivers:
         await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
-    keyboard_buttons = []
-    for driver in drivers:
-        keyboard_buttons.append([
-            InlineKeyboardButton(
-                f"🚗 {driver.get('driver_name', 'Unknown')}",
-                callback_data=f"select_driver_{driver['id']}"
-            )
-        ])
-    keyboard_buttons.append([
-        InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")
-    ])
-    driver_keyboard = InlineKeyboardMarkup(keyboard_buttons)
+    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
     driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
     await query.message.reply_text(
         f"✅ Group selected: **{selected_group.get('group_name', 'N/A')}**\n\n"
@@ -866,7 +888,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle driver selection after Phase 2 (or after group selection when assistants_choose_group)."""
+    """Handle driver selection after Phase 2 (or after group selection, or after timeout resend)."""
     query = update.callback_query
     await query.answer()
     
@@ -879,7 +901,14 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     
     lead_data = state.get("data", {})
-    phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group']}
+    
+    # Resend flow: lead exists, just send to new drivers
+    if lead_data.get("resend") and lead_data.get("lead_id"):
+        return await _handle_resend_to_drivers(
+            update, context, lead_data, query.data, user_id,
+        )
+    
+    phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
     phone_number = lead_data.get('phone_number')
     price = lead_data.get('price')
     encrypted_data = lead_data.get('encrypted_data', {})
@@ -894,10 +923,45 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     all_drivers = db.get_all_drivers()
     active_drivers = [d for d in all_drivers if d.get('is_active', True)]
     
+    suspended = _get_suspended_driver_ids()
     if callback_data == "select_driver_all":
-        # Send to all active drivers
-        selected_driver_ids = [d['id'] for d in active_drivers]
-        selected_drivers = active_drivers
+        selected_drivers = [d for d in active_drivers if d['id'] not in suspended]
+        selected_driver_ids = [d['id'] for d in selected_drivers]
+        if not selected_drivers:
+            await query.message.reply_text("❌ No eligible drivers (all suspended). Please select a driver individually.")
+            return STATE_SELECT_DRIVER
+    elif callback_data.startswith("driver_suspended_"):
+        driver_id = callback_data.replace("driver_suspended_", "")
+        driver = next((d for d in all_drivers if d["id"] == driver_id), None)
+        name = driver.get("driver_name", "Driver") if driver else "Driver"
+        pending = db.get_driver_pending_receipts(driver_id) if driver_id else []
+        count = len(pending)
+        await query.message.reply_text(
+            f"⚠️ **{name}** is temporarily suspended (PENALTY).\n\n"
+            f"They owe {count} receipt(s). No leads will be sent until all receipts are uploaded."
+        )
+        # Notify driver that dispatcher tried to send lead
+        tid = driver.get("driver_telegram_id") if driver else None
+        if tid and pending:
+            try:
+                cid = int(str(tid).strip())
+                ref_buttons = [
+                    [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                    for p in pending[:10]
+                ]
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        f"⛔ **Temporary suspension**\n\n"
+                        f"Dispatcher tried to send you a lead, but you owe **{count}** receipt(s).\n\n"
+                        f"Upload all receipts below to resume receiving leads:"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(ref_buttons),
+                )
+            except Exception as e:
+                logger.warning("Could not notify suspended driver: %s", e)
+        return STATE_SELECT_DRIVER
     else:
         # Send to selected driver
         driver_id = callback_data.replace("select_driver_", "")
@@ -906,6 +970,9 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not selected_drivers:
             await query.message.reply_text("❌ Error: Driver not found.")
             return ConversationHandler.END
+        if driver_id in suspended:
+            await query.message.reply_text("❌ This driver is suspended. Please select another.")
+            return STATE_SELECT_DRIVER
     
     # Create lead in database
     final_lead_data = {
@@ -1016,8 +1083,9 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         }
     
     # Prepare messages for distribution
-    # Full message with all details (for Supervisory) – phone only via encrypted link
+    # Full message with all details (for Supervisory) – phone only via encrypted link; include reference ID
     full_message = (
+        f"📋 Reference ID: `{reference_id}`\n"
         f"👤 User: @{username}\n"
         f"🚗 Vehicle: {vehicle_safe}\n"
         f"📍 Delivery: {delivery_safe}\n"
@@ -1027,9 +1095,10 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
 
-    # Group message – no raw phone; vehicle content sanitized
+    # Group message – no raw phone; vehicle content sanitized; include reference ID for linking
     group_message = (
         f"🏷NEW CLIENT❗️\n\n"
+        f"📋 Reference ID: `{reference_id}`\n"
         f"🚗 Vehicle: {vehicle_safe}\n"
         f"🔗 Encrypted Link: {encrypted_data.get('link')}\n"
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
@@ -1063,7 +1132,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             except (ValueError, TypeError):
                 driver_chat_id = driver_telegram_id_raw
             try:
-                # Create assignment record
                 db.create_lead_assignment(lead['id'], driver['id'], group_id)
                 await context.bot.send_message(
                     chat_id=driver_chat_id,
@@ -1072,6 +1140,23 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     reply_markup=accept_keyboard
                 )
                 assigned_count += 1
+                # Strike message: if driver has 1–2 pending receipts, remind them
+                pending = db.get_driver_pending_receipts(driver['id'])
+                if 1 <= len(pending) <= 2:
+                    ref_buttons = [
+                        [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                        for p in pending
+                    ]
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=(
+                            f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s):\n\n"
+                            + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending) +
+                            "\n\nTap below to view details and upload:"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(ref_buttons),
+                    )
             except Exception as e:
                 logger.error(f"Error sending to driver {driver.get('driver_name')} (chat_id={driver_chat_id}): {e!r}")
     
@@ -1106,7 +1191,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     supervisory_telegram_id = selected_group.get('supervisory_telegram_id')
     supervisory_message = (
         f"{full_message}\n\n"
-        f"📋 Reference ID: `{reference_id}`\n"
         f"👥 Group: {selected_group.get('group_name', 'N/A')}"
     )
     
@@ -1276,7 +1360,144 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def _handle_resend_to_drivers(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    lead_data: dict, callback_data: str, user_id: int,
+) -> int:
+    """Resend lead to newly selected drivers after timeout."""
+    lead_id = lead_data.get("lead_id")
+    reference_id = lead_data.get("reference_id", "N/A")
+    group_id = lead_data.get("group_id")
+    selected_group = lead_data.get("selected_group")
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await update.callback_query.message.reply_text("❌ Lead not found.")
+        db.clear_user_state(user_id)
+        return ConversationHandler.END
+    all_drivers = db.get_all_drivers()
+    active_drivers = [d for d in all_drivers if d.get("is_active", True)]
+    if callback_data == "select_driver_all":
+        selected_drivers = active_drivers
+    else:
+        driver_id = callback_data.replace("select_driver_", "")
+        selected_drivers = [d for d in active_drivers if d["id"] == driver_id]
+        if not selected_drivers:
+            await update.callback_query.message.reply_text("❌ Driver not found.")
+            return STATE_SELECT_DRIVER
+    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    driver_request_message = (
+        f"👋Hi! New client 💸 available📈❗️\n\n"
+        f"📍 Delivery: {lead.get('delivery_details', '')}\n"
+        f"📋 Reference ID: `{reference_id}`\n"
+        f" Delivery Time 🏷️: {extra_safe}\n"
+        f"Please have Car, Driver License, and Laser Printer Ready✅"
+    )
+    accept_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead_id}"),
+        ]
+    ])
+    assigned_count = 0
+    for driver in selected_drivers:
+        tid = driver.get("driver_telegram_id")
+        if not tid:
+            continue
+        try:
+            cid = int(str(tid).strip())
+        except (ValueError, TypeError):
+            cid = tid
+        try:
+            db.create_lead_assignment(lead_id, driver["id"], group_id)
+            await context.bot.send_message(
+                chat_id=cid,
+                text=driver_request_message,
+                parse_mode="Markdown",
+                reply_markup=accept_keyboard,
+            )
+            assigned_count += 1
+            pending = db.get_driver_pending_receipts(driver["id"])
+            if 1 <= len(pending) <= 2:
+                ref_buttons = [
+                    [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                    for p in pending
+                ]
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s). Tap to view and upload:",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(ref_buttons),
+                )
+        except Exception as e:
+            logger.error("Resend to driver %s: %s", driver.get("driver_name"), e)
+    driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+    group_telegram_id = selected_group.get("group_telegram_id") if selected_group else None
+    if group_telegram_id and assigned_count > 0:
+        try:
+            gcid = int(str(group_telegram_id).strip())
+            await context.bot.send_message(
+                chat_id=gcid,
+                text=f"🔄 Reference ID `{reference_id}`: Reassigned to driver(s) **{driver_names}**",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Group reassign notify: %s", e)
+    await update.callback_query.message.reply_text(
+        f"✅ **Lead resent successfully**\n\n"
+        f"Reference ID: `{reference_id}`\n"
+        f"Sent to driver(s): **{driver_names}**\n\n"
+        "Use /start to create another lead.",
+        parse_mode="Markdown",
+    )
+    db.clear_user_state(user_id)
+    return ConversationHandler.END
+
+
 # Driver assignment handlers
+async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 'Pick new driver' after timeout – show driver picker for resend."""
+    query = update.callback_query
+    await query.answer()
+    lead_id = query.data.replace("resend_driver_", "").strip()
+    user_id = query.from_user.id
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("❌ Lead not found. Use /start to create a new lead.")
+        return
+    group_id = lead.get("group_id")
+    if not group_id:
+        await query.message.reply_text("❌ Lead has no group. Use /start to create a new lead.")
+        return
+    selected_group = db.get_group_by_id(group_id)
+    if not selected_group:
+        await query.message.reply_text("❌ Group not found. Use /start to create a new lead.")
+        return
+    reference_id = lead.get("reference_id") or "N/A"
+    resend_data = {
+        "lead_id": lead_id,
+        "reference_id": reference_id,
+        "group_id": group_id,
+        "selected_group": selected_group,
+        "resend": True,
+    }
+    db.set_user_state(user_id, "select_driver", resend_data)
+    drivers = db.get_all_drivers()
+    active_drivers = [d for d in drivers if d.get("is_active", True)]
+    if not active_drivers:
+        await query.message.reply_text("❌ No active drivers found. Please contact admin.")
+        return
+    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
+    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
+    await query.message.reply_text(
+        f"🔄 **Pick new driver**\n\n"
+        f"Reference ID: `{reference_id}`\n\n"
+        f"Select which driver(s) to notify:",
+        parse_mode="Markdown",
+        reply_markup=driver_keyboard,
+    )
+    return STATE_SELECT_DRIVER
+
+
 async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle driver accepting a lead."""
     query = update.callback_query
@@ -1371,7 +1592,25 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
             reply_markup=receipt_keyboard
         )
-        
+        # Strike message: remind about pending receipts
+        pending = db.get_driver_pending_receipts(driver["id"])
+        if pending:
+            ref_buttons = [
+                [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                for p in pending[:10]
+            ]
+            if len(pending) >= SUSPENSION_THRESHOLD:
+                txt = (
+                    f"⛔ **Temporary suspension**\n\n"
+                    f"You owe **{len(pending)}** receipt(s). Upload all to resume receiving leads:"
+                )
+            else:
+                txt = f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s). Tap to view and upload:"
+            await query.message.reply_text(
+                txt,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(ref_buttons),
+            )
         # Forward acceptance message to group
         if group:
             group_telegram_id = group.get('group_telegram_id')
@@ -1429,6 +1668,34 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # Receipt submission handlers
+async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """When driver clicks ref in strike message – show lead details and Upload button."""
+    query = update.callback_query
+    await query.answer()
+    ref = query.data.replace("receipt_for_", "").strip()
+    lead = db.get_lead_by_reference_id(ref)
+    if not lead:
+        await query.message.reply_text(f"❌ Reference ID `{ref}` not found.")
+        return ConversationHandler.END
+    context.user_data["receipt_lead_id"] = lead["id"]
+    context.user_data["receipt_reference_id"] = ref
+    context.user_data["receipt_monday_item_id"] = lead.get("monday_item_id")
+    delivery_safe = _sanitize_phones_for_send(lead.get("delivery_details") or "")
+    msg = (
+        f"📋 **Reference ID:** `{ref}`\n\n"
+        f"📍 Delivery: {delivery_safe or 'N/A'}\n"
+        f"🚗 Vehicle: {lead.get('vehicle_details', 'N/A')[:300]}\n\n"
+        "Upload receipt for this lead:"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Upload Receipt", callback_data="confirm_receipt")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_receipt")],
+    ])
+    db.set_user_state(query.from_user.id, "waiting_receipt_confirm", context.user_data)
+    await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    return STATE_WAITING_RECEIPT_CONFIRM
+
+
 async def handle_driver_receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle driver receipt button callback."""
     query = update.callback_query
@@ -1747,7 +2014,10 @@ def main():
     
     # Create conversation handler for lead creation
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
+        ],
         states={
             STATE_PHASE1: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
@@ -1764,7 +2034,7 @@ def main():
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
             STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
-            STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_")],
+            STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
@@ -1772,7 +2042,10 @@ def main():
     
     # Create conversation handler for receipt submission
     receipt_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(handle_driver_receipt_callback, pattern="^driver_receipt$")],
+        entry_points=[
+            CallbackQueryHandler(handle_driver_receipt_callback, pattern="^driver_receipt$"),
+            CallbackQueryHandler(handle_receipt_for_ref_callback, pattern="^receipt_for_"),
+        ],
         states={
             STATE_WAITING_REFERENCE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reference_id_input)],
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
@@ -1789,6 +2062,58 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
     
+    # Driver timeout: every minute, check for leads where no driver accepted within 10 min
+    async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            overdue = db.get_leads_pending_driver_timeout(minutes=10)
+            for item in overdue:
+                lead_id = item.get("lead_id")
+                user_id = item.get("user_id")
+                reference_id = item.get("reference_id", "N/A")
+                drivers = item.get("drivers") or []
+                driver_names = ", ".join(d.get("driver_name", "?") for d in drivers)
+                try:
+                    user_chat = int(user_id) if isinstance(user_id, (int, str)) else user_id
+                except (ValueError, TypeError):
+                    user_chat = user_id
+                for d in drivers:
+                    tid = d.get("driver_telegram_id")
+                    if not tid:
+                        continue
+                    try:
+                        cid = int(str(tid).strip())
+                        await context.bot.send_message(
+                            chat_id=cid,
+                            text=f"⏰ **Lead expired.**\n\nReference ID: `{reference_id}`\n\nNo one accepted in time.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.warning("Driver timeout notify to %s: %s", tid, e)
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Pick new driver", callback_data=f"resend_driver_{lead_id}")],
+                ])
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_chat,
+                        text=(
+                            f"⏰ **Lead not accepted**\n\n"
+                            f"Driver(s) **{driver_names}** did not accept the lead.\n\n"
+                            f"Reference ID: `{reference_id}`\n\n"
+                            "Tap below to pick a new driver:"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                    )
+                except Exception as e:
+                    logger.warning("User timeout notify: %s", e)
+                db.mark_driver_timeout_notified(lead_id)
+                logger.info("Driver timeout notified for lead %s ref %s", lead_id, reference_id)
+        except Exception as e:
+            logger.error("Driver timeout job failed: %s", e)
+    if application.job_queue:
+        application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
+        logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
+
     # Receipt reminder: every hour, send a reminder to drivers who accepted 24+ hours ago and haven't submitted receipt
     async def send_receipt_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
