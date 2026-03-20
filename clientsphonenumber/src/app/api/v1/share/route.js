@@ -36,8 +36,10 @@ export const runtime = "nodejs";
 
 export async function POST(req) {
   try {
-    const expectedUser = process.env.ONETIMESECRET_USERNAME || process.env.CLIENTSPHNUMBER_USERNAME || "";
-    const expectedKey = process.env.ONETIMESECRET_API_KEY || process.env.CLIENTSPHNUMBER_API_KEY || "";
+    const expectedUser =
+      (process.env.ONETIMESECRET_USERNAME || process.env.CLIENTSPHNUMBER_USERNAME || "").trim();
+    const expectedKey =
+      (process.env.ONETIMESECRET_API_KEY || process.env.CLIENTSPHNUMBER_API_KEY || "").trim();
     if (!expectedUser || !expectedKey) {
       return NextResponse.json(
         { error: "Server not configured (missing ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY)" },
@@ -47,7 +49,9 @@ export async function POST(req) {
 
     const auth = parseBasicAuth(req.headers.get("authorization") || "");
     if (!auth) return unauthorized("Missing Basic auth");
-    if (auth.username !== expectedUser || auth.apiKey !== expectedKey) return forbidden("Bad credentials");
+    if (auth.username.trim() !== expectedUser || auth.apiKey.trim() !== expectedKey) {
+      return forbidden("Bad credentials");
+    }
 
     const body = await parseShareBody(req);
     const secret = (body?.secret ?? "").toString().trim();

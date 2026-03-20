@@ -27,7 +27,7 @@ export async function POST(req) {
       return NextResponse.json({ error: "Expired" }, { status: 410 });
     }
 
-    if ((config.passphrase || "").toString() !== passphrase) {
+    if ((config.passphrase || "").toString().trim() !== passphrase.trim()) {
       return NextResponse.json({ error: "Incorrect passphrase" }, { status: 401 });
     }
 
