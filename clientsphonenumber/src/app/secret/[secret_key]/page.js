@@ -9,6 +9,7 @@ export default function SecretPage({ params }) {
   const [error, setError] = useState("");
   const [secret, setSecret] = useState("");
   const [unlocked, setUnlocked] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   async function unlock() {
     setError("");
@@ -39,21 +40,60 @@ export default function SecretPage({ params }) {
     }
   }
 
+  async function copySecret() {
+    if (!secret) return;
+    try {
+      await navigator.clipboard.writeText(secret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
-    <main style={{ maxWidth: 720, margin: "40px auto", padding: 16, fontFamily: "system-ui" }}>
-      <h1 style={{ marginBottom: 12 }}>Unlock note</h1>
+    <main
+      style={{
+        minHeight: "100vh",
+        background: "#08142b",
+        color: "#f3f4f6",
+        padding: "60px 16px",
+        fontFamily: "Georgia, 'Times New Roman', serif",
+      }}
+    >
+      <div
+        style={{
+          maxWidth: 760,
+          margin: "0 auto",
+          background: "rgba(255,255,255,0.08)",
+          border: "1px solid rgba(255,255,255,0.12)",
+          borderRadius: 14,
+          padding: 28,
+        }}
+      >
+        <h1 style={{ marginBottom: 14, fontSize: 44, lineHeight: 1.1 }}>Your secure message is {unlocked ? "shown below." : "ready."}</h1>
       {!unlocked ? (
         <>
-          <p style={{ marginBottom: 18, color: "#555" }}>
-            Enter the passphrase set by the admin to reveal this phone number.
+          <p style={{ marginBottom: 12, color: "#e5e7eb", fontSize: 34 }}>
+            This message requires a passphrase:
           </p>
-          <div style={{ display: "grid", gap: 10 }}>
-            <label style={{ fontWeight: 600 }}>
-              Passphrase
+          <div style={{ display: "grid", gap: 12 }}>
+            <label style={{ fontWeight: 600, color: "#dbe2ea" }}>
               <input
                 value={passphrase}
                 onChange={(e) => setPassphrase(e.target.value)}
-                style={{ display: "block", width: "100%", padding: 12, marginTop: 6 }}
+                placeholder="Enter the passphrase here"
+                style={{
+                  display: "block",
+                  width: "100%",
+                  padding: 16,
+                  marginTop: 6,
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "rgba(255,255,255,0.08)",
+                  color: "#fff",
+                  fontSize: 30,
+                }}
                 type="password"
                 autoComplete="off"
               />
@@ -63,40 +103,66 @@ export default function SecretPage({ params }) {
               onClick={unlock}
               disabled={loading || !secretKey}
               style={{
-                padding: "12px 16px",
+                padding: "16px 18px",
                 border: "none",
-                borderRadius: 8,
-                background: "#667eea",
+                borderRadius: 10,
+                background: "#cf421a",
                 color: "white",
                 cursor: "pointer",
-                fontWeight: 700,
+                fontWeight: 800,
+                fontSize: 42,
                 opacity: loading ? 0.7 : 1,
               }}
             >
-              {loading ? "Unlocking..." : "Unlock"}
+              {loading ? "Revealing..." : "Click to reveal ->"}
             </button>
           </div>
-          {error ? <p style={{ marginTop: 12, color: "#dc3545" }}>{error}</p> : null}
+          {error ? <p style={{ marginTop: 12, color: "#ff8a8a", fontFamily: "system-ui, sans-serif" }}>{error}</p> : null}
         </>
       ) : (
         <>
-          <p style={{ marginBottom: 10, color: "#155724", fontWeight: 700 }}>Unlocked</p>
+          <p style={{ marginBottom: 14, color: "#f3f4f6", fontSize: 20, fontFamily: "system-ui, sans-serif" }}>
+            Your secure message is shown below.
+          </p>
           <div
             style={{
-              background: "#f6f6f6",
-              borderRadius: 12,
-              padding: 16,
+              background: "rgba(255,255,255,0.08)",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.16)",
+              padding: 18,
               wordBreak: "break-word",
-              fontSize: 20,
+              fontSize: 36,
+              color: "#fff",
             }}
           >
             {secret}
           </div>
+          <button
+            type="button"
+            onClick={copySecret}
+            style={{
+              marginTop: 16,
+              padding: "14px 20px",
+              border: "none",
+              borderRadius: 10,
+              background: "#cf421a",
+              color: "white",
+              cursor: "pointer",
+              fontWeight: 800,
+              fontSize: 28,
+            }}
+          >
+            {copied ? "Copied" : "Copy to clipboard"}
+          </button>
+          <p style={{ marginTop: 30, color: "#9ca3af", fontSize: 14, fontFamily: "system-ui, sans-serif" }}>
+            You can close this window when done.
+          </p>
         </>
       )}
-      <p style={{ marginTop: 24, color: "#888", fontSize: 12 }}>
+      <p style={{ marginTop: 28, color: "#6b7280", fontSize: 12, fontFamily: "system-ui, sans-serif" }}>
         Secret key: {secretKey?.slice(0, 10)}...
       </p>
+      </div>
     </main>
   );
 }
