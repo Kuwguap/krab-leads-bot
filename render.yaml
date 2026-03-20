@@ -27,6 +27,12 @@ services:
         sync: false
       - key: ONETIMESECRET_API_KEY
         sync: false
+      - key: ONETIMESECRET_URL
+        sync: false
+      - key: ONETIMESECRET_LINK_BASE
+        sync: false
+      - key: ONETIMESECRET_PASSPHRASE
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY

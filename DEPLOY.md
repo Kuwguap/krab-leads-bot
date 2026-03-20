@@ -20,7 +20,7 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
    - All vars use `sync: false` – you must add values in the Render dashboard
    - See table below
 
-4. **Supabase:** Run `database/schema.sql`, `database/schema_multi_group.sql`, and `database/migration_driver_timeout.sql` in your Supabase SQL Editor before the bot receives leads.
+4. **Supabase:** Run `database/schema.sql`, `database/schema_multi_group.sql`, `database/migration_driver_timeout.sql`, and `database/migration_clientsphonenumber.sql` in your Supabase SQL Editor before the bot receives leads.
 
 ### Environment Variables for Render
 
@@ -33,8 +33,11 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
 | TELEGRAM_BOT_TOKEN | Yes | Telegram bot token |
 | MONDAY_API_KEY | Yes | Monday.com API key |
 | MONDAY_BOARD_ID | Yes | Monday.com board ID |
-| ONETIMESECRET_USERNAME | Yes | OneTimeSecret username |
-| ONETIMESECRET_API_KEY | Yes | OneTimeSecret API key |
+| ONETIMESECRET_USERNAME | Yes | Basic-auth username used by `clientsphonenumber` API |
+| ONETIMESECRET_API_KEY | Yes | Basic-auth key used by `clientsphonenumber` API |
+| ONETIMESECRET_URL | Yes | OneTimeSecret-compatible endpoint (e.g. `https://clientsphonenumber.vercel.app/api/v1/share`) |
+| ONETIMESECRET_LINK_BASE | Yes | Link base shown to users (e.g. `https://clientsphonenumber.vercel.app/secret/`) |
+| ONETIMESECRET_PASSPHRASE | Yes | Passphrase sent by bot when creating secret links |
 | SUPABASE_URL | Yes | Supabase project URL |
 | SUPABASE_KEY | Yes | Supabase anon key |
 | DRIVER_TELEGRAM_ID | Optional | Legacy driver ID |
@@ -62,8 +65,17 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
    - The admin dashboard lives in `admin-frontend/` (Next.js)
    - Vercel auto-deploys from your Git repo if connected
    - Ensure `admin-frontend` is the root or set root directory in Vercel project settings
-   - Add env vars in Vercel: `NEXT_PUBLIC_API_URL` (e.g. your Render admin web URL)
+   - Add env vars in Vercel: `NEXT_PUBLIC_ADMIN_BACKEND_URL` (e.g. your Render admin web URL)
 
-3. **Render:**
+3. **Vercel (Clients Phone Number app):**
+   - The OneTimeSecret-compatible app lives in `clientsphonenumber/` (Next.js)
+   - Deploy as its own Vercel project (e.g. `clientsphonenumber.vercel.app`)
+   - Add env vars:
+     - `SUPABASE_URL`
+     - `SUPABASE_KEY`
+     - `ONETIMESECRET_USERNAME`
+     - `ONETIMESECRET_API_KEY`
+
+4. **Render:**
    - Push triggers automatic redeploy if Render is connected to your repo
    - Add `OPENAI_API_KEY` in Render → krabsleads-bot → Environment
