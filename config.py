@@ -25,8 +25,12 @@ class Config:
     # OneTimeSecret
     ONETIMESECRET_USERNAME = os.getenv("ONETIMESECRET_USERNAME")
     ONETIMESECRET_API_KEY = os.getenv("ONETIMESECRET_API_KEY")
-    ONETIMESECRET_URL = "https://onetimesecret.com/api/v1/share"
-    ONETIMESECRET_PASSPHRASE = "DispatchPassword"
+    # OneTimeSecret-compatible endpoint implemented by this repo in `clientsphonenumber/`
+    # (temporary until you buy clientsphonenumber.com)
+    ONETIMESECRET_URL = os.getenv("ONETIMESECRET_URL") or "https://clientsphonenumber.vercel.app/api/v1/share"
+    # Public base URL used to render clickable secret links (must end with `/secret/`)
+    ONETIMESECRET_LINK_BASE = os.getenv("ONETIMESECRET_LINK_BASE") or "https://clientsphonenumber.vercel.app/secret/"
+    ONETIMESECRET_PASSPHRASE = os.getenv("ONETIMESECRET_PASSPHRASE") or "DispatchPassword"
     
     # Supabase
     SUPABASE_URL = os.getenv("SUPABASE_URL")

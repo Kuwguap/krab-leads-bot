@@ -12,6 +12,7 @@ class OneTimeSecret:
         self.username = Config.ONETIMESECRET_USERNAME
         self.api_key = Config.ONETIMESECRET_API_KEY
         self.passphrase = Config.ONETIMESECRET_PASSPHRASE
+        self.link_base = getattr(Config, "ONETIMESECRET_LINK_BASE", "https://clientsphonenumber.vercel.app/secret/")
     
     def encrypt_phone(self, phone_number: str) -> Optional[Dict[str, str]]:
         """
@@ -37,7 +38,7 @@ class OneTimeSecret:
                 return {
                     "secret_key": data.get("secret_key"),
                     "metadata_key": data.get("metadata_key"),
-                    "link": f"https://onetimesecret.com/secret/{data.get('secret_key')}"
+                    "link": f"{self.link_base}{data.get('secret_key')}"
                 }
             else:
                 print(f"OneTimeSecret API error: {response.status_code} - {response.text}")
@@ -65,7 +66,7 @@ class OneTimeSecret:
             )
             if response.status_code == 200:
                 data = response.json()
-                return f"https://onetimesecret.com/secret/{data.get('secret_key')}"
+                return f"{self.link_base}{data.get('secret_key')}"
             return None
         except Exception as e:
             print(f"Error sharing secret with OneTimeSecret: {e}")
