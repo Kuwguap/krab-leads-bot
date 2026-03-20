@@ -362,6 +362,7 @@ class AdminDatabase:
         }
 
         "Owed receipts" are accepted assignments where the joined lead has no receipt_image_url.
+        Admin API: receipt_debts_summary (v1).
         """
         if not self._check_tables_exist():
             return {"drivers": []}
