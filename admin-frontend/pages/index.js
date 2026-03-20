@@ -80,9 +80,18 @@ export default function AdminPanel() {
         const data = await res.json();
         setReceiptDebtsDrivers(data?.drivers || []);
       } else {
+        const status = res.status;
+        showMessage(
+          `Receipt tracker API not available (HTTP ${status}). Redeploy the Render admin backend to include the new /api/receipt_debts routes.`,
+          'error'
+        );
         setReceiptDebtsDrivers([]);
       }
     } catch {
+      showMessage(
+        'Could not reach the Render admin backend receipt tracker API. Check NEXT_PUBLIC_ADMIN_BACKEND_URL.',
+        'error'
+      );
       setReceiptDebtsDrivers([]);
     }
   }, []);
