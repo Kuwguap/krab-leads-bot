@@ -343,6 +343,159 @@ class AdminDatabase:
             pass
         return out
 
+    # Receipt debts (pending receipts) for admin penalty tooling
+    def get_receipt_debts_summary(self, refs_per_driver: int = 5) -> dict:
+        """
+        Return summary for admin UI:
+        {
+          "drivers": [
+            {
+              "driver_id": "...",
+              "driver_name": "...",
+              "is_active": true/false,
+              "owed_receipts": <int>,
+              "pending_references": [
+                { "assignment_id": "...", "reference_id": "...", "accepted_at": "..." }
+              ]
+            }
+          ]
+        }
+
+        "Owed receipts" are accepted assignments where the joined lead has no receipt_image_url.
+        """
+        if not self._check_tables_exist():
+            return {"drivers": []}
+
+        try:
+            drivers_resp = self.client.table("drivers").select("id, driver_name, is_active").order("driver_name").execute()
+            drivers = drivers_resp.data or []
+
+            # Pull all accepted assignments with receipt fields from the joined lead.
+            # We'll filter to "receipt missing" in Python to keep the logic consistent with bot.py.
+            assignments_resp = self.client.table("lead_assignments").select(
+                "id, driver_id, accepted_at, lead:leads(reference_id, receipt_image_url)"
+            ).eq("status", "accepted").execute()
+
+            by_driver = {d.get("id"): {
+                "driver_id": d.get("id"),
+                "driver_name": d.get("driver_name", "N/A"),
+                "is_active": d.get("is_active", True),
+                "owed_receipts": 0,
+                "pending_references": [],
+            } for d in drivers}
+
+            for row in (assignments_resp.data or []):
+                driver_id = row.get("driver_id")
+                if not driver_id or driver_id not in by_driver:
+                    continue
+
+                lead = row.get("lead") or {}
+                # receipt_image_url empty or null => missing receipt
+                if lead.get("receipt_image_url"):
+                    continue
+
+                by_driver[driver_id]["owed_receipts"] += 1
+
+                # Keep only the first N refs for the "portion" shown in the table.
+                if len(by_driver[driver_id]["pending_references"]) < (refs_per_driver or 0):
+                    by_driver[driver_id]["pending_references"].append({
+                        "assignment_id": row.get("id"),
+                        "reference_id": lead.get("reference_id") or "N/A",
+                        "accepted_at": row.get("accepted_at"),
+                    })
+
+            # Keep stable driver ordering (from drivers table).
+            out_drivers = [by_driver.get(d.get("id")) for d in drivers if by_driver.get(d.get("id"))]
+            return {"drivers": out_drivers}
+        except Exception:
+            # Don't break the whole admin page if Supabase is temporarily failing.
+            return {"drivers": []}
+
+    def get_driver_pending_receipts(self, driver_id: str) -> list:
+        """
+        Return full pending receipt items for a driver.
+        Each item includes lead details so admin can click a reference and inspect it.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            assignments_resp = self.client.table("lead_assignments").select(
+                "id, driver_id, accepted_at, lead:leads("
+                "id, reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, monday_status"
+                ")"
+            ).eq("status", "accepted").eq("driver_id", driver_id).order("accepted_at").execute()
+
+            out = []
+            for row in (assignments_resp.data or []):
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+
+                out.append({
+                    "assignment_id": row.get("id"),
+                    "lead_id": lead.get("id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "accepted_at": row.get("accepted_at"),
+                    "monday_status": lead.get("monday_status"),
+                    "vehicle_details": lead.get("vehicle_details"),
+                    "delivery_details": lead.get("delivery_details"),
+                    "extra_info": lead.get("extra_info"),
+                })
+            return out
+        except Exception:
+            return []
+
+    def delete_pending_receipt_assignment(self, assignment_id: str) -> bool:
+        """
+        Delete a single pending receipt item by deleting its lead_assignments row.
+        Only allowed when the joined lead has no receipt_image_url.
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            r = self.client.table("lead_assignments").select("id, lead:leads(receipt_image_url)").eq("id", assignment_id).limit(1).execute()
+            if not r.data:
+                return False
+
+            lead = (r.data[0].get("lead") or {})
+            if lead.get("receipt_image_url"):
+                # Receipt already submitted; don't delete.
+                return False
+
+            self.client.table("lead_assignments").delete().eq("id", assignment_id).execute()
+            return True
+        except Exception:
+            return False
+
+    def delete_pending_receipts_for_driver(self, driver_id: str) -> int:
+        """
+        Clear all pending receipts (delete accepted assignments without receipts) for a driver.
+        Returns number of deleted lead_assignments rows.
+        """
+        if not self._check_tables_exist():
+            return 0
+        try:
+            r = self.client.table("lead_assignments").select("id, lead:leads(receipt_image_url)").eq("status", "accepted").eq(
+                "driver_id", driver_id
+            ).execute()
+
+            pending_ids = []
+            for row in (r.data or []):
+                lead = row.get("lead") or {}
+                if not lead.get("receipt_image_url"):
+                    pending_ids.append(row.get("id"))
+
+            deleted = 0
+            for aid in pending_ids:
+                if not aid:
+                    continue
+                ok = self.client.table("lead_assignments").delete().eq("id", aid).execute()
+                # Supabase returns data depending on config; we just count attempted deletes that succeeded without exception.
+                deleted += 1
+            return deleted
+        except Exception:
+            return 0
+
 db = AdminDatabase()
 
 # Simple HTML template for the dashboard
@@ -1166,6 +1319,46 @@ def api_stats():
         return jsonify(db.get_lead_stats())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/receipt_debts/summary', methods=['GET'])
+def api_receipt_debts_summary():
+    """Get per-driver count of owed receipts + a small portion of pending references."""
+    try:
+        return jsonify(db.get_receipt_debts_summary())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/receipt_debts/drivers/<driver_id>', methods=['GET'])
+def api_receipt_debts_driver(driver_id):
+    """Get the full list of pending receipt items for a given driver."""
+    try:
+        return jsonify(db.get_driver_pending_receipts(driver_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/receipt_debts/drivers/<driver_id>/pending', methods=['DELETE'])
+def api_receipt_debts_clear_driver(driver_id):
+    """Clear pending receipts for a driver by deleting unsent receipt assignments."""
+    try:
+        deleted = db.delete_pending_receipts_for_driver(driver_id)
+        return jsonify({"success": True, "deleted": deleted})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/receipt_debts/assignments/<assignment_id>', methods=['DELETE'])
+def api_receipt_debts_delete_assignment(assignment_id):
+    """Delete a single pending receipt assignment row."""
+    try:
+        ok = db.delete_pending_receipt_assignment(assignment_id)
+        if ok:
+            return jsonify({"success": True})
+        return jsonify({"success": False, "error": "Assignment not found or receipt already submitted."}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/groups/<group_id>/toggle', methods=['POST'])

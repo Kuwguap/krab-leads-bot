@@ -10,6 +10,12 @@ export default function AdminPanel() {
   const [contactSources, setContactSources] = useState([]);
   const [assignments, setAssignments] = useState([]);
   const [stats, setStats] = useState({ total_leads: 0, drivers: [] });
+  const [receiptDebtsDrivers, setReceiptDebtsDrivers] = useState([]);
+  const [receiptModalOpen, setReceiptModalOpen] = useState(false);
+  const [receiptModalDriver, setReceiptModalDriver] = useState(null); // { driver_id, driver_name }
+  const [receiptModalItems, setReceiptModalItems] = useState([]); // pending receipt assignments
+  const [receiptSelectedAssignmentId, setReceiptSelectedAssignmentId] = useState(null);
+  const [receiptModalLoading, setReceiptModalLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
   const [messageType, setMessageType] = useState('success');
@@ -67,6 +73,20 @@ export default function AdminPanel() {
     } catch {}
   }, []);
 
+  const fetchReceiptDebts = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/receipt_debts/summary`);
+      if (res.ok) {
+        const data = await res.json();
+        setReceiptDebtsDrivers(data?.drivers || []);
+      } else {
+        setReceiptDebtsDrivers([]);
+      }
+    } catch {
+      setReceiptDebtsDrivers([]);
+    }
+  }, []);
+
   const fetchContactSources = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/contact_sources`);
@@ -95,10 +115,10 @@ export default function AdminPanel() {
     }
     (async () => {
       setLoading(true);
-      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats(), fetchContactSources(), fetchAssignments()]);
+      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats(), fetchReceiptDebts(), fetchContactSources(), fetchAssignments()]);
       setLoading(false);
     })();
-  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchContactSources, fetchAssignments]);
+  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchContactSources, fetchAssignments]);
 
   useEffect(() => {
     if (!API || groups.length === 0) return;
@@ -192,6 +212,75 @@ export default function AdminPanel() {
         fetchDrivers();
       } else {
         showMessage(data.error || 'Failed to update driver', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function openReceiptDebtModal(driverId, assignmentIdToSelect = null) {
+    if (!driverId) return;
+    setReceiptModalLoading(true);
+    try {
+      const summaryDriver = receiptDebtsDrivers.find((d) => d.driver_id === driverId);
+      const fallbackDriver = drivers.find((d) => d.id === driverId);
+      const driverName = summaryDriver?.driver_name || fallbackDriver?.driver_name || 'N/A';
+
+      const res = await fetch(`${API}/api/receipt_debts/drivers/${driverId}`);
+      const items = res.ok ? await res.json() : [];
+
+      setReceiptModalDriver({ driver_id: driverId, driver_name: driverName });
+      setReceiptModalItems(items || []);
+      const nextSelected = assignmentIdToSelect || (items?.[0]?.assignment_id ?? null);
+      setReceiptSelectedAssignmentId(nextSelected);
+      setReceiptModalOpen(true);
+    } catch {
+      showMessage('Failed to load pending receipts.', 'error');
+      setReceiptModalOpen(false);
+    } finally {
+      setReceiptModalLoading(false);
+    }
+  }
+
+  async function clearDriverPendingReceipts(driverId) {
+    if (!driverId) return;
+    const ok = window.confirm('Delete ALL pending (unsent) receipts for this driver? This clears the penalty used by the bot.');
+    if (!ok) return;
+
+    try {
+      const res = await fetch(`${API}/api/receipt_debts/drivers/${driverId}/pending`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage(`Cleared pending receipts (${data.deleted || 0}).`);
+        await fetchReceiptDebts();
+        // Refresh modal items if we are viewing this driver.
+        if (receiptModalDriver?.driver_id === driverId) {
+          await openReceiptDebtModal(driverId);
+        }
+      } else {
+        showMessage(data.error || 'Failed to clear pending receipts.', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
+  async function deletePendingReceiptAssignment(assignmentId) {
+    if (!assignmentId) return;
+    const ok = window.confirm('Delete this pending receipt assignment (unsent receipt)?');
+    if (!ok) return;
+
+    try {
+      const res = await fetch(`${API}/api/receipt_debts/assignments/${assignmentId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showMessage('Pending receipt deleted.');
+        await fetchReceiptDebts();
+        if (receiptModalDriver?.driver_id) {
+          await openReceiptDebtModal(receiptModalDriver.driver_id);
+        }
+      } else {
+        showMessage(data.error || 'Failed to delete pending receipt.', 'error');
       }
     } catch {
       showMessage('Network error.', 'error');
@@ -370,6 +459,9 @@ export default function AdminPanel() {
     );
   }
 
+  const receiptSelectedItem =
+    receiptModalItems.find((it) => it.assignment_id === receiptSelectedAssignmentId) || null;
+
   return (
     <div className="admin-page" style={styles.page}>
       <style dangerouslySetInnerHTML={{ __html: `
@@ -458,6 +550,64 @@ export default function AdminPanel() {
               )}
             </tbody>
           </table>
+          </div>
+        </section>
+
+        <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>Receipt Tracker (Owed)</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>
+            Owed receipts are accepted leads with an empty/missing receipt image. Deleting pending items clears the penalty used by the bot.
+          </p>
+          <div className="admin-table-wrap">
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th>Driver</th>
+                  <th>Owed receipts</th>
+                  <th>Pending refs</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(receiptDebtsDrivers || []).length === 0 ? (
+                  <tr><td colSpan={4} style={{ textAlign: 'center', color: '#888' }}>No pending receipts found</td></tr>
+                ) : (
+                  (receiptDebtsDrivers || []).map((d) => (
+                    <tr key={d.driver_id}>
+                      <td>{d.driver_name}</td>
+                      <td>{d.owed_receipts || 0}</td>
+                      <td>
+                        {(d.pending_references || []).length === 0 ? (
+                          <span style={{ color: '#888' }}>—</span>
+                        ) : (
+                          (d.pending_references || []).map((r) => (
+                            <button
+                              key={r.assignment_id}
+                              type="button"
+                              className="admin-mobile-full"
+                              style={{ ...styles.buttonSmall, marginRight: 8, marginBottom: 8, minWidth: 0, background: '#667eea', color: 'white' }}
+                              onClick={() => openReceiptDebtModal(d.driver_id, r.assignment_id)}
+                            >
+                              {r.reference_id}
+                            </button>
+                          ))
+                        )}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          onClick={() => openReceiptDebtModal(d.driver_id)}
+                          className="admin-mobile-full"
+                          style={{ ...styles.button, ...styles.buttonSmall }}
+                        >
+                          View details
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
 
@@ -734,6 +884,212 @@ export default function AdminPanel() {
           </table>
           </div>
         </section>
+
+        {receiptModalOpen && (
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              background: 'rgba(0,0,0,0.6)',
+              zIndex: 9999,
+              padding: 20,
+              overflow: 'auto',
+            }}
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setReceiptModalOpen(false);
+            }}
+          >
+            <div
+              style={{
+                background: 'white',
+                borderRadius: 12,
+                boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+                maxWidth: 1100,
+                margin: '0 auto',
+                padding: 20,
+              }}
+            >
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                <div>
+                  <h2 style={{ margin: 0, color: '#333' }}>
+                    Pending receipts: {receiptModalDriver?.driver_name || '—'}
+                  </h2>
+                  <p style={{ marginTop: 6, marginBottom: 0, color: '#555' }}>
+                    {receiptModalItems.length} pending unsent receipt(s)
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    onClick={() => clearDriverPendingReceipts(receiptModalDriver?.driver_id)}
+                    className="admin-mobile-full"
+                    style={{ ...styles.button, ...styles.buttonSmall, background: '#dc3545' }}
+                    disabled={receiptModalLoading || !receiptModalDriver?.driver_id || receiptModalItems.length === 0}
+                  >
+                    Clear all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReceiptModalOpen(false)}
+                    className="admin-mobile-full"
+                    style={{ ...styles.button, ...styles.buttonSmall }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                {receiptModalLoading ? (
+                  <p style={{ color: '#555' }}>Loading pending receipts...</p>
+                ) : receiptModalItems.length === 0 ? (
+                  <p style={{ color: '#888' }}>No pending receipts for this driver.</p>
+                ) : (
+                  <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                    <div style={{ flex: '1 1 320px', minWidth: 280 }}>
+                      <h3 style={{ marginBottom: 10, color: '#667eea' }}>References</h3>
+                      <div style={{ maxHeight: 420, overflow: 'auto', paddingRight: 8 }}>
+                        {(receiptModalItems || []).map((it) => {
+                          const selected = it.assignment_id === receiptSelectedAssignmentId;
+                          return (
+                            <div
+                              key={it.assignment_id}
+                              style={{
+                                display: 'flex',
+                                gap: 8,
+                                alignItems: 'center',
+                                padding: 8,
+                                borderRadius: 8,
+                                border: selected ? '2px solid #667eea' : '1px solid #eee',
+                                marginBottom: 8,
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => setReceiptSelectedAssignmentId(it.assignment_id)}
+                                style={{
+                                  ...styles.buttonSmall,
+                                  background: selected ? '#667eea' : '#eee',
+                                  color: selected ? 'white' : '#333',
+                                  borderRadius: 6,
+                                  border: 'none',
+                                  cursor: 'pointer',
+                                  padding: '8px 10px',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                {it.reference_id}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deletePendingReceiptAssignment(it.assignment_id)}
+                                style={{
+                                  ...styles.buttonSmall,
+                                  background: '#dc3545',
+                                  color: 'white',
+                                  borderRadius: 6,
+                                  border: 'none',
+                                  cursor: 'pointer',
+                                  padding: '8px 10px',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div style={{ flex: '2 1 520px', minWidth: 320 }}>
+                      <h3 style={{ marginBottom: 10, color: '#667eea' }}>Receipt details</h3>
+                      {receiptSelectedItem ? (
+                        <div>
+                          <p style={{ marginBottom: 8 }}>
+                            <strong>Reference:</strong> {receiptSelectedItem.reference_id}
+                            <br />
+                            <strong>Accepted at:</strong> {receiptSelectedItem.accepted_at || '—'}
+                            <br />
+                            <strong>Lead ID:</strong> {receiptSelectedItem.lead_id || '—'}
+                          </p>
+                          <p style={{ marginBottom: 8, color: '#555' }}>
+                            <strong>Monday status:</strong> {receiptSelectedItem.monday_status || '—'}
+                          </p>
+
+                          <div style={{ marginBottom: 12 }}>
+                            <strong>Vehicle details:</strong>
+                            <pre
+                              style={{
+                                background: '#f6f6f6',
+                                padding: 12,
+                                borderRadius: 8,
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-word',
+                                maxHeight: 220,
+                                overflow: 'auto',
+                              }}
+                            >
+                              {receiptSelectedItem.vehicle_details || ''}
+                            </pre>
+                          </div>
+
+                          <div style={{ marginBottom: 12 }}>
+                            <strong>Delivery details:</strong>
+                            <pre
+                              style={{
+                                background: '#f6f6f6',
+                                padding: 12,
+                                borderRadius: 8,
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-word',
+                                maxHeight: 220,
+                                overflow: 'auto',
+                              }}
+                            >
+                              {receiptSelectedItem.delivery_details || ''}
+                            </pre>
+                          </div>
+
+                          <div style={{ marginBottom: 12 }}>
+                            <strong>Extra info:</strong>
+                            <pre
+                              style={{
+                                background: '#f6f6f6',
+                                padding: 12,
+                                borderRadius: 8,
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-word',
+                                maxHeight: 220,
+                                overflow: 'auto',
+                              }}
+                            >
+                              {receiptSelectedItem.extra_info || ''}
+                            </pre>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => deletePendingReceiptAssignment(receiptSelectedItem.assignment_id)}
+                            className="admin-mobile-full"
+                            style={{ ...styles.button, ...styles.buttonSmall, background: '#dc3545' }}
+                          >
+                            Delete this unsent receipt assignment
+                          </button>
+                        </div>
+                      ) : (
+                        <p style={{ color: '#888' }}>Select a reference to view details.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
