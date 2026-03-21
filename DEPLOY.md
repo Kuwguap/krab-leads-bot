@@ -35,8 +35,8 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
 | MONDAY_BOARD_ID | Yes | Monday.com board ID |
 | ONETIMESECRET_USERNAME | Yes | Basic-auth username used by `clientsphonenumber` API |
 | ONETIMESECRET_API_KEY | Yes | Basic-auth key used by `clientsphonenumber` API |
-| ONETIMESECRET_URL | Yes | OneTimeSecret-compatible endpoint (e.g. `https://clientsphonenumber.vercel.app/api/v1/share`) |
-| ONETIMESECRET_LINK_BASE | Yes | Link base shown to users (e.g. `https://clientsphonenumber.vercel.app/secret/`) |
+| ONETIMESECRET_URL | Yes | OneTimeSecret-compatible endpoint (e.g. `https://clientsphonenumber.com/api/v1/share`) |
+| ONETIMESECRET_LINK_BASE | Yes | Link base shown to users (e.g. `https://clientsphonenumber.com/secret/`) |
 | ONETIMESECRET_PASSPHRASE | Yes | Passphrase sent by bot when creating secret links |
 | SUPABASE_URL | Yes | Supabase project URL |
 | SUPABASE_KEY | Yes | Supabase anon key |
@@ -69,7 +69,7 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
 
 3. **Vercel (Clients Phone Number app):**
    - The OneTimeSecret-compatible app lives in `clientsphonenumber/` (Next.js)
-   - Deploy as its own Vercel project (e.g. `clientsphonenumber.vercel.app`)
+   - Deploy as its own Vercel project; add custom domain (e.g. `clientsphonenumber.com`)
    - Add env vars:
      - `SUPABASE_URL`
      - `SUPABASE_KEY`

@@ -12,7 +12,7 @@ class OneTimeSecret:
         self.username = Config.ONETIMESECRET_USERNAME
         self.api_key = Config.ONETIMESECRET_API_KEY
         self.passphrase = Config.ONETIMESECRET_PASSPHRASE
-        self.link_base = getattr(Config, "ONETIMESECRET_LINK_BASE", "https://clientsphonenumber.vercel.app/secret/")
+        self.link_base = getattr(Config, "ONETIMESECRET_LINK_BASE", "https://clientsphonenumber.com/secret/")
     
     def encrypt_phone(self, phone_number: str) -> Optional[Dict[str, str]]:
         """

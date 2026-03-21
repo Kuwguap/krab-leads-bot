@@ -25,6 +25,9 @@ Add these to your Vercel project:
 
 The unlock passphrase and TTL settings are stored in Supabase (via `/admin`).
 
+## Custom domain
+Point your domain (e.g. `clientsphonenumber.com`) to this Vercel project in **Vercel → Project → Settings → Domains**. Use **HTTPS** in env vars (`ONETIMESECRET_URL`, `ONETIMESECRET_LINK_BASE`) on the bot/Render side.
+
 ## Routes
 - `POST /api/v1/share` (OneTimeSecret-compatible)
 - `POST /api/v1/unlock` (used by unlock UI)
