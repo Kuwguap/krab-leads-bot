@@ -45,6 +45,7 @@ STATE_PHASE2 = 2  # Waiting for phone number and price
 STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistants_choose_group is on)
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
+STATE_GROUP_BROADCAST_WAIT = 15  # Lead was broadcast to groups; waiting for them to accept/decline
 STATE_VIN_CHOICE = 10  # VIN checker returned different car; user picks stated vs API
 STATE_VIN_RETYPE = 14  # User chose to retype VIN; waiting for new VIN input
 STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
@@ -102,6 +103,79 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
         if elig:
             buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeyboardMarkup:
+    """Build group selection keyboard; optionally include broadcast-to-all."""
+    buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"select_group_{g['id']}")] for g in groups]
+    if include_all and groups:
+        buttons.append([InlineKeyboardButton("📢 Send to All Groups", callback_data="select_group_all")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _parse_chat_id(raw: str | int | None) -> int | str | None:
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except (ValueError, TypeError):
+        return raw
+
+
+async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, lead: dict, text: str) -> None:
+    """Send a notification to the lead initiator and global supervisor (if configured)."""
+    initiator_id = lead.get("user_id")
+    if initiator_id:
+        try:
+            await context.bot.send_message(chat_id=int(initiator_id), text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Could not notify initiator %s: %s", initiator_id, e)
+    sup = (Config.SUPERVISORY_TELEGRAM_ID or "").strip()
+    if sup:
+        try:
+            await context.bot.send_message(chat_id=_parse_chat_id(sup), text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Could not notify supervisor %s: %s", sup, e)
+
+
+async def _send_driver_requests_for_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+    group: dict,
+) -> tuple[int, str]:
+    """Send accept/decline requests to drivers assigned to a group. Returns (count, driver_names)."""
+    group_id = group.get("id")
+    drivers = db.get_active_drivers_for_group(group_id) if group_id else []
+    suspended = _get_suspended_driver_ids()
+    selected_drivers = [d for d in (drivers or []) if d.get("id") not in suspended]
+    if not selected_drivers:
+        return (0, "")
+    reference_id = lead.get("reference_id", "N/A")
+    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    driver_request_message = (
+        f"👋Hi! New client 💸 available📈❗️\n\n"
+        f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
+        f"📋 Reference ID: `{reference_id}`\n"
+        f" Delivery Time 🏷️: {extra_safe}\n"
+        f"Please have Car, Driver License, and Laser Printer Ready✅"
+    )
+    accept_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead['id']}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead['id']}"),
+    ]])
+    assigned_count = 0
+    for driver in selected_drivers:
+        cid = _parse_chat_id(driver.get("driver_telegram_id"))
+        if not cid:
+            continue
+        try:
+            db.create_lead_assignment(lead["id"], driver["id"], group_id)
+            await context.bot.send_message(chat_id=cid, text=driver_request_message, parse_mode="Markdown", reply_markup=accept_keyboard)
+            assigned_count += 1
+        except Exception as e:
+            logger.error("Error sending driver request to %s: %s", driver.get("driver_name"), e)
+    driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+    return (assigned_count, driver_names)
 
 
 def generate_reference_id() -> str:
@@ -796,8 +870,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             "username": username
         })
         db.set_user_state(user_id, "select_group", state_data)
-        group_buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"select_group_{g['id']}")] for g in active_groups]
-        group_keyboard = InlineKeyboardMarkup(group_buttons)
+        group_keyboard = _build_group_keyboard(active_groups, include_all=True)
         await update.message.reply_text(
             "✅ Phone and price received!\n\n**Select which group to send this lead to:**",
             parse_mode="Markdown",
@@ -861,6 +934,86 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("❌ Error: Lead data not found. Please start over with /start")
         return ConversationHandler.END
     lead_data = state.get("data", {}).copy()
+    if query.data == "select_group_all":
+        # Broadcast: create lead immediately, send offer to all active groups, first accept wins.
+        phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
+        final_lead_data = {
+            "user_id": user_id,
+            "telegram_username": (query.from_user.username or "Unknown"),
+            "vehicle_details": phase1_data.get("vehicle_details", ""),
+            "delivery_details": phase1_data.get("delivery_details", ""),
+            "phone_number": lead_data.get("phone_number"),
+            "price": lead_data.get("price"),
+            "onetimesecret_token": (lead_data.get("encrypted_data") or {}).get("secret_key"),
+            "onetimesecret_secret_key": (lead_data.get("encrypted_data") or {}).get("metadata_key"),
+            "encrypted_link": (lead_data.get("encrypted_data") or {}).get("link"),
+            "reference_id": lead_data.get("reference_id"),
+            "group_id": None,
+            "extra_info": lead_data.get("extra_info", ""),
+        }
+        lead = db.create_lead(final_lead_data)
+        if not lead:
+            await query.message.reply_text("❌ Error saving lead to database.")
+            return ConversationHandler.END
+
+        reference_id = lead.get("reference_id", "N/A")
+        username = query.from_user.username or "Unknown"
+        group_offer_message = (
+            f"🏷NEW CLIENT❗️\n\n"
+            f"📋 Reference ID: `{reference_id}`\n"
+            f"👤 Submitted by: @{username}\n\n"
+            f"Tap below to accept/decline for your group."
+        )
+        offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
+        groups = db.get_all_groups()
+        active_groups = [g for g in groups if g.get("is_active", True)]
+        for g in active_groups:
+            gid = g.get("id")
+            if not gid:
+                continue
+            offer_kb_by_group[gid] = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"accept_group_{lead['id']}_{gid}"),
+                InlineKeyboardButton("❌ Decline", callback_data=f"decline_group_{lead['id']}_{gid}"),
+            ]])
+        sent_count = 0
+        for g in active_groups:
+            gid = g.get("id")
+            chat_id = _parse_chat_id(g.get("group_telegram_id"))
+            if not gid or not chat_id:
+                continue
+            # Create offer row first; we'll fill message IDs after sending.
+            db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=group_offer_message,
+                    parse_mode="Markdown",
+                    reply_markup=offer_kb_by_group.get(gid),
+                )
+                db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                sent_count += 1
+            except Exception as e:
+                logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
+
+        db.set_user_state(
+            user_id,
+            "group_broadcast_wait",
+            {"lead_id": lead["id"], "reference_id": reference_id, "username": username},
+        )
+
+        await _notify_initiator_and_supervisor(
+            context,
+            lead,
+            f"📣 **Lead broadcast to groups**\n\nReference: `{reference_id}`\nSent to **{sent_count}** group(s).",
+        )
+
+        await query.message.reply_text(
+            f"📣 **Broadcast sent**\n\nReference ID: `{reference_id}`\nSent to **{sent_count}** group(s).\n\n"
+            "First group to accept will get it.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
     group_id = query.data.replace("select_group_", "")
     selected_group = db.get_group_by_id(group_id)
     if not selected_group or not selected_group.get("is_active", True):
@@ -1630,6 +1783,12 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception as e:
                     logger.error(f"Error forwarding acceptance to group: {e}")
+        # Notify initiator and global supervisor
+        await _notify_initiator_and_supervisor(
+            context,
+            lead,
+            f"✅ **Driver accepted**\n\nReference: `{lead.get('reference_id', 'N/A')}`\nDriver: **{driver.get('driver_name', 'Driver')}**",
+        )
     else:
         # Fallback error
         await query.message.edit_text(
@@ -1659,12 +1818,125 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Decline the assignment
     db.decline_lead_assignment(lead_id, driver['id'])
+
+    # Notify initiator and global supervisor
+    lead = db.get_lead_by_id(lead_id)
+    if lead:
+        await _notify_initiator_and_supervisor(
+            context,
+            lead,
+            f"❌ **Driver declined**\n\nReference: `{lead.get('reference_id', 'N/A')}`\nDriver: **{driver.get('driver_name', 'Driver')}**",
+        )
     
     await query.message.edit_text(
         "❌ **Lead Declined**\n\n"
         "You have declined this lead.",
         parse_mode="Markdown"
     )
+
+
+async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle a group member accepting a broadcast lead offer."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("accept_group_", "")
+    try:
+        lead_id, group_id = raw.split("_", 1)
+    except ValueError:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    lead = db.get_lead_by_id(lead_id)
+    group = db.get_group_by_id(group_id)
+    if not lead or not group or not group.get("is_active", True):
+        try:
+            await query.message.edit_text("❌ Offer not found or expired.")
+        except Exception:
+            pass
+        return
+
+    accepted = db.accept_group_lead_offer(lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
+    if not accepted:
+        # Someone else already accepted.
+        accepted_row = db.get_accepted_group_for_lead(lead_id)
+        accepted_group = db.get_group_by_id(accepted_row.get("group_id")) if accepted_row else None
+        gname = accepted_group.get("group_name") if accepted_group else "another group"
+        try:
+            await query.message.edit_text(f"❌ **Taken**\n\nThis lead was accepted by **{gname}**.", parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    # Set lead.group_id to winning group
+    db.update_lead(lead_id, {"group_id": group_id})
+
+    reference_id = lead.get("reference_id", "N/A")
+    winner_name = group.get("group_name", "Group")
+
+    # Update all group offer messages to reflect taken/accepted
+    offers = db.get_group_lead_offers(lead_id)
+    for o in offers:
+        ocid = _parse_chat_id(o.get("group_chat_id"))
+        mid = o.get("group_message_id")
+        ogid = o.get("group_id")
+        if not ocid or not mid:
+            continue
+        try:
+            if ogid == group_id:
+                await context.bot.edit_message_text(
+                    chat_id=ocid,
+                    message_id=int(mid),
+                    text=f"✅ **Accepted by {winner_name}**\n\nReference ID: `{reference_id}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=ocid,
+                    message_id=int(mid),
+                    text=f"❌ **Taken by another group**\n\nAccepted by: **{winner_name}**\nReference ID: `{reference_id}`",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.warning("Could not edit group offer message: %s", e)
+
+    # Notify initiator + global supervisor
+    await _notify_initiator_and_supervisor(
+        context,
+        lead,
+        f"👥 **Group accepted**\n\nReference: `{reference_id}`\nGroup: **{winner_name}**\nAccepted by: @{query.from_user.username or query.from_user.first_name}",
+    )
+
+    # Send driver requests to drivers for this group (keeps existing driver-accept flow)
+    count, driver_names = await _send_driver_requests_for_group(context, lead, group)
+    if count > 0:
+        await context.bot.send_message(
+            chat_id=_parse_chat_id(group.get("group_telegram_id")),
+            text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
+            parse_mode="Markdown",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=_parse_chat_id(group.get("group_telegram_id")),
+            text=f"⚠️ No eligible drivers to notify for this group (inactive/suspended/missing Telegram IDs).\nReference: `{reference_id}`",
+            parse_mode="Markdown",
+        )
+
+
+async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle a group member declining a broadcast lead offer (for that group only)."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("decline_group_", "")
+    try:
+        lead_id, group_id = raw.split("_", 1)
+    except ValueError:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    db.decline_group_lead_offer(lead_id, group_id)
+    try:
+        await query.message.edit_text("❌ **Declined**", parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # Receipt submission handlers
@@ -2061,6 +2333,10 @@ def main():
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
+
+    # Add accept/decline handlers for group broadcast offers
+    application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^accept_group_"))
+    application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^decline_group_"))
     
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:

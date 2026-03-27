@@ -445,6 +445,111 @@ class Database:
         """Create a lead assignment (when sent to driver)."""
         if not self._check_tables_exist():
             return False
+
+    # Group lead offer methods (broadcast lead to many groups; first accept wins)
+    def create_group_lead_offer(
+        self,
+        lead_id: str,
+        group_id: str,
+        group_chat_id: str | None = None,
+        group_message_id: int | None = None,
+    ) -> bool:
+        """Create a pending group offer record for a lead."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            row = {
+                "lead_id": lead_id,
+                "group_id": group_id,
+                "status": "pending",
+            }
+            if group_chat_id is not None:
+                row["group_chat_id"] = str(group_chat_id)
+            if group_message_id is not None:
+                row["group_message_id"] = int(group_message_id)
+            self.client.table("group_lead_offers").insert(row).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating group lead offer: {e}")
+            return False
+
+    def update_group_lead_offer_message(
+        self,
+        lead_id: str,
+        group_id: str,
+        group_chat_id: str | None,
+        group_message_id: int | None,
+    ) -> bool:
+        """Persist the group chat/message IDs for an offer after sending."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            updates = {}
+            if group_chat_id is not None:
+                updates["group_chat_id"] = str(group_chat_id)
+            if group_message_id is not None:
+                updates["group_message_id"] = int(group_message_id)
+            if not updates:
+                return True
+            self.client.table("group_lead_offers").update(updates).eq("lead_id", lead_id).eq("group_id", group_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating group lead offer message: {e}")
+            return False
+
+    def get_group_lead_offers(self, lead_id: str) -> list:
+        """Return all group offers for a lead."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("group_lead_offers").select("*").eq("lead_id", lead_id).execute()
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error getting group lead offers: {e}")
+            return []
+
+    def get_accepted_group_for_lead(self, lead_id: str) -> Optional[Dict[str, Any]]:
+        """Return accepted group offer for a lead (if any)."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = self.client.table("group_lead_offers").select("*").eq("lead_id", lead_id).eq("status", "accepted").limit(1).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error getting accepted group for lead: {e}")
+            return None
+
+    def accept_group_lead_offer(self, lead_id: str, group_id: str, accepted_by_telegram_id: str) -> bool:
+        """Accept a group offer (first group to accept wins); declines all other pending offers."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            existing = self.client.table("group_lead_offers").select("id").eq("lead_id", lead_id).eq("status", "accepted").execute()
+            if existing.data:
+                return False
+            self.client.table("group_lead_offers").update({
+                "status": "accepted",
+                "accepted_by_telegram_id": str(accepted_by_telegram_id),
+                "accepted_at": "now()",
+            }).eq("lead_id", lead_id).eq("group_id", group_id).execute()
+            self.client.table("group_lead_offers").update({
+                "status": "declined",
+            }).eq("lead_id", lead_id).eq("status", "pending").neq("group_id", group_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error accepting group lead offer: {e}")
+            return False
+
+    def decline_group_lead_offer(self, lead_id: str, group_id: str) -> bool:
+        """Decline a group offer."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_lead_offers").update({"status": "declined"}).eq("lead_id", lead_id).eq("group_id", group_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error declining group lead offer: {e}")
+            return False
         
         try:
             self.client.table("lead_assignments").insert({
