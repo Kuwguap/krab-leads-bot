@@ -1,5 +1,7 @@
 """Database utilities for Supabase integration."""
 import logging
+import re
+import secrets
 from supabase import create_client, Client
 from config import Config
 from typing import Optional, Dict, Any
@@ -174,6 +176,50 @@ class Database:
             error_msg = str(e)
             if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
                 logger.error(f"Error getting lead by reference ID: {e}")
+            return None
+    
+    def upload_receipt_to_storage(
+        self,
+        lead_id: str,
+        reference_id: str,
+        file_bytes: bytes,
+        original_name: str,
+    ) -> Optional[str]:
+        """
+        Upload receipt image to Storage bucket `receipts`. Returns public URL, or None on failure.
+        Requires bucket from database/migration_receipts_storage.sql; use service_role key for the bot.
+        """
+        if not file_bytes or not Config.SUPABASE_URL or not Config.SUPABASE_KEY:
+            return None
+        lower = (original_name or "").lower()
+        ext = "jpg"
+        if lower.endswith(".png"):
+            ext = "png"
+        elif lower.endswith(".webp"):
+            ext = "webp"
+        elif lower.endswith(".gif"):
+            ext = "gif"
+        content_type = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "gif": "image/gif",
+        }.get(ext, "image/jpeg")
+        safe_ref = re.sub(r"[^A-Za-z0-9_-]+", "_", str(reference_id))[:36]
+        path = f"{lead_id}/{safe_ref}_{secrets.token_hex(4)}.{ext}"
+        try:
+            bucket = self.client.storage.from_("receipts")
+            bucket.upload(
+                path,
+                file_bytes,
+                file_options={
+                    "content-type": content_type,
+                },
+            )
+            return bucket.get_public_url(path)
+        except Exception as e:
+            logger.warning("upload_receipt_to_storage failed (bucket missing or RLS?): %s", e)
             return None
     
     def update_lead_receipt(self, lead_id: str, receipt_image_url: str) -> bool:

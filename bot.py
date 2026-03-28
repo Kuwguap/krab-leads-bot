@@ -2123,10 +2123,10 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     
-    # Build a Telegram file URL for storage (Supabase)
-    image_url = f"https://api.telegram.org/file/bot{Config.TELEGRAM_BOT_TOKEN}/{file.file_path}"
+    # Telegram file URL (fallback if Supabase Storage upload fails)
+    telegram_file_url = f"https://api.telegram.org/file/bot{Config.TELEGRAM_BOT_TOKEN}/{file.file_path}"
     
-    # Download bytes so we can upload a real file to Monday.com
+    # Download bytes for Monday + optional Supabase Storage
     import io
     bio = io.BytesIO()
     # For python-telegram-bot v20+, use download_to_memory
@@ -2159,8 +2159,11 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         if driver:
             driver_name = driver.get('driver_name', 'Driver')
     
-    # Update lead with receipt image (stored in Supabase / DB)
-    success = db.update_lead_receipt(lead_id, image_url)
+    storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
+    stored_url = (storage_url or "").strip() or telegram_file_url
+
+    # Update lead with receipt URL (prefer durable Supabase Storage public URL)
+    success = db.update_lead_receipt(lead_id, stored_url)
     
     if success and monday and monday_item_id:
         # First, try to upload the actual image file to the Monday files4 column.
@@ -2175,7 +2178,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         # so the team still has access to the receipt.
         if not upload_ok:
             try:
-                monday.update_item_receipt_link(monday_item_id, image_url)
+                monday.update_item_receipt_link(monday_item_id, stored_url)
             except Exception as e:
                 logger.error(f"Error updating Monday.com with receipt URL fallback: {e}")
         
@@ -2198,7 +2201,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             3,
             f"Receipt uploaded for lead ref# `{reference_id}`",
             [f"Driver: **{driver_name}**"],
-            photo_url=image_url,
+            photo_url=stored_url,
         )
         
         # Notify group supervisory + ST (same copy as step 3)
@@ -2211,7 +2214,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🔔 **(3/3)** Receipt uploaded for lead ref# `{reference_id}`\n\n"
             f"Driver: **{driver_name}**\n"
             f"Group: **{group_name}**\n"
-            f"[Open receipt]({image_url})"
+            f"[Open receipt]({stored_url})"
         )
         if group and (group.get("supervisory_telegram_id") or "").strip():
             supervisory_telegram_id = (group.get("supervisory_telegram_id") or "").strip()
