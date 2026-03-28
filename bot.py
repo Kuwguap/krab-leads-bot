@@ -125,7 +125,7 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
 async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, lead: dict, text: str) -> None:
     """Send a notification to the lead initiator and global supervisor (if configured)."""
     initiator_id = lead.get("user_id")
-    if initiator_id:
+    if initiator_id is not None:
         try:
             await context.bot.send_message(chat_id=int(initiator_id), text=text, parse_mode="Markdown")
         except Exception as e:
@@ -136,6 +136,50 @@ async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, l
             await context.bot.send_message(chat_id=_parse_chat_id(sup), text=text, parse_mode="Markdown")
         except Exception as e:
             logger.warning("Could not notify supervisor %s: %s", sup, e)
+
+
+async def _notify_lead_lifecycle(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+    step: int,
+    title_line: str,
+    extra_lines: Optional[list[str]] = None,
+    photo_url: Optional[str] = None,
+) -> None:
+    """
+    Standard 3-step alerts to lead initiator + SUPERVISORY_TELEGRAM_ID.
+    step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
+    """
+    lines = [f"🔔 **({step}/3)** {title_line}", ""]
+    lines.extend(extra_lines or [])
+    text = "\n".join(lines)
+    initiator_id = lead.get("user_id")
+    sup = (Config.SUPERVISORY_TELEGRAM_ID or "").strip()
+    targets = []
+    if initiator_id is not None:
+        try:
+            targets.append(int(initiator_id))
+        except (TypeError, ValueError):
+            logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
+    if sup:
+        targets.append(_parse_chat_id(sup))
+    for cid in targets:
+        if cid is None:
+            continue
+        try:
+            if photo_url and step == 3:
+                try:
+                    await context.bot.send_photo(chat_id=cid, photo=photo_url, caption=text, parse_mode="Markdown")
+                except Exception:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=text + f"\n\n[Receipt]({photo_url})",
+                        parse_mode="Markdown",
+                    )
+            else:
+                await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
 
 
 async def _send_driver_requests_for_group(
@@ -1001,12 +1045,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             {"lead_id": lead["id"], "reference_id": reference_id, "username": username},
         )
 
-        await _notify_initiator_and_supervisor(
-            context,
-            lead,
-            f"📣 **Lead broadcast to groups**\n\nReference: `{reference_id}`\nSent to **{sent_count}** group(s).",
-        )
-
         await query.message.reply_text(
             f"📣 **Broadcast sent**\n\nReference ID: `{reference_id}`\nSent to **{sent_count}** group(s).\n\n"
             "First group to accept will get it.",
@@ -1396,6 +1434,19 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             logger.warning("Could not forward attached file to group/supervisory: %s", e)
     
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+    lead_for_notify = db.get_lead_by_id(lead["id"]) or lead
+    await _notify_lead_lifecycle(
+        context,
+        lead_for_notify,
+        1,
+        "Issuer accepted new lead",
+        [
+            f"Reference: `{reference_id}`",
+            f"Group: **{selected_group.get('group_name', 'N/A')}**",
+            f"Drivers notified: **{driver_names}**",
+        ],
+    )
+
     contact_sources = db.get_contact_info_sources()
     
     if contact_sources:
@@ -1783,11 +1834,15 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception as e:
                     logger.error(f"Error forwarding acceptance to group: {e}")
-        # Notify initiator and global supervisor
-        await _notify_initiator_and_supervisor(
+        await _notify_lead_lifecycle(
             context,
             lead,
-            f"✅ **Driver accepted**\n\nReference: `{lead.get('reference_id', 'N/A')}`\nDriver: **{driver.get('driver_name', 'Driver')}**",
+            2,
+            "Driver accepted new lead",
+            [
+                f"Reference: `{lead.get('reference_id', 'N/A')}`",
+                f"Driver: **{driver.get('driver_name', 'Driver')}**",
+            ],
         )
     else:
         # Fallback error
@@ -1819,15 +1874,6 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Decline the assignment
     db.decline_lead_assignment(lead_id, driver['id'])
 
-    # Notify initiator and global supervisor
-    lead = db.get_lead_by_id(lead_id)
-    if lead:
-        await _notify_initiator_and_supervisor(
-            context,
-            lead,
-            f"❌ **Driver declined**\n\nReference: `{lead.get('reference_id', 'N/A')}`\nDriver: **{driver.get('driver_name', 'Driver')}**",
-        )
-    
     await query.message.edit_text(
         "❌ **Lead Declined**\n\n"
         "You have declined this lead.",
@@ -1899,11 +1945,18 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.warning("Could not edit group offer message: %s", e)
 
-    # Notify initiator + global supervisor
-    await _notify_initiator_and_supervisor(
+    lead_ref = db.get_lead_by_id(lead_id) or lead
+    accepter = f"@{query.from_user.username}" if query.from_user.username else (query.from_user.first_name or "member")
+    await _notify_lead_lifecycle(
         context,
-        lead,
-        f"👥 **Group accepted**\n\nReference: `{reference_id}`\nGroup: **{winner_name}**\nAccepted by: @{query.from_user.username or query.from_user.first_name}",
+        lead_ref,
+        1,
+        "Issuer accepted new lead",
+        [
+            f"Reference: `{reference_id}`",
+            f"Group: **{winner_name}**",
+            f"Accepted in group chat by {accepter}",
+        ],
     )
 
     # Send driver requests to drivers for this group (keeps existing driver-accept flow)
@@ -2138,43 +2191,54 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Receipt for Reference ID `{reference_id}` has been uploaded and processed.\n"
             "Status updated to 'PAID RECEIPT' in Monday.com."
         )
+
+        await _notify_lead_lifecycle(
+            context,
+            lead,
+            3,
+            f"Receipt uploaded for lead ref# `{reference_id}`",
+            [f"Driver: **{driver_name}**"],
+            photo_url=image_url,
+        )
         
-        # Notify ST Telegram ID and Supervisory Telegram ID (group that received this lead)
+        # Notify group supervisory + ST (same copy as step 3)
         group_id = lead.get("group_id")
         group_name = "—"
-        if group_id:
-            group = db.get_group_by_id(group_id)
-            if group:
-                group_name = group.get("group_name") or group_name
-                supervisory_telegram_id = (group.get("supervisory_telegram_id") or "").strip()
-                if supervisory_telegram_id:
-                    try:
-                        sup_chat_id = int(supervisory_telegram_id.strip())
-                        await context.bot.send_message(
-                            chat_id=sup_chat_id,
-                            text=(
-                                f"🧾 **Receipt submitted**\n\n"
-                                f"Driver **{driver_name}** submitted a receipt for Reference ID `{reference_id}`\n"
-                                f"Group: **{group_name}**"
-                            ),
-                            parse_mode="Markdown",
-                        )
-                    except (ValueError, TypeError) as e:
-                        logger.warning("Invalid supervisory_telegram_id for group %s: %s", group_id, e)
-                    except Exception as e:
-                        logger.warning("Could not send receipt notification to supervisory %s: %s", supervisory_telegram_id, e)
+        group = db.get_group_by_id(group_id) if group_id else None
+        if group:
+            group_name = group.get("group_name") or group_name
+        receipt_notice = (
+            f"🔔 **(3/3)** Receipt uploaded for lead ref# `{reference_id}`\n\n"
+            f"Driver: **{driver_name}**\n"
+            f"Group: **{group_name}**\n"
+            f"[Open receipt]({image_url})"
+        )
+        if group and (group.get("supervisory_telegram_id") or "").strip():
+            supervisory_telegram_id = (group.get("supervisory_telegram_id") or "").strip()
+            try:
+                sup_chat_id = int(supervisory_telegram_id.strip())
+            except (ValueError, TypeError):
+                sup_chat_id = supervisory_telegram_id
+            try:
+                await context.bot.send_message(
+                    chat_id=sup_chat_id,
+                    text=receipt_notice,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning("Invalid supervisory_telegram_id for group %s: %s", group_id, e)
+            except Exception as e:
+                logger.warning("Could not send receipt notification to supervisory %s: %s", supervisory_telegram_id, e)
         st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
         if st_telegram_id:
             try:
                 st_chat_id = int(st_telegram_id.strip())
                 await context.bot.send_message(
                     chat_id=st_chat_id,
-                    text=(
-                        f"🧾 **Receipt submitted**\n\n"
-                        f"Driver **{driver_name}** submitted a receipt for Reference ID `{reference_id}`\n"
-                        f"Group: **{group_name}**"
-                    ),
+                    text=receipt_notice,
                     parse_mode="Markdown",
+                    disable_web_page_preview=True,
                 )
             except (ValueError, TypeError) as e:
                 logger.warning("Invalid st_telegram_id: %s", e)

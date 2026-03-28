@@ -497,6 +497,51 @@ class AdminDatabase:
         except Exception:
             return 0
 
+    def get_submitted_receipts_recent(self, limit: int = 100) -> list:
+        """Leads with a stored receipt image + accepting driver name (for admin review)."""
+        if not self._check_tables_exist():
+            return []
+        cap = max(1, min(int(limit or 100), 500))
+        try:
+            r = self.client.table("leads").select(
+                "id, reference_id, receipt_image_url, updated_at, group_id"
+            ).order("updated_at", desc=True).limit(cap * 3).execute()
+            out = []
+            for lead in (r.data or []):
+                url = (lead.get("receipt_image_url") or "").strip()
+                if not url:
+                    continue
+                lid = lead.get("id")
+                driver_name = "—"
+                try:
+                    a = self.client.table("lead_assignments").select(
+                        "driver:drivers(driver_name)"
+                    ).eq("lead_id", lid).eq("status", "accepted").limit(1).execute()
+                    if a.data:
+                        dr = (a.data[0].get("driver") or {})
+                        driver_name = dr.get("driver_name") or driver_name
+                except Exception:
+                    pass
+                gname = "—"
+                gid = lead.get("group_id")
+                if gid:
+                    g = self.get_group_by_id(str(gid))
+                    if g:
+                        gname = g.get("group_name") or gname
+                out.append({
+                    "lead_id": lid,
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "receipt_image_url": url,
+                    "driver_name": driver_name,
+                    "group_name": gname,
+                    "updated_at": lead.get("updated_at"),
+                })
+                if len(out) >= cap:
+                    break
+            return out
+        except Exception:
+            return []
+
 db = AdminDatabase()
 
 # Simple HTML template for the dashboard
@@ -1360,6 +1405,17 @@ def api_receipt_debts_delete_assignment(assignment_id):
         return jsonify({"success": False, "error": "Assignment not found or receipt already submitted."}), 400
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/receipts/submitted', methods=['GET'])
+def api_receipts_submitted():
+    """Recent leads with driver-uploaded receipt images (for admin dashboard gallery)."""
+    try:
+        raw_limit = request.args.get("limit", "100")
+        limit = int(raw_limit) if str(raw_limit).isdigit() else 100
+        return jsonify(db.get_submitted_receipts_recent(limit=limit))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/groups/<group_id>/toggle', methods=['POST'])

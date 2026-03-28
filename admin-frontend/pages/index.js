@@ -16,6 +16,7 @@ export default function AdminPanel() {
   const [receiptModalItems, setReceiptModalItems] = useState([]); // pending receipt assignments
   const [receiptSelectedAssignmentId, setReceiptSelectedAssignmentId] = useState(null);
   const [receiptModalLoading, setReceiptModalLoading] = useState(false);
+  const [submittedReceipts, setSubmittedReceipts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
   const [messageType, setMessageType] = useState('success');
@@ -73,6 +74,20 @@ export default function AdminPanel() {
     } catch {}
   }, []);
 
+  const fetchSubmittedReceipts = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/receipts/submitted?limit=100`);
+      if (res.ok) {
+        const data = await res.json();
+        setSubmittedReceipts(Array.isArray(data) ? data : []);
+      } else {
+        setSubmittedReceipts([]);
+      }
+    } catch {
+      setSubmittedReceipts([]);
+    }
+  }, []);
+
   const fetchReceiptDebts = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/receipt_debts/summary`);
@@ -124,10 +139,19 @@ export default function AdminPanel() {
     }
     (async () => {
       setLoading(true);
-      await Promise.all([fetchGroups(), fetchDrivers(), fetchSettings(), fetchStats(), fetchReceiptDebts(), fetchContactSources(), fetchAssignments()]);
+      await Promise.all([
+        fetchGroups(),
+        fetchDrivers(),
+        fetchSettings(),
+        fetchStats(),
+        fetchReceiptDebts(),
+        fetchSubmittedReceipts(),
+        fetchContactSources(),
+        fetchAssignments(),
+      ]);
       setLoading(false);
     })();
-  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchContactSources, fetchAssignments]);
+  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchSubmittedReceipts, fetchContactSources, fetchAssignments]);
 
   useEffect(() => {
     if (!API || groups.length === 0) return;
@@ -262,6 +286,7 @@ export default function AdminPanel() {
       if (res.ok && data.success) {
         showMessage(`Cleared pending receipts (${data.deleted || 0}).`);
         await fetchReceiptDebts();
+        await fetchSubmittedReceipts();
         // Refresh modal items if we are viewing this driver.
         if (receiptModalDriver?.driver_id === driverId) {
           await openReceiptDebtModal(driverId);
@@ -285,6 +310,7 @@ export default function AdminPanel() {
       if (res.ok && data.success) {
         showMessage('Pending receipt deleted.');
         await fetchReceiptDebts();
+        await fetchSubmittedReceipts();
         if (receiptModalDriver?.driver_id) {
           await openReceiptDebtModal(receiptModalDriver.driver_id);
         }
@@ -612,6 +638,61 @@ export default function AdminPanel() {
                           View details
                         </button>
                       </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>Submitted receipts</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>
+            Driver-uploaded receipt images stored on each lead. Open full size in a new tab if the preview does not load (some Telegram file URLs expire).
+          </p>
+          <div style={{ marginBottom: 12 }}>
+            <button type="button" className="admin-mobile-full" style={{ ...styles.button, ...styles.buttonSmall }} onClick={() => fetchSubmittedReceipts()}>
+              Refresh list
+            </button>
+          </div>
+          <div className="admin-table-wrap">
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th>Ref</th>
+                  <th>Driver</th>
+                  <th>Group</th>
+                  <th>Receipt</th>
+                  <th>Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(submittedReceipts || []).length === 0 ? (
+                  <tr><td colSpan={5} style={{ textAlign: 'center', color: '#888' }}>No submitted receipts yet</td></tr>
+                ) : (
+                  (submittedReceipts || []).map((row) => (
+                    <tr key={row.lead_id}>
+                      <td><code>{row.reference_id}</code></td>
+                      <td>{row.driver_name}</td>
+                      <td>{row.group_name}</td>
+                      <td>
+                        {row.receipt_image_url ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start' }}>
+                            <a href={row.receipt_image_url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 13 }}>
+                              Open full image
+                            </a>
+                            <img
+                              src={row.receipt_image_url}
+                              alt={`Receipt ${row.reference_id}`}
+                              style={{ maxWidth: 180, maxHeight: 240, objectFit: 'contain', borderRadius: 6, border: '1px solid #ddd' }}
+                            />
+                          </div>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                      <td style={{ fontSize: 12, color: '#555' }}>{row.updated_at ? String(row.updated_at).slice(0, 19) : '—'}</td>
                     </tr>
                   ))
                 )}
