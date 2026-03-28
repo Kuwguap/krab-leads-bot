@@ -46,6 +46,9 @@ STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistan
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
 STATE_GROUP_BROADCAST_WAIT = 15  # Lead was broadcast to groups; waiting for them to accept/decline
+STATE_AI_REVIEW = 16  # AI parsed Phase 1: user confirms or edits fields
+STATE_AI_EDIT_MENU = 17  # Pick which field to edit
+STATE_AI_EDIT_INPUT = 18  # Waiting for new text for selected field
 STATE_VIN_CHOICE = 10  # VIN checker returned different car; user picks stated vs API
 STATE_VIN_RETYPE = 14  # User chose to retype VIN; waiting for new VIN input
 STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
@@ -379,6 +382,194 @@ def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
     ])
 
 
+# AI Phase 1: human review — field edit keys (keep callback_data short; max 64 bytes)
+PH1_REVIEW_ACCEPT = "ph1_accept"
+PH1_REVIEW_EDIT = "ph1_edit"
+PH1_EDIT_BACK = "ph1_back"
+PH1_EDIT_MORE = "ph1_more"
+PH1_EDIT_DONE = "ph1_done"
+# edit key -> state_data key (None = first/last name parts)
+PH1_EDIT_TO_STATE_KEY = {
+    "fn": None,
+    "ln": None,
+    "addr": "address",
+    "csz": "city_state_zip",
+    "daddr": "delivery_address",
+    "dcsz": "delivery_city_state_zip",
+    "vin": "vin",
+    "car": "car",
+    "col": "color",
+    "ins": "insurance_company",
+    "pol": "insurance_policy_number",
+    "xtra": "extra_info",
+}
+PH1_EDIT_PROMPT_LABEL = {
+    "fn": "First name",
+    "ln": "Last name",
+    "addr": "Registration address (street)",
+    "csz": "Registration city, state, ZIP",
+    "daddr": "Delivery address (street)",
+    "dcsz": "Delivery city, state, ZIP",
+    "vin": "VIN (17 characters if known)",
+    "car": "Car (year make model)",
+    "col": "Color",
+    "ins": "Insurance company",
+    "pol": "Insurance policy number",
+    "xtra": "Delivery date/time and extra notes",
+}
+
+
+def _name_parts_from_full(name: str) -> tuple:
+    n = (name or "").strip()
+    if not n or n == "-":
+        return ("-", "-")
+    parts = n.split(None, 1)
+    first = parts[0]
+    last = parts[1] if len(parts) > 1 else "-"
+    return (first, last)
+
+
+def _set_full_name(state_data: dict, first: str, last: str) -> None:
+    f, l = (first or "").strip(), (last or "").strip()
+    if l in ("", "-"):
+        state_data["name"] = f if f else "-"
+    else:
+        state_data["name"] = f"{f} {l}".strip() if f else l
+
+
+def _format_phase1_ai_review_text(state_data: dict) -> str:
+    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+    first, last = _name_parts_from_full(state_data.get("name"))
+    lines = [
+        "📝 Here's how I understood your lead:\n",
+        f"First name: {first}",
+        f"Last name: {last}",
+        f"Registration address: {state_data.get('address') or '-'}",
+        f"Registration city, state, ZIP: {state_data.get('city_state_zip') or '-'}",
+        f"Delivery address: {state_data.get('delivery_address') or '-'}",
+        f"Delivery city, state, ZIP: {state_data.get('delivery_city_state_zip') or '-'}",
+        f"VIN: {state_data.get('vin') or '-'}",
+        f"Car: {state_data.get('car') or '-'}",
+        f"Color: {state_data.get('color') or '-'}",
+        f"Insurance company: {state_data.get('insurance_company') or '-'}",
+        f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
+        f"Date/time & notes: {state_data.get('extra_info') or '-'}",
+        "\nTap Accept to continue, or Make changes to fix any field.",
+    ]
+    return "\n".join(lines)
+
+
+def _truncate_btn_val(val: str, max_len: int = 22) -> str:
+    v = (val if val and str(val).strip() else "-").strip()
+    v = re.sub(r"\s+", " ", v)
+    return (v[: max_len - 1] + "…") if len(v) > max_len else v
+
+
+def _phase1_review_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=PH1_REVIEW_ACCEPT),
+            InlineKeyboardButton("✏️ Make changes", callback_data=PH1_REVIEW_EDIT),
+        ]
+    ])
+
+
+def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
+    """One button per field: Label: value (callback ph1edit_<key>)."""
+    first, last = _name_parts_from_full(state_data.get("name"))
+    rows = [
+        [InlineKeyboardButton(f"First name:{_truncate_btn_val(first)}", callback_data="ph1edit_fn")],
+        [InlineKeyboardButton(f"Last name:{_truncate_btn_val(last)}", callback_data="ph1edit_ln")],
+        [InlineKeyboardButton(f"Reg address:{_truncate_btn_val(state_data.get('address'))}", callback_data="ph1edit_addr")],
+        [InlineKeyboardButton(f"Reg city/ST/ZIP:{_truncate_btn_val(state_data.get('city_state_zip'))}", callback_data="ph1edit_csz")],
+        [InlineKeyboardButton(f"Deliv address:{_truncate_btn_val(state_data.get('delivery_address'))}", callback_data="ph1edit_daddr")],
+        [InlineKeyboardButton(f"Deliv city/ST/ZIP:{_truncate_btn_val(state_data.get('delivery_city_state_zip'))}", callback_data="ph1edit_dcsz")],
+        [InlineKeyboardButton(f"VIN:{_truncate_btn_val(state_data.get('vin'), 18)}", callback_data="ph1edit_vin")],
+        [InlineKeyboardButton(f"Car:{_truncate_btn_val(state_data.get('car'))}", callback_data="ph1edit_car")],
+        [InlineKeyboardButton(f"Color:{_truncate_btn_val(state_data.get('color'))}", callback_data="ph1edit_col")],
+        [InlineKeyboardButton(f"Insurance:{_truncate_btn_val(state_data.get('insurance_company'))}", callback_data="ph1edit_ins")],
+        [InlineKeyboardButton(f"Policy #:{_truncate_btn_val(state_data.get('insurance_policy_number'))}", callback_data="ph1edit_pol")],
+        [InlineKeyboardButton(f"Date/notes:{_truncate_btn_val(state_data.get('extra_info'))}", callback_data="ph1edit_xtra")],
+        [InlineKeyboardButton("⬅️ Back to summary", callback_data=PH1_EDIT_BACK)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE),
+            InlineKeyboardButton("➡️ Done — continue lead", callback_data=PH1_EDIT_DONE),
+        ]
+    ])
+
+
+async def _send_phase1_ai_review(target_message, state_data: dict) -> None:
+    await target_message.reply_text(
+        _format_phase1_ai_review_text(state_data),
+        reply_markup=_phase1_review_keyboard(),
+    )
+
+
+async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    """After user accepts AI interpretation (or finishes edits): VIN check → missing fields → files."""
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"].copy()
+    _apply_single_address_as_both(state_data)
+    _clean_vin_and_car(state_data)
+    db.set_user_state(user_id, "phase1", state_data)
+    alert_msg, conflict = _vin_check_after_phase1(state_data)
+    if conflict:
+        api_car, stated_car = conflict
+        context.user_data["vin_choice_api_car"] = api_car
+        context.user_data["vin_choice_stated_car"] = stated_car
+        keyboard = _vin_choice_keyboard(api_car, stated_car)
+        await message.reply_text(
+            "⚠️ **VIN returned different car than stated**\n\n"
+            f"• Driver details in lead: {stated_car}\n"
+            f"• VIN lookup result: {api_car}\n\n"
+            "Choose which to use:",
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+        return STATE_VIN_CHOICE
+    if alert_msg:
+        await message.reply_text(alert_msg)
+    # Re-check missing fields against a synthetic blob so detector still works
+    blob = "\n".join(
+        str(state_data.get(k) or "")
+        for k in ("name", "address", "city_state_zip", "delivery_address", "delivery_city_state_zip", "vin", "car", "color", "insurance_company", "insurance_policy_number", "extra_info")
+    )
+    missing = ai_vision.detect_missing_fields(state_data, blob)
+    if missing:
+        prompts = ai_vision.MISSING_FIELD_PROMPTS
+        msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
+        context.user_data["missing_fields"] = missing
+        context.user_data["missing_field_state_data"] = state_data.copy()
+        await message.reply_text(msg)
+        return STATE_MISSING_FIELD
+    return await _ask_add_files(message, context)
+
+
+def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) -> None:
+    """Apply one field edit from the AI review flow."""
+    new_text = (new_text or "").strip()
+    if edit_key == "fn":
+        first, last = _name_parts_from_full(state_data.get("name"))
+        _set_full_name(state_data, new_text, last if last != "-" else "")
+        return
+    if edit_key == "ln":
+        first, last = _name_parts_from_full(state_data.get("name"))
+        _set_full_name(state_data, first if first != "-" else "", new_text)
+        return
+    sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
+    if sk:
+        state_data[sk] = new_text if new_text else "-"
+
+
 def _clean_vin_and_car(state_data: dict) -> None:
     """Identify VIN only as a 17 alphanumeric string (no cutting). Clean car from phones and any stray VIN."""
     vin_raw = (state_data.get("vin") or "").strip()
@@ -425,6 +616,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db.clear_user_state(user_id)
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
+        context.user_data.pop("phase1_pending_edit_key", None)
     
     # Initialize new state
     db.set_user_state(user_id, "phase1", {})
@@ -523,32 +715,8 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return STATE_PHASE1
     db.set_user_state(user_id, "phase1", state_data)
-    alert_msg, conflict = _vin_check_after_phase1(state_data)
-    if conflict:
-        api_car, stated_car = conflict
-        context.user_data["vin_choice_api_car"] = api_car
-        context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = _vin_choice_keyboard(api_car, stated_car)
-        await update.message.reply_text(
-            "⚠️ **VIN returned different car than stated**\n\n"
-            f"• Driver details in lead: {stated_car}\n"
-            f"• VIN lookup result: {api_car}\n\n"
-            "Choose which to use:",
-            reply_markup=keyboard,
-            parse_mode="Markdown",
-        )
-        return STATE_VIN_CHOICE
-    if alert_msg:
-        await update.message.reply_text(alert_msg)
-    missing = ai_vision.detect_missing_fields(state_data, normalized_11 or "")
-    if missing:
-        prompts = ai_vision.MISSING_FIELD_PROMPTS
-        msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
-        context.user_data["missing_fields"] = missing
-        context.user_data["missing_field_state_data"] = state_data.copy()
-        await update.message.reply_text(msg)
-        return STATE_MISSING_FIELD
-    return await _ask_add_files(update.message, context)
+    await _send_phase1_ai_review(update.message, state_data)
+    return STATE_AI_REVIEW
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -589,32 +757,8 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             return STATE_PHASE1
         db.set_user_state(user_id, "phase1", state_data)
-        alert_msg, conflict = _vin_check_after_phase1(state_data)
-        if conflict:
-            api_car, stated_car = conflict
-            context.user_data["vin_choice_api_car"] = api_car
-            context.user_data["vin_choice_stated_car"] = stated_car
-            keyboard = _vin_choice_keyboard(api_car, stated_car)
-            await update.message.reply_text(
-                "⚠️ **VIN returned different car than stated**\n\n"
-                f"• Driver details in lead: {stated_car}\n"
-                f"• VIN lookup result: {api_car}\n\n"
-                "Choose which to use:",
-                reply_markup=keyboard,
-                parse_mode="Markdown",
-            )
-            return STATE_VIN_CHOICE
-        if alert_msg:
-            await update.message.reply_text(alert_msg)
-        missing = ai_vision.detect_missing_fields(state_data, message_text)
-        if missing:
-            prompts = ai_vision.MISSING_FIELD_PROMPTS
-            msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
-            context.user_data["missing_fields"] = missing
-            context.user_data["missing_field_state_data"] = state_data.copy()
-            await update.message.reply_text(msg)
-            return STATE_MISSING_FIELD
-        return await _ask_add_files(update.message, context)
+        await _send_phase1_ai_review(update.message, state_data)
+        return STATE_AI_REVIEW
     else:
         # No AI: require the 11-line structure
         state_data = parse_phase1_structured(message_text)
@@ -726,6 +870,107 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
         return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
+
+
+async def handle_phase1_ai_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accept AI Phase 1 interpretation or open field editor."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if query.data == PH1_REVIEW_ACCEPT:
+        return await _continue_phase1_after_ai_review(query.message, context, user_id)
+    if query.data == PH1_REVIEW_EDIT:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        await query.message.reply_text(
+            "Pick a field to edit (each button shows label:current value):",
+            reply_markup=_phase1_edit_fields_keyboard(state["data"]),
+        )
+        return STATE_AI_EDIT_MENU
+    return STATE_AI_REVIEW
+
+
+async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Choose field to edit or go back to summary."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if query.data == PH1_EDIT_BACK:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        await query.message.reply_text(
+            _format_phase1_ai_review_text(state["data"]),
+            reply_markup=_phase1_review_keyboard(),
+        )
+        return STATE_AI_REVIEW
+    if not query.data.startswith("ph1edit_"):
+        return STATE_AI_EDIT_MENU
+    edit_key = query.data.replace("ph1edit_", "", 1)
+    if edit_key not in PH1_EDIT_PROMPT_LABEL:
+        return STATE_AI_EDIT_MENU
+    context.user_data["phase1_pending_edit_key"] = edit_key
+    label = PH1_EDIT_PROMPT_LABEL[edit_key]
+    await query.message.reply_text(
+        f"✏️ Send new text for: {label}\n\n"
+        "Send a single minus (-) to clear that field.",
+    )
+    return STATE_AI_EDIT_INPUT
+
+
+async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Apply new text for the selected Phase 1 field."""
+    user_id = update.effective_user.id
+    ek = context.user_data.get("phase1_pending_edit_key")
+    if not ek:
+        await update.message.reply_text(
+            "Use the buttons above (**Change another field** or **Done — continue lead**), or /start to begin again."
+        )
+        return STATE_AI_EDIT_INPUT
+    text = (update.message.text or "").strip()
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        context.user_data.pop("phase1_pending_edit_key", None)
+        await update.message.reply_text("❌ Lead data not found. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"].copy()
+    if text == "-":
+        _apply_single_phase1_edit(state_data, ek, "")
+    else:
+        _apply_single_phase1_edit(state_data, ek, text)
+    _apply_single_address_as_both(state_data)
+    _clean_vin_and_car(state_data)
+    db.set_user_state(user_id, "phase1", state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    await update.message.reply_text(
+        "✅ Updated.\n\n"
+        "Need another change, or continue the lead?",
+        reply_markup=_phase1_after_edit_keyboard(),
+    )
+    return STATE_AI_EDIT_INPUT
+
+
+async def handle_phase1_edit_followup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """After an edit: more fields or finish and run VIN / files flow."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if query.data == PH1_EDIT_MORE:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        await query.message.reply_text(
+            "Pick a field to edit:",
+            reply_markup=_phase1_edit_fields_keyboard(state["data"]),
+        )
+        return STATE_AI_EDIT_MENU
+    if query.data == PH1_EDIT_DONE:
+        return await _continue_phase1_after_ai_review(query.message, context, user_id)
+    return STATE_AI_EDIT_INPUT
 
 
 # Maps API field names to state_data keys (e.g. delivery_date -> extra_info)
@@ -1558,6 +1803,8 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the conversation."""
     user_id = update.effective_user.id
+    if context.user_data:
+        context.user_data.pop("phase1_pending_edit_key", None)
     db.clear_user_state(user_id)
     
     await update.message.reply_text("❌ Operation cancelled. Use /start to begin again.")
@@ -2361,6 +2608,16 @@ def main():
             STATE_PHASE1: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
+            ],
+            STATE_AI_REVIEW: [
+                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=f"^({PH1_REVIEW_ACCEPT}|{PH1_REVIEW_EDIT})$"),
+            ],
+            STATE_AI_EDIT_MENU: [
+                CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1edit_[a-z]+)$"),
+            ],
+            STATE_AI_EDIT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
+                CallbackQueryHandler(handle_phase1_edit_followup_callback, pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE})$"),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
             STATE_ADD_FILES: [CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$")],
