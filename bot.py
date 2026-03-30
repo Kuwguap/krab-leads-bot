@@ -1,4 +1,5 @@
 """Main Telegram bot application."""
+import asyncio
 import io
 import logging
 import re
@@ -1125,10 +1126,18 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     # Encrypt phone number via OneTimeSecret
     await update.message.reply_text("🔐 Encrypting phone number...")
-    encrypted_data = ots.encrypt_phone(phone_number)
+    # NOTE: `utils/onetimesecret.py` uses synchronous HTTP calls; run in a thread so the async bot doesn't freeze.
+    encrypted_data = await asyncio.to_thread(ots.encrypt_phone, phone_number)
     
     if not encrypted_data:
-        await update.message.reply_text("❌ Error encrypting phone number. Please try again.")
+        await update.message.reply_text(
+            "❌ Error encrypting phone number.\n\n"
+            "Fix checklist:\n"
+            "1) Ensure `ONETIMESECRET_URL` is HTTPS and ends with `/api/v1/share`\n"
+            "2) Ensure `ONETIMESECRET_USERNAME` and `ONETIMESECRET_API_KEY` match your Vercel env\n"
+            "3) Ensure `clientsphonenumber.com` is up\n\n"
+            "Then try again."
+        )
         return STATE_PHASE2
     
     # Generate unique reference ID for this lead
