@@ -1111,9 +1111,9 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     digits_only = re.sub(r"\D", "", non_price_text)
     if len(digits_only) == 11 and digits_only.startswith("1"):
         digits_only = digits_only[1:]
-    # If 10 digits start with 1, treat as +1 (xxx) xxx-xxx so we don't store 11234567890 in OTS
-    if len(digits_only) == 10 and digits_only.startswith("1"):
-        digits_only = digits_only[1:]
+    # NOTE: Do NOT strip leading "1" from 10-digit numbers.
+    # Example: "+1234567890" is already a valid 10-digit number (area code can start with 1),
+    # and stripping would corrupt it and break encryption/unlock downstream.
     if len(digits_only) not in (9, 10) or not price:
         await update.message.reply_text(
             "❌ Please provide both phone number and price.\n"
