@@ -1129,7 +1129,17 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     encrypted_data = ots.encrypt_phone(phone_number)
     
     if not encrypted_data:
-        await update.message.reply_text("❌ Error encrypting phone number. Please try again.")
+        reason = (getattr(ots, "last_error", "") or "").strip()
+        if reason:
+            await update.message.reply_text(
+                "❌ Error encrypting phone number.\n\n"
+                f"Reason: {reason}\n\n"
+                "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
+                "(SUPABASE_URL/SUPABASE_KEY and ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY) on Vercel "
+                "or the bot has wrong credentials."
+            )
+        else:
+            await update.message.reply_text("❌ Error encrypting phone number. Please try again.")
         return STATE_PHASE2
     
     # Generate unique reference ID for this lead
@@ -2560,6 +2570,34 @@ def main():
     except Exception as e:
         logger.warning(f"Could not clear webhook (continuing anyway): {e}")
     time.sleep(1)
+
+    # #region agent log — startup self-test: verify phone encryption API is reachable
+    try:
+        _test_resp = requests.post(
+            ots.url,
+            auth=(ots.username, ots.api_key),
+            data={"secret": "__startup_test__", "passphrase": ots.passphrase, "ttl": "60"},
+            headers={"User-Agent": "KrabsLeads-Bot/1.0"},
+            timeout=10,
+        )
+        logger.info(
+            "PHONE ENCRYPTION SELF-TEST: HTTP %s | key_prefix=%s | url=%s | body_preview=%s",
+            _test_resp.status_code,
+            (ots.api_key or "")[:8] + "...",
+            ots.url,
+            (_test_resp.text or "")[:120],
+        )
+        if _test_resp.status_code != 200:
+            logger.error(
+                "*** PHONE ENCRYPTION WILL FAIL *** — API returned %s. "
+                "Update ONETIMESECRET_API_KEY in Render env vars to match the key "
+                "configured in the Vercel clientsphonenumber project.",
+                _test_resp.status_code,
+            )
+    except Exception as _te:
+        logger.error("PHONE ENCRYPTION SELF-TEST FAILED: %s", _te)
+    # #endregion
+
     # During Render redeploys, old and new worker can briefly overlap; stagger polling start
     # so the previous instance is more likely to have released getUpdates.
     if os.environ.get("RENDER", "").lower() == "true":
