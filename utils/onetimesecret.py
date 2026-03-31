@@ -23,7 +23,7 @@ def _normalize_share_url(url: str) -> str:
     Use HTTPS for production hosts. HTTP→HTTPS redirects often become GET and drop the POST body,
     which breaks the share API (looks like 'missing secret' / 405).
     """
-    u = (url or "").strip().rstrip("/")
+    u = (url or "").strip().lstrip("=").rstrip("/")
     if u.startswith("http://") and "localhost" not in u and "127.0.0.1" not in u:
         u = "https://" + u[len("http://") :]
     return u
