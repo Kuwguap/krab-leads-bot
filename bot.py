@@ -1267,6 +1267,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
         groups = db.get_all_groups()
         active_groups = [g for g in groups if g.get("is_active", True)]
+        # #region agent log
+        logger.info("BROADCAST DEBUG: total groups=%d, active=%d", len(groups), len(active_groups))
+        for _dg in groups:
+            logger.info("  group id=%s name=%s is_active=%s telegram_id=%r",
+                        _dg.get("id"), _dg.get("group_name"), _dg.get("is_active"), _dg.get("group_telegram_id"))
+        # #endregion
         for g in active_groups:
             gid = g.get("id")
             if not gid:
@@ -1283,6 +1289,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 continue
             # Create offer row first; we'll fill message IDs after sending.
             db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+            # #region agent log
+            logger.info("BROADCAST SEND: gid=%s chat_id=%r (%s) group=%s", gid, chat_id, type(chat_id).__name__, g.get("group_name"))
+            # #endregion
             try:
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
@@ -1292,7 +1301,13 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
+                # #region agent log
+                logger.info("BROADCAST OK: gid=%s msg_id=%s", gid, msg.message_id)
+                # #endregion
             except Exception as e:
+                # #region agent log
+                logger.error("BROADCAST FAIL: gid=%s error=%s (%s)", gid, e, type(e).__name__)
+                # #endregion
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
 
         db.set_user_state(
@@ -2534,70 +2549,11 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
-    """
-    Wait until no other process is polling this bot token.
-    Render starts the new worker before killing the old one; this loop lets
-    the new process survive that overlap instead of crashing with 409.
-    Returns True when the slot is free, False if timed out.
-    """
-    import requests as _req
-    import time as _time
-    api = f"https://api.telegram.org/bot{bot_token}"
-
-    # 1. Always clear webhook first
-    try:
-        _req.post(f"{api}/deleteWebhook", json={"drop_pending_updates": True}, timeout=5)
-    except Exception:
-        pass
-
-    # 2. Probe with getUpdates (timeout=1). If another process is polling,
-    #    Telegram returns 409 Conflict. We retry until the old one dies.
-    waited = 0
-    backoff = 2
-    while waited < max_wait:
-        try:
-            r = _req.post(f"{api}/getUpdates", json={"timeout": 1, "limit": 1}, timeout=10)
-            if r.status_code == 200:
-                logger.info("Polling slot is free — proceeding to start bot.")
-                return True
-            if r.status_code == 409:
-                logger.info(
-                    "Another instance still polling (409). Waiting %ds for it to shut down… (%d/%ds)",
-                    backoff, waited, max_wait,
-                )
-                _time.sleep(backoff)
-                waited += backoff
-                backoff = min(backoff * 2, 15)
-                continue
-            logger.warning("getUpdates probe returned HTTP %s, retrying…", r.status_code)
-            _time.sleep(3)
-            waited += 3
-        except Exception as e:
-            logger.warning("getUpdates probe failed: %s, retrying…", e)
-            _time.sleep(3)
-            waited += 3
-
-    logger.error("Timed out waiting for exclusive polling slot after %ds.", max_wait)
-    return False
-
-
 def main():
     """Main function to start the bot."""
-    import signal
-    import time
-
     logger.info("Bot starting...")
     sys.stdout.flush()
     sys.stderr.flush()
-
-    # Handle SIGTERM so Render's graceful-stop kills us quickly
-    # (the OLD process exits fast → frees the polling slot for the new one)
-    def _handle_sigterm(signum, frame):
-        logger.info("Received SIGTERM — shutting down gracefully.")
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
     # Validate configuration
     try:
         Config.validate()
@@ -2607,17 +2563,9 @@ def main():
         logger.error("Missing variables should be set in the .env file in the project root directory.")
         return
     
-    bot_token = Config.TELEGRAM_BOT_TOKEN
-
-    # Wait for any previous instance to release the polling slot
-    if not _wait_for_exclusive_polling(bot_token, max_wait=90):
-        logger.error("Could not acquire polling slot. Exiting.")
-        sys.exit(1)
-
     # Create application
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     
-
     # Always delete webhook before polling (avoids 409 when webhook was set elsewhere)
     import requests
     import time
@@ -2673,7 +2621,6 @@ def main():
         logger.info("Render: waiting %.1fs before polling (deploy overlap guard).", stagger)
         time.sleep(stagger)
     
-
     # Add error handler for all errors
     _conflict_logged = False  # Flag to prevent repeated logging
     
@@ -2694,9 +2641,11 @@ def main():
                     "Also: clear any webhook (e.g. run check_webhook.py once), then redeploy.\n"
                     "="*60
                 )
-                # Do not stop here. During Render deploy overlap, a transient second
-                # instance can cause Conflict; stopping both can make the bot appear down.
-                logger.info("Conflict detected; keeping process alive and waiting for overlap to clear.")
+                # Exit gracefully after logging
+                logger.info("Exiting due to conflict error...")
+                import asyncio
+                # Schedule application shutdown
+                asyncio.create_task(application.stop())
             # Suppress the error to prevent spam
             return
         
@@ -2911,30 +2860,36 @@ def main():
         application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=18, minute=0, tzinfo=eastern))
         logger.info("Daily motivation jobs scheduled (8 AM ET, 6 PM ET)")
 
-    logger.info("Starting polling — bot is live.")
+    logger.info("Make sure only ONE instance of the bot is running!")
+    logger.info("Starting polling - bot is live. Press Ctrl+C to stop.")
     
     try:
-        while True:
-            try:
-                application.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True
-                )
-                break
-            except Conflict:
-                logger.warning(
-                    "Startup conflict (another instance polling). "
-                    "Will retry in 10s instead of exiting."
-                )
-                time.sleep(10)
-                continue
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Conflict as e:
+        # This should only happen if conflict occurs during startup
+        logger.error(
+            "\n" + "="*60 + "\n"
+            "TELEGRAM CONFLICT ERROR: Multiple bot instances detected!\n\n"
+            "Possible causes:\n"
+            "1. Another instance of THIS bot is running\n"
+            "2. A webhook is set for this bot token\n"
+            "3. A background process is still running\n\n"
+            "Solution:\n"
+            "1. Run: python stop_bot.py (to find running processes)\n"
+            "2. Stop all bot instances (Ctrl+C in all terminals)\n"
+            "3. Wait 10 seconds\n"
+            "4. Run: python check_webhook.py (to clear webhooks)\n"
+            "5. Start only ONE instance: python bot.py\n"
+            "="*60
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-    except SystemExit:
-        raise
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
