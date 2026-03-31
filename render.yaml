@@ -15,6 +15,7 @@ services:
     name: krabsleads-bot
     runtime: python
     numInstances: 1
+    maxShutdownDelaySeconds: 60
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
