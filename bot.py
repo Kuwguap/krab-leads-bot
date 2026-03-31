@@ -1,5 +1,4 @@
 """Main Telegram bot application."""
-import asyncio
 import io
 import logging
 import re
@@ -816,10 +815,10 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
         await query.message.reply_text(
-            "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide phone number and price.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')"
-        )
+        "✅ Phase 1 received!\n\n"
+        "**Phase 2:** Please provide phone number and price.\n"
+        "Format: Phone number and price (e.g., '+1234567890 $500')"
+    )
         return STATE_PHASE2
     # add_files_yes
     await query.message.reply_text("📎 Send the file (photo or document).")
@@ -868,7 +867,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             "**Phase 2:** Please provide phone number and price.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')"
         )
-        return STATE_PHASE2
+    return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
 
@@ -1126,18 +1125,10 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     # Encrypt phone number via OneTimeSecret
     await update.message.reply_text("🔐 Encrypting phone number...")
-    # NOTE: `utils/onetimesecret.py` uses synchronous HTTP calls; run in a thread so the async bot doesn't freeze.
-    encrypted_data = await asyncio.to_thread(ots.encrypt_phone, phone_number)
+    encrypted_data = ots.encrypt_phone(phone_number)
     
     if not encrypted_data:
-        await update.message.reply_text(
-            "❌ Error encrypting phone number.\n\n"
-            "Fix checklist:\n"
-            "1) Ensure `ONETIMESECRET_URL` is HTTPS and ends with `/api/v1/share`\n"
-            "2) Ensure `ONETIMESECRET_USERNAME` and `ONETIMESECRET_API_KEY` match your Vercel env\n"
-            "3) Ensure `clientsphonenumber.com` is up\n\n"
-            "Then try again."
-        )
+        await update.message.reply_text("❌ Error encrypting phone number. Please try again.")
         return STATE_PHASE2
     
     # Generate unique reference ID for this lead
@@ -1461,7 +1452,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     vehicle_safe = "\n".join(vehicle_lines_display)
     delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
     extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
-
+    
     # Create item in Monday.com (if configured)
     monday_result = None
     if monday:
@@ -1539,7 +1530,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
-
+    
     # Group message – no raw phone; vehicle content sanitized; include reference ID for linking
     group_message = (
         f"🏷NEW CLIENT❗️\n\n"
@@ -2129,7 +2120,7 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Decline the assignment
     db.decline_lead_assignment(lead_id, driver['id'])
-
+    
     await query.message.edit_text(
         "❌ **Lead Declined**\n\n"
         "You have declined this lead.",
@@ -2666,7 +2657,7 @@ def main():
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
-
+    
     # Add accept/decline handlers for group broadcast offers
     application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^accept_group_"))
     application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^decline_group_"))
@@ -2810,7 +2801,7 @@ def main():
 
     logger.info("Make sure only ONE instance of the bot is running!")
     logger.info("Starting polling - bot is live. Press Ctrl+C to stop.")
-
+    
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
