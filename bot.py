@@ -1,6 +1,7 @@
 """Main Telegram bot application."""
 import io
 import logging
+import os
 import re
 import sys
 import secrets
@@ -2559,6 +2560,13 @@ def main():
     except Exception as e:
         logger.warning(f"Could not clear webhook (continuing anyway): {e}")
     time.sleep(1)
+    # During Render redeploys, old and new worker can briefly overlap; stagger polling start
+    # so the previous instance is more likely to have released getUpdates.
+    if os.environ.get("RENDER", "").lower() == "true":
+        import random
+        stagger = random.uniform(2.0, 12.0)
+        logger.info("Render: waiting %.1fs before polling (deploy overlap guard).", stagger)
+        time.sleep(stagger)
     
     # Add error handler for all errors
     _conflict_logged = False  # Flag to prevent repeated logging
