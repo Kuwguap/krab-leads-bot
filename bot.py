@@ -1235,8 +1235,17 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
     lead_data = state.get("data", {}).copy()
     if query.data == "select_group_all":
-        # Broadcast: create lead immediately, send offer to all active groups, first accept wins.
+        # Broadcast: notify groups, then immediately continue to driver selection (no waiting).
         phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
+        groups = db.get_all_groups()
+        active_groups = [g for g in groups if g.get("is_active", True)]
+        # group_id is NOT NULL for driver assignments, so pick a primary group for the lead record.
+        primary_group = db.get_group_by_assistant_telegram_id(str(user_id))
+        if not primary_group or not primary_group.get("is_active", True):
+            primary_group = active_groups[0] if active_groups else None
+        if not primary_group:
+            await query.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
+            return ConversationHandler.END
         final_lead_data = {
             "user_id": user_id,
             "telegram_username": (query.from_user.username or "Unknown"),
@@ -1248,7 +1257,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "onetimesecret_secret_key": (lead_data.get("encrypted_data") or {}).get("metadata_key"),
             "encrypted_link": (lead_data.get("encrypted_data") or {}).get("link"),
             "reference_id": lead_data.get("reference_id"),
-            "group_id": None,
+            "group_id": primary_group.get("id"),
             "extra_info": lead_data.get("extra_info", ""),
         }
         lead = db.create_lead(final_lead_data)
@@ -1266,8 +1275,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"Tap below to accept/decline for your group."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
-        groups = db.get_all_groups()
-        active_groups = [g for g in groups if g.get("is_active", True)]
         # #region agent log
         logger.info("BROADCAST DEBUG: total groups=%d, active=%d", len(groups), len(active_groups))
         for _dg in groups:
@@ -1316,18 +1323,30 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 # #endregion
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
 
-        db.set_user_state(
-            user_id,
-            "group_broadcast_wait",
-            {"lead_id": lead["id"], "reference_id": reference_id, "username": username},
-        )
-
+        # Continue immediately to driver selection. Use resend flow so we don't create the lead twice.
+        resend_data = {
+            "lead_id": lead["id"],
+            "reference_id": reference_id,
+            "group_id": primary_group.get("id"),
+            "selected_group": primary_group,
+            "resend": True,
+            "broadcast": True,
+        }
+        db.set_user_state(user_id, "select_driver", resend_data)
+        drivers = db.get_all_drivers()
+        active_drivers = [d for d in drivers if d.get("is_active", True)]
+        if not active_drivers:
+            await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
+            return ConversationHandler.END
+        driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
+        driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
         await query.message.reply_text(
             f"📣 **Broadcast sent**\n\nReference ID: `{reference_id}`\nSent to **{sent_count}** group(s).\n\n"
-            "First group to accept will get it.",
+            f"Now select which driver(s) to notify:\n\n{driver_list}",
             parse_mode="Markdown",
+            reply_markup=driver_keyboard,
         )
-        return ConversationHandler.END
+        return STATE_SELECT_DRIVER
 
     group_id = query.data.replace("select_group_", "")
     selected_group = db.get_group_by_id(group_id)
