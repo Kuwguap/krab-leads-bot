@@ -1323,16 +1323,14 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 # #endregion
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
 
-        # Continue immediately to driver selection. Use resend flow so we don't create the lead twice.
-        resend_data = {
-            "lead_id": lead["id"],
-            "reference_id": reference_id,
-            "group_id": primary_group.get("id"),
-            "selected_group": primary_group,
-            "resend": True,
-            "broadcast": True,
-        }
-        db.set_user_state(user_id, "select_driver", resend_data)
+        # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
+        continue_data = lead_data.copy()
+        continue_data["lead_id"] = lead["id"]
+        continue_data["group_id"] = primary_group.get("id")
+        continue_data["selected_group"] = primary_group
+        continue_data["follow_after_broadcast"] = True
+        continue_data.pop("resend", None)
+        db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
         active_drivers = [d for d in drivers if d.get("is_active", True)]
         if not active_drivers:
@@ -1389,13 +1387,17 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     lead_data = state.get("data", {})
     
-    # Resend flow: lead exists, just send to new drivers
-    if lead_data.get("resend") and lead_data.get("lead_id"):
+    # Resend flow: lead exists, just send to new drivers (not used after broadcast-all; that uses follow_after_broadcast)
+    if lead_data.get("resend") and lead_data.get("lead_id") and not lead_data.get("follow_after_broadcast"):
         return await _handle_resend_to_drivers(
             update, context, lead_data, query.data, user_id,
         )
     
-    phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
+    _phase1_exclude = {
+        'phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group',
+        'resend', 'lead_id', 'follow_after_broadcast', 'broadcast',
+    }
+    phase1_data = {k: v for k, v in lead_data.items() if k not in _phase1_exclude}
     phone_number = lead_data.get('phone_number')
     price = lead_data.get('price')
     encrypted_data = lead_data.get('encrypted_data', {})
@@ -1478,11 +1480,17 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "extra_info": lead_data.get("extra_info", "")
     }
     
-    lead = db.create_lead(final_lead_data)
-    
-    if not lead:
-        await query.message.reply_text("❌ Error saving lead to database.")
-        return ConversationHandler.END
+    if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
+        lead = db.get_lead_by_id(lead_data["lead_id"])
+        if not lead:
+            await query.message.reply_text("❌ Error: lead not found. Use /start to begin again.")
+            return ConversationHandler.END
+        reference_id = lead.get("reference_id") or reference_id
+    else:
+        lead = db.create_lead(final_lead_data)
+        if not lead:
+            await query.message.reply_text("❌ Error saving lead to database.")
+            return ConversationHandler.END
     
     # Build vehicle block from individual fields so VIN and car are NEVER sanitized (no link in those lines)
     def _safe(s: str) -> str:
