@@ -1258,9 +1258,10 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
         reference_id = lead.get("reference_id", "N/A")
         username = query.from_user.username or "Unknown"
+        # Plain text: legacy Markdown breaks on underscores in usernames (e.g. foo_bar → parse error → 0 groups sent).
         group_offer_message = (
-            f"🏷NEW CLIENT❗️\n\n"
-            f"📋 Reference ID: `{reference_id}`\n"
+            f"🏷 NEW CLIENT\n\n"
+            f"📋 Reference ID: {reference_id}\n"
             f"👤 Submitted by: @{username}\n\n"
             f"Tap below to accept/decline for your group."
         )
@@ -1286,6 +1287,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             gid = g.get("id")
             chat_id = _parse_chat_id(g.get("group_telegram_id"))
             if not gid or not chat_id:
+                # #region agent log
+                logger.warning(
+                    "BROADCAST SKIP: group=%s missing gid or chat_id (gid=%r telegram_id=%r)",
+                    g.get("group_name"), gid, g.get("group_telegram_id"),
+                )
+                # #endregion
                 continue
             # Create offer row first; we'll fill message IDs after sending.
             db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
@@ -1296,7 +1303,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
                     text=group_offer_message,
-                    parse_mode="Markdown",
                     reply_markup=offer_kb_by_group.get(gid),
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
@@ -2549,20 +2555,78 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
+    """
+    Wait until no other process is polling this bot token.
+    Render starts the new worker before killing the old one; this loop lets
+    the new process survive that overlap instead of crashing with 409.
+    Returns True when the slot is free, False if timed out.
+    """
+    import requests as _req
+    import time as _time
+    api = f"https://api.telegram.org/bot{bot_token}"
+
+    try:
+        _req.post(f"{api}/deleteWebhook", json={"drop_pending_updates": True}, timeout=5)
+    except Exception:
+        pass
+
+    waited = 0
+    backoff = 2
+    while waited < max_wait:
+        try:
+            r = _req.post(f"{api}/getUpdates", json={"timeout": 1, "limit": 1}, timeout=10)
+            if r.status_code == 200:
+                logger.info("Polling slot is free — proceeding to start bot.")
+                return True
+            if r.status_code == 409:
+                logger.info(
+                    "Another instance still polling (409). Waiting %ds for it to shut down… (%d/%ds)",
+                    backoff, waited, max_wait,
+                )
+                _time.sleep(backoff)
+                waited += backoff
+                backoff = min(backoff * 2, 15)
+                continue
+            logger.warning("getUpdates probe returned HTTP %s, retrying…", r.status_code)
+            _time.sleep(3)
+            waited += 3
+        except Exception as e:
+            logger.warning("getUpdates probe failed: %s, retrying…", e)
+            _time.sleep(3)
+            waited += 3
+
+    logger.error("Timed out waiting for exclusive polling slot after %ds.", max_wait)
+    return False
+
+
 def main():
     """Main function to start the bot."""
+    import signal
+
     logger.info("Bot starting...")
     sys.stdout.flush()
     sys.stderr.flush()
+
+    def _handle_sigterm(signum, frame):
+        logger.info("Received SIGTERM — shutting down gracefully.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     # Validate configuration
     try:
         Config.validate()
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
-        logger.error("\nPlease check your .env file and ensure all required variables have non-empty values.")
-        logger.error("Missing variables should be set in the .env file in the project root directory.")
+        logger.error("\nPlease check your .env file and ensure all required environment variables have non-empty values.")
         return
-    
+
+    bot_token = Config.TELEGRAM_BOT_TOKEN
+    if not _wait_for_exclusive_polling(bot_token, max_wait=90):
+        logger.error("Could not acquire polling slot. Exiting.")
+        sys.exit(1)
+
     # Create application
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
     
