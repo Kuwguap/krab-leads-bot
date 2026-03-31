@@ -2626,11 +2626,9 @@ def main():
                     "Also: clear any webhook (e.g. run check_webhook.py once), then redeploy.\n"
                     "="*60
                 )
-                # Exit gracefully after logging
-                logger.info("Exiting due to conflict error...")
-                import asyncio
-                # Schedule application shutdown
-                asyncio.create_task(application.stop())
+                # Do not stop here. During Render deploy overlap, a transient second
+                # instance can cause Conflict; stopping both can make the bot appear down.
+                logger.info("Conflict detected; keeping process alive and waiting for overlap to clear.")
             # Suppress the error to prevent spam
             return
         
@@ -2848,13 +2846,20 @@ def main():
     logger.info("Starting polling — bot is live.")
     
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-    except Conflict:
-        logger.error("409 Conflict during polling — another instance grabbed the slot. Exiting.")
-        sys.exit(1)
+        while True:
+            try:
+                application.run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True
+                )
+                break
+            except Conflict:
+                logger.warning(
+                    "Startup conflict (another instance polling). "
+                    "Will retry in 10s instead of exiting."
+                )
+                time.sleep(10)
+                continue
     except KeyboardInterrupt:
         logger.info("Bot stopped by user.")
     except SystemExit:
