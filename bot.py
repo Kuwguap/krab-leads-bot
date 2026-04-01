@@ -69,6 +69,18 @@ monday = MondayClient() if Config.is_monday_configured() else None
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 
 
+import base64, uuid as _uuid_mod
+
+def _short_uuid(u: str) -> str:
+    """Compress a UUID string (36 chars) to 22-char base64url (no padding)."""
+    return base64.urlsafe_b64encode(_uuid_mod.UUID(u).bytes).rstrip(b"=").decode()
+
+def _long_uuid(s: str) -> str:
+    """Expand a 22-char base64url back to a standard UUID string."""
+    padded = s + "==" 
+    return str(_uuid_mod.UUID(bytes=base64.urlsafe_b64decode(padded)))
+
+
 def _get_suspended_driver_ids() -> set:
     """Driver IDs with 3+ pending receipts (suspended)."""
     suspended = set()
@@ -1282,13 +1294,15 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"Tap Accept or Decline for your group. If another group accepts first, this will show as taken."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
+        short_lead = _short_uuid(lead["id"])
         for g in active_groups:
             gid = g.get("id")
             if not gid:
                 continue
+            short_gid = _short_uuid(gid)
             offer_kb_by_group[gid] = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"accept_group_{lead['id']}_{gid}"),
-                InlineKeyboardButton("❌ Decline", callback_data=f"decline_group_{lead['id']}_{gid}"),
+                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}_{short_gid}"),
+                InlineKeyboardButton("❌ Decline", callback_data=f"dg_{short_lead}_{short_gid}"),
             ]])
         sent_count = 0
         failures: list[tuple[str, str]] = []
@@ -2211,10 +2225,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     """Handle a group member accepting a broadcast lead offer."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("accept_group_", "")
+    raw = query.data.replace("ag_", "")
     try:
-        lead_id, group_id = raw.split("_", 1)
-    except ValueError:
+        short_lead, short_group = raw.split("_", 1)
+        lead_id = _long_uuid(short_lead)
+        group_id = _long_uuid(short_group)
+    except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
 
@@ -2319,10 +2335,12 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
     """Handle a group member declining a broadcast lead offer (for that group only)."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("decline_group_", "")
+    raw = query.data.replace("dg_", "")
     try:
-        lead_id, group_id = raw.split("_", 1)
-    except ValueError:
+        short_lead, short_group = raw.split("_", 1)
+        lead_id = _long_uuid(short_lead)
+        group_id = _long_uuid(short_group)
+    except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
     db.decline_group_lead_offer(lead_id, group_id)
@@ -2818,8 +2836,8 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
     
     # Add accept/decline handlers for group broadcast offers
-    application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^accept_group_"))
-    application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^decline_group_"))
+    application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^ag_"))
+    application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^dg_"))
     
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
