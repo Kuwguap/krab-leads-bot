@@ -1275,12 +1275,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"Tap below to accept/decline for your group."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
-        # #region agent log
-        logger.info("BROADCAST DEBUG: total groups=%d, active=%d", len(groups), len(active_groups))
-        for _dg in groups:
-            logger.info("  group id=%s name=%s is_active=%s telegram_id=%r",
-                        _dg.get("id"), _dg.get("group_name"), _dg.get("is_active"), _dg.get("group_telegram_id"))
-        # #endregion
         for g in active_groups:
             gid = g.get("id")
             if not gid:
@@ -1294,18 +1288,14 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             gid = g.get("id")
             chat_id = _parse_chat_id(g.get("group_telegram_id"))
             if not gid or not chat_id:
-                # #region agent log
                 logger.warning(
-                    "BROADCAST SKIP: group=%s missing gid or chat_id (gid=%r telegram_id=%r)",
-                    g.get("group_name"), gid, g.get("group_telegram_id"),
+                    "Broadcast skipped group %s: missing group id or telegram chat id (telegram_id=%r)",
+                    g.get("group_name"),
+                    g.get("group_telegram_id"),
                 )
-                # #endregion
                 continue
             # Create offer row first; we'll fill message IDs after sending.
             db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
-            # #region agent log
-            logger.info("BROADCAST SEND: gid=%s chat_id=%r (%s) group=%s", gid, chat_id, type(chat_id).__name__, g.get("group_name"))
-            # #endregion
             try:
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
@@ -1314,13 +1304,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
-                # #region agent log
-                logger.info("BROADCAST OK: gid=%s msg_id=%s", gid, msg.message_id)
-                # #endregion
             except Exception as e:
-                # #region agent log
-                logger.error("BROADCAST FAIL: gid=%s error=%s (%s)", gid, e, type(e).__name__)
-                # #endregion
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
 
         # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
@@ -2676,33 +2660,6 @@ def main():
     except Exception as e:
         logger.warning(f"Could not clear webhook (continuing anyway): {e}")
     time.sleep(1)
-
-    # #region agent log — startup self-test: verify phone encryption API is reachable
-    try:
-        _test_resp = requests.post(
-            ots.url,
-            auth=(ots.username, ots.api_key),
-            data={"secret": "__startup_test__", "passphrase": ots.passphrase, "ttl": "60"},
-            headers={"User-Agent": "KrabsLeads-Bot/1.0"},
-            timeout=10,
-        )
-        logger.info(
-            "PHONE ENCRYPTION SELF-TEST: HTTP %s | key_prefix=%s | url=%s | body_preview=%s",
-            _test_resp.status_code,
-            (ots.api_key or "")[:8] + "...",
-            ots.url,
-            (_test_resp.text or "")[:120],
-        )
-        if _test_resp.status_code != 200:
-            logger.error(
-                "*** PHONE ENCRYPTION WILL FAIL *** — API returned %s. "
-                "Update ONETIMESECRET_API_KEY in Render env vars to match the key "
-                "configured in the Vercel clientsphonenumber project.",
-                _test_resp.status_code,
-            )
-    except Exception as _te:
-        logger.error("PHONE ENCRYPTION SELF-TEST FAILED: %s", _te)
-    # #endregion
 
     # During Render redeploys, old and new worker can briefly overlap; stagger polling start
     # so the previous instance is more likely to have released getUpdates.
