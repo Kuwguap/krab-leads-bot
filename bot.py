@@ -119,10 +119,15 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
 def _parse_chat_id(raw: str | int | None) -> int | str | None:
     if raw is None:
         return None
+    # Render/GUI copy-paste mistakes sometimes include a leading '=' (e.g. "= -100123...")
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.lstrip("=").strip()
     try:
-        return int(str(raw).strip())
+        return int(s)
     except (ValueError, TypeError):
-        return raw
+        return s
 
 
 async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, lead: dict, text: str) -> None:
@@ -1650,11 +1655,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "Lead not sent to group. Check the group record in admin."
         )
     else:
-        # Telegram expects numeric chat_id as int (e.g. -1001234567890)
-        try:
-            group_chat_id = int(str(group_telegram_id_raw).strip())
-        except (ValueError, TypeError):
-            group_chat_id = group_telegram_id_raw
+        group_chat_id = _parse_chat_id(group_telegram_id_raw)
         try:
             logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
             # No parse_mode so user content (vehicle_details, etc.) can't break Markdown
@@ -1696,10 +1697,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     # Forward attached files to group and supervisory
     attached_files = phase1_data.get("attached_files") or []
-    try:
-        _group_cid = int(str(group_telegram_id_raw).strip()) if group_telegram_id_raw else None
-    except (ValueError, TypeError):
-        _group_cid = None
+    _group_cid = _parse_chat_id(group_telegram_id_raw)
     try:
         _sup_cid = int(str(supervisory_telegram_id).strip()) if supervisory_telegram_id else None
     except (ValueError, TypeError):
@@ -1928,7 +1926,7 @@ async def _handle_resend_to_drivers(
     group_telegram_id = selected_group.get("group_telegram_id") if selected_group else None
     if group_telegram_id and assigned_count > 0:
         try:
-            gcid = int(str(group_telegram_id).strip())
+            gcid = _parse_chat_id(group_telegram_id)
             await context.bot.send_message(
                 chat_id=gcid,
                 text=f"🔄 Reference ID `{reference_id}`: Reassigned to driver(s) **{driver_names}**",
