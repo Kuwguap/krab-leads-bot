@@ -1240,6 +1240,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     lead_data = state.get("data", {}).copy()
     if query.data == "select_group_all":
         # Broadcast: notify groups, then immediately continue to driver selection (no waiting).
+        import asyncio
+        from telegram.error import RetryAfter
+
         phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
         groups = db.get_all_groups()
         active_groups = [g for g in groups if g.get("is_active", True)]
@@ -1288,6 +1291,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 InlineKeyboardButton("❌ Decline", callback_data=f"decline_group_{lead['id']}_{gid}"),
             ]])
         sent_count = 0
+        failures: list[tuple[str, str]] = []
         for g in active_groups:
             gid = g.get("id")
             chat_id = _parse_chat_id(g.get("group_telegram_id"))
@@ -1297,6 +1301,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     g.get("group_name"),
                     g.get("group_telegram_id"),
                 )
+                failures.append((g.get("group_name") or str(gid) or "Unknown group", "missing group_telegram_id"))
                 continue
             # Create offer row first; we'll fill message IDs after sending.
             db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
@@ -1308,8 +1313,25 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
+            except RetryAfter as e:
+                # Telegram is rate limiting. Wait the requested time and retry once.
+                wait_s = int(getattr(e, "retry_after", 1) or 1)
+                logger.warning("Broadcast rate-limited for %s; retrying in %ss", g.get("group_name"), wait_s)
+                await asyncio.sleep(wait_s)
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=group_offer_message,
+                        reply_markup=offer_kb_by_group.get(gid),
+                    )
+                    db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                    sent_count += 1
+                except Exception as e2:
+                    logger.error("Error sending group offer to %s after retry: %s", g.get("group_name"), e2)
+                    failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e2).__name__}: {e2}"))
             except Exception as e:
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
+                failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e).__name__}: {e}"))
 
         # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
         continue_data = lead_data.copy()
@@ -1328,10 +1350,18 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
         # Plain text to avoid Telegram Markdown parse errors (driver names/usernames can contain underscores).
         try:
+            summary = ""
+            if failures:
+                # Keep summary short to avoid Telegram message limits.
+                top = failures[:8]
+                summary_lines = [f"- {name}: {reason}" for (name, reason) in top]
+                more = f"\n- (+{len(failures) - len(top)} more)" if len(failures) > len(top) else ""
+                summary = "\n\nFailed group(s):\n" + "\n".join(summary_lines) + more
             await query.message.reply_text(
                 f"📣 Broadcast sent\n\nReference ID: {reference_id}\nSent to {sent_count} group(s).\n\n"
                 f"You do not need to wait for a group — pick drivers next. Groups can still accept/decline in their chats.\n\n"
-                f"Select which driver(s) to notify:\n\n{driver_list}",
+                f"Select which driver(s) to notify:\n\n{driver_list}"
+                f"{summary}",
                 reply_markup=driver_keyboard,
             )
         except Exception as e:
