@@ -46,7 +46,6 @@ STATE_PHASE2 = 2  # Waiting for phone number and price
 STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistants_choose_group is on)
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
-STATE_GROUP_BROADCAST_WAIT = 15  # Lead was broadcast to groups; waiting for them to accept/decline
 STATE_AI_REVIEW = 16  # AI parsed Phase 1: user confirms or edits fields
 STATE_AI_EDIT_MENU = 17  # Pick which field to edit
 STATE_AI_EDIT_INPUT = 18  # Waiting for new text for selected field
@@ -1272,7 +1271,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"🏷 NEW CLIENT\n\n"
             f"📋 Reference ID: {reference_id}\n"
             f"👤 Submitted by: @{username}\n\n"
-            f"Tap below to accept/decline for your group."
+            f"Tap Accept or Decline for your group. If another group accepts first, this will show as taken."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
         for g in active_groups:
@@ -1324,7 +1323,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
         await query.message.reply_text(
             f"📣 **Broadcast sent**\n\nReference ID: `{reference_id}`\nSent to **{sent_count}** group(s).\n\n"
-            f"Now select which driver(s) to notify:\n\n{driver_list}",
+            f"You do not need to wait for a group — pick drivers next. Groups can still accept/decline in their chats.\n\n"
+            f"**Select which driver(s) to notify:**\n\n{driver_list}",
             parse_mode="Markdown",
             reply_markup=driver_keyboard,
         )
@@ -2249,20 +2249,34 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         ],
     )
 
-    # Send driver requests to drivers for this group (keeps existing driver-accept flow)
-    count, driver_names = await _send_driver_requests_for_group(context, lead, group)
-    if count > 0:
-        await context.bot.send_message(
-            chat_id=_parse_chat_id(group.get("group_telegram_id")),
-            text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
-            parse_mode="Markdown",
-        )
+    # If the sender already went through driver selection, do not DM drivers again.
+    if db.lead_has_assignments(lead_id):
+        try:
+            await context.bot.send_message(
+                chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                text=(
+                    f"✅ **Your group claimed this lead**\n\n"
+                    f"Reference: `{reference_id}`\n\n"
+                    f"The sender already notified driver(s). This group is now recorded as the accepting group."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not notify group after accept (assignments already exist): %s", e)
     else:
-        await context.bot.send_message(
-            chat_id=_parse_chat_id(group.get("group_telegram_id")),
-            text=f"⚠️ No eligible drivers to notify for this group (inactive/suspended/missing Telegram IDs).\nReference: `{reference_id}`",
-            parse_mode="Markdown",
-        )
+        count, driver_names = await _send_driver_requests_for_group(context, lead, group)
+        if count > 0:
+            await context.bot.send_message(
+                chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                text=f"⚠️ No eligible drivers to notify for this group (inactive/suspended/missing Telegram IDs).\nReference: `{reference_id}`",
+                parse_mode="Markdown",
+            )
 
 
 async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):

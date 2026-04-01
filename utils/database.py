@@ -503,6 +503,17 @@ class Database:
             logger.error(f"Error creating lead assignment: {e}")
             return False
 
+    def lead_has_assignments(self, lead_id: str) -> bool:
+        """True if any driver assignment exists for this lead (sender already picked drivers)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            r = self.client.table("lead_assignments").select("id").eq("lead_id", lead_id).limit(1).execute()
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error checking lead assignments: {e}")
+            return False
+
     # Group lead offer methods (broadcast lead to many groups; first accept wins)
     def create_group_lead_offer(
         self,
