@@ -1,5 +1,7 @@
 # Render Blueprint: KrabsLeads
 # Web: admin dashboard API (Flask). Worker: Telegram bot (single instance; do not scale to avoid 409 Conflict).
+previews:
+  generation: off
 services:
   - type: web
     name: krabsleads-admin
