@@ -491,6 +491,17 @@ class Database:
         """Create a lead assignment (when sent to driver)."""
         if not self._check_tables_exist():
             return False
+        try:
+            self.client.table("lead_assignments").insert({
+                "lead_id": lead_id,
+                "driver_id": driver_id,
+                "group_id": group_id,
+                "status": "pending",
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating lead assignment: {e}")
+            return False
 
     # Group lead offer methods (broadcast lead to many groups; first accept wins)
     def create_group_lead_offer(
@@ -596,19 +607,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error declining group lead offer: {e}")
             return False
-        
-        try:
-            self.client.table("lead_assignments").insert({
-                "lead_id": lead_id,
-                "driver_id": driver_id,
-                "group_id": group_id,
-                "status": "pending"
-            }).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error creating lead assignment: {e}")
-            return False
-    
+
     def accept_lead_assignment(self, lead_id: str, driver_id: str) -> bool:
         """Accept a lead assignment (first driver to accept)."""
         if not self._check_tables_exist():
