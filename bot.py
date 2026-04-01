@@ -1326,13 +1326,21 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
         driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
         driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
-        await query.message.reply_text(
-            f"📣 **Broadcast sent**\n\nReference ID: `{reference_id}`\nSent to **{sent_count}** group(s).\n\n"
-            f"You do not need to wait for a group — pick drivers next. Groups can still accept/decline in their chats.\n\n"
-            f"**Select which driver(s) to notify:**\n\n{driver_list}",
-            parse_mode="Markdown",
-            reply_markup=driver_keyboard,
-        )
+        # Plain text to avoid Telegram Markdown parse errors (driver names/usernames can contain underscores).
+        try:
+            await query.message.reply_text(
+                f"📣 Broadcast sent\n\nReference ID: {reference_id}\nSent to {sent_count} group(s).\n\n"
+                f"You do not need to wait for a group — pick drivers next. Groups can still accept/decline in their chats.\n\n"
+                f"Select which driver(s) to notify:\n\n{driver_list}",
+                reply_markup=driver_keyboard,
+            )
+        except Exception as e:
+            logger.error("Broadcast: could not reply with driver picker: %s", e)
+            # Last resort: still show the keyboard with a minimal message.
+            await query.message.reply_text(
+                "📣 Broadcast sent. Select driver(s) to notify:",
+                reply_markup=driver_keyboard,
+            )
         return STATE_SELECT_DRIVER
 
     group_id = query.data.replace("select_group_", "")
