@@ -1161,6 +1161,25 @@ export default function AdminPanel() {
                             </pre>
                           </div>
 
+                          {receiptSelectedItem.special_request_note ? (
+                            <div style={{ marginBottom: 12 }}>
+                              <strong>Special request note:</strong>
+                              <pre
+                                style={{
+                                  background: '#f6f6f6',
+                                  padding: 12,
+                                  borderRadius: 8,
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  maxHeight: 220,
+                                  overflow: 'auto',
+                                }}
+                              >
+                                {receiptSelectedItem.special_request_note}
+                              </pre>
+                            </div>
+                          ) : null}
+
                           <button
                             type="button"
                             onClick={() => deletePendingReceiptAssignment(receiptSelectedItem.assignment_id)}

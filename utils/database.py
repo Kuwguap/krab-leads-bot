@@ -491,6 +491,28 @@ class Database:
         """Create a lead assignment (when sent to driver)."""
         if not self._check_tables_exist():
             return False
+        try:
+            self.client.table("lead_assignments").insert({
+                "lead_id": lead_id,
+                "driver_id": driver_id,
+                "group_id": group_id,
+                "status": "pending",
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating lead assignment: {e}")
+            return False
+
+    def lead_has_assignments(self, lead_id: str) -> bool:
+        """True if any driver assignment exists for this lead (sender already picked drivers)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            r = self.client.table("lead_assignments").select("id").eq("lead_id", lead_id).limit(1).execute()
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error checking lead assignments: {e}")
+            return False
 
     # Group lead offer methods (broadcast lead to many groups; first accept wins)
     def create_group_lead_offer(
@@ -596,19 +618,7 @@ class Database:
         except Exception as e:
             logger.error(f"Error declining group lead offer: {e}")
             return False
-        
-        try:
-            self.client.table("lead_assignments").insert({
-                "lead_id": lead_id,
-                "driver_id": driver_id,
-                "group_id": group_id,
-                "status": "pending"
-            }).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error creating lead assignment: {e}")
-            return False
-    
+
     def accept_lead_assignment(self, lead_id: str, driver_id: str) -> bool:
         """Accept a lead assignment (first driver to accept)."""
         if not self._check_tables_exist():
@@ -783,7 +793,7 @@ class Database:
             return []
         try:
             r = self.client.table("lead_assignments").select(
-                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info)"
+                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note)"
             ).eq("driver_id", driver_id).eq("status", "accepted").execute()
             out = []
             for row in r.data or []:

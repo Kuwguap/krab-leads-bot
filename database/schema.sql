@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS leads (
     
     -- Extra info from Phase 1 (e.g., delivery time / notes)
     extra_info TEXT,
+    -- Note from Phase 2 (after phone/price); shown at bottom of forwarded lead
+    special_request_note TEXT,
     
     -- Metadata
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

@@ -22,14 +22,12 @@ class Config:
     MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID")
     MONDAY_API_URL = "https://api.monday.com/v2"
     
-    # OneTimeSecret (strip whitespace — Windows .env often adds CR/LF and breaks Basic auth)
-    ONETIMESECRET_USERNAME = (os.getenv("ONETIMESECRET_USERNAME") or "").strip() or None
-    ONETIMESECRET_API_KEY = (os.getenv("ONETIMESECRET_API_KEY") or "").strip() or None
-    # OneTimeSecret-compatible endpoint (hosted app in `clientsphonenumber/`, e.g. Vercel + custom domain)
-    ONETIMESECRET_URL = (os.getenv("ONETIMESECRET_URL") or "https://clientsphonenumber.com/api/v1/share").strip()
-    # Public base URL for unlock links (must end with `/secret/`)
-    ONETIMESECRET_LINK_BASE = (os.getenv("ONETIMESECRET_LINK_BASE") or "https://clientsphonenumber.com/secret/").strip()
-    ONETIMESECRET_PASSPHRASE = (os.getenv("ONETIMESECRET_PASSPHRASE") or "DispatchPassword").strip()
+    # OneTimeSecret (strip whitespace and stray '=' from copy-paste in Render dashboard)
+    ONETIMESECRET_USERNAME = (os.getenv("ONETIMESECRET_USERNAME") or "").strip().lstrip("=") or None
+    ONETIMESECRET_API_KEY = (os.getenv("ONETIMESECRET_API_KEY") or "").strip().lstrip("=") or None
+    ONETIMESECRET_URL = (os.getenv("ONETIMESECRET_URL") or "https://clientsphonenumber.com/api/v1/share").strip().lstrip("=")
+    ONETIMESECRET_LINK_BASE = (os.getenv("ONETIMESECRET_LINK_BASE") or "https://clientsphonenumber.com/secret/").strip().lstrip("=")
+    ONETIMESECRET_PASSPHRASE = (os.getenv("ONETIMESECRET_PASSPHRASE") or "DispatchPassword").strip().lstrip("=")
     
     # Supabase
     SUPABASE_URL = os.getenv("SUPABASE_URL")
