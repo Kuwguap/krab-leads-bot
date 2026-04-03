@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import re
+import html
 import sys
 import secrets
 import string
@@ -54,6 +55,14 @@ STATE_VIN_RETYPE = 14  # User chose to retype VIN; waiting for new VIN input
 STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
 STATE_ADD_FILES = 12  # Ask "Do you want to add files?"
 STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
+STATE_SPECIAL_REQUEST_NOTE = 19  # After phone + price: optional note for dispatchers
+
+# Keys in user state data that are not Phase 1 vehicle/delivery fields
+_PHASE1_STATE_EXCLUDE = frozenset({
+    "phone_number", "price", "encrypted_data", "reference_id", "group_id", "selected_group",
+    "resend", "lead_id", "follow_after_broadcast", "broadcast",
+    "pending_phone_number", "pending_price", "special_request_note", "username",
+})
 
 # Receipt submission states
 STATE_WAITING_REFERENCE_ID = 4  # Waiting for reference ID input
@@ -216,6 +225,7 @@ async def _send_driver_requests_for_group(
         return (0, "")
     reference_id = lead.get("reference_id", "N/A")
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    spec = (lead.get("special_request_note") or "").strip()
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
         f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
@@ -223,6 +233,8 @@ async def _send_driver_requests_for_group(
         f" Delivery Time 🏷️: {extra_safe}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
+    if spec:
+        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(spec)}"
     accept_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead['id']}"),
         InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead['id']}"),
@@ -389,12 +401,10 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
 
 def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
     """Build keyboard for VIN conflict: keep driver details, use VIN search result, or retype VIN."""
-    def _t(s: str, n: int = 35) -> str:
-        s = s or ""
-        return (s[:n] + "…") if len(s) > n else s
+    _ = api_car, stated_car  # context shown in message body above the buttons
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Keep driver details in lead data: {_t(stated_car)}", callback_data="vin_keep")],
-        [InlineKeyboardButton(f"Use VIN found in search: {_t(api_car)}", callback_data="vin_use")],
+        [InlineKeyboardButton("Continue with same Vin", callback_data="vin_keep")],
+        [InlineKeyboardButton("Use Vin Lookup", callback_data="vin_use")],
         [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
     ])
 
@@ -405,6 +415,7 @@ PH1_REVIEW_EDIT = "ph1_edit"
 PH1_EDIT_BACK = "ph1_back"
 PH1_EDIT_MORE = "ph1_more"
 PH1_EDIT_DONE = "ph1_done"
+PH1_FINAL_CONFIRM = "ph1_final_ok"
 # edit key -> state_data key (None = first/last name parts)
 PH1_EDIT_TO_STATE_KEY = {
     "fn": None,
@@ -454,11 +465,10 @@ def _set_full_name(state_data: dict, first: str, last: str) -> None:
         state_data["name"] = f"{f} {l}".strip() if f else l
 
 
-def _format_phase1_ai_review_text(state_data: dict) -> str:
-    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+def _format_phase1_field_lines(state_data: dict) -> str:
+    """Plain-text list of all Phase 1 fields (same labels as the edit picker)."""
     first, last = _name_parts_from_full(state_data.get("name"))
     lines = [
-        "📝 Here's how I understood your lead:\n",
         f"First name: {first}",
         f"Last name: {last}",
         f"Registration address: {state_data.get('address') or '-'}",
@@ -471,9 +481,50 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
         f"Insurance company: {state_data.get('insurance_company') or '-'}",
         f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
         f"Date/time & notes: {state_data.get('extra_info') or '-'}",
-        "\nTap Accept to continue, or Make changes to fix any field.",
     ]
     return "\n".join(lines)
+
+
+def _format_phase1_ai_review_text(state_data: dict) -> str:
+    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+    return (
+        "📝 Here's how I understood your lead:\n\n"
+        + _format_phase1_field_lines(state_data)
+        + "\n\nTap Accept to continue, or Make changes to fix any field."
+    )
+
+
+def _preview_value_after_phase1_edit(state_data: dict, edit_key: str) -> str:
+    """Current display value for a field after an edit (for recent-changes list)."""
+    if edit_key == "fn":
+        first, _ = _name_parts_from_full(state_data.get("name"))
+        return first
+    if edit_key == "ln":
+        _, last = _name_parts_from_full(state_data.get("name"))
+        return last
+    sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
+    if sk:
+        return str(state_data.get(sk) or "-")
+    return "-"
+
+
+def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> str:
+    """After Done — show full list like the edit flow, plus recent changes, then confirm."""
+    blocks = ["📋 Final review before continuing the lead.\n"]
+    if recent_edits:
+        ch_lines = "\n".join(
+            f"• {e.get('label', '?')}: {_truncate_btn_val(str(e.get('value', '-')), 56)}"
+            for e in recent_edits
+        )
+        blocks.append("📌 Most recent change(s) in this session:\n" + ch_lines + "\n")
+    blocks.append(
+        "📄 All fields (same list as when you pick a field to edit):\n"
+        + _format_phase1_field_lines(state_data)
+    )
+    blocks.append(
+        "\nTap Confirm to continue the lead (VIN check / files), or Change another field."
+    )
+    return "\n".join(blocks)
 
 
 def _truncate_btn_val(val: str, max_len: int = 22) -> str:
@@ -518,6 +569,13 @@ def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE),
             InlineKeyboardButton("➡️ Done — continue lead", callback_data=PH1_EDIT_DONE),
         ]
+    ])
+
+
+def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm & continue lead", callback_data=PH1_FINAL_CONFIRM)],
+        [InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE)],
     ])
 
 
@@ -634,6 +692,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
         context.user_data.pop("phase1_pending_edit_key", None)
+        context.user_data.pop("phase1_recent_edits", None)
     
     # Initialize new state
     db.set_user_state(user_id, "phase1", {})
@@ -675,6 +734,72 @@ def _sanitize_phones_for_send(text: str) -> str:
     if not text or not str(text).strip():
         return text or ""
     return phone_redact.replace_phones_with_ots_links(str(text).strip(), ots)
+
+
+def _format_group_lead_message_html(
+    reference_id: str,
+    phase1_data: dict,
+    encrypted_link: str,
+    issue_dt,
+    expiry_dt,
+    special_request_note: str,
+) -> str:
+    """Telegram HTML for the detailed group lead: copy section in <pre> for tap-to-copy."""
+    def _safe_raw(s: str) -> str:
+        return (_sanitize_phones_for_send(s or "") or "").strip() or "-"
+
+    def _h(s: str) -> str:
+        return html.escape(s or "", quote=False)
+
+    vin_raw = (phase1_data.get("vin") or "").strip() or "-"
+    car_raw = (phase1_data.get("car") or "").strip() or "-"
+    name_line = _h(_safe_raw(phase1_data.get("name")))
+    tail_lines = [
+        _h(_safe_raw(phase1_data.get("address"))),
+        _h(_safe_raw(phase1_data.get("city_state_zip"))),
+        _h(vin_raw),
+        _h(car_raw),
+        _h(_safe_raw(phase1_data.get("color"))),
+        _h(_safe_raw(phase1_data.get("insurance_company"))),
+        _h(_safe_raw(phase1_data.get("insurance_policy_number"))),
+        _h(_safe_raw(phase1_data.get("extra_info"))),
+    ]
+    note = (special_request_note or "").strip()
+    if note:
+        tail_lines.append(_h("📝 " + _safe_raw(note)))
+    vehicle_block = f"🚗 Vehicle: {name_line}\n" + "\n".join(tail_lines)
+
+    d_street = (phase1_data.get("delivery_address") or "").strip()
+    d_csz = (phase1_data.get("delivery_city_state_zip") or "").strip()
+    delivery_combined = ", ".join(p for p in [d_street, d_csz] if p)
+    if not delivery_combined:
+        delivery_combined = _sanitize_phones_for_send(phase1_data.get("delivery_details") or "") or ""
+    delivery_combined = (delivery_combined or "").strip() or "—"
+    extra_time = (_sanitize_phones_for_send(phase1_data.get("extra_info") or "") or "").strip() or "—"
+    link = (encrypted_link or "").strip()
+    issue_s = issue_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if issue_dt else "N/A"
+    expiry_s = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry_dt else "N/A"
+
+    copy_plain = "\n".join([
+        "- - - - - - copy & paste - - - - - -",
+        f"⏰ {extra_time}",
+        f"📍Delivery address: {delivery_combined}",
+        f"📞 Phone 🔗 Encrypted Link: {link}",
+        "- - - - - - copy & paste - - - - - -",
+    ])
+    pre_wrapped = f"<pre>{html.escape(copy_plain)}</pre>"
+    return (
+        "🏷NEW CLIENT❗️\n\n"
+        f"📋 Reference ID: {_h(reference_id)}\n"
+        f"{vehicle_block}\n\n"
+        "Please use @Krabsenderbot 📧🚘\n"
+        "-Tag 🏷\n"
+        "-delivery address 📍\n"
+        "-phone 📞\n\n"
+        f"{pre_wrapped}\n\n"
+        f"📅 Issue Date: {_h(issue_s)}\n"
+        f"⏰ Expires: {_h(expiry_s)}"
+    )
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -832,14 +957,65 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
         await query.message.reply_text(
-        "✅ Phase 1 received!\n\n"
-        "**Phase 2:** Please provide phone number and price.\n"
-        "Format: Phone number and price (e.g., '+1234567890 $500')"
-    )
+            "✅ Phase 1 received!\n\n"
+            "**Phase 2:** Please provide phone number and price.\n"
+            "After that you can add an optional special-request note.\n"
+            "Format: Phone number and price (e.g., '+1234567890 $500')",
+        )
         return STATE_PHASE2
     # add_files_yes
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
+
+
+async def handle_add_files_stray_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    In STATE_ADD_FILES only inline buttons were handled, so sending a PDF/photo first
+    matched no handler and the bot looked stuck. Accept document/photo as implicit Yes,
+    and nudge for plain text.
+    """
+    msg = update.effective_message
+    if not msg:
+        return STATE_ADD_FILES
+    files = context.user_data.get("phase1_attached_files")
+    if files is None:
+        files = []
+        context.user_data["phase1_attached_files"] = files
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
+        [InlineKeyboardButton("No", callback_data="another_file_no")],
+    ])
+    if msg.document:
+        files.append({"type": "document", "file_id": msg.document.file_id})
+        await msg.reply_text(
+            "✅ File received. Send another if needed, or tap **No** to continue.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return STATE_WAITING_FILE
+    if msg.photo:
+        files.append({"type": "photo", "file_id": msg.photo[-1].file_id})
+        await msg.reply_text(
+            "✅ File received. Send another if needed, or tap **No** to continue.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return STATE_WAITING_FILE
+    await msg.reply_text(
+        "Please tap **Yes** to attach files (then send your PDF or photo), or **No** to continue without files.",
+        parse_mode="Markdown",
+    )
+    return STATE_ADD_FILES
+
+
+async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Step 1 only parses text/photos; documents were ignored with no reply."""
+    await update.message.reply_text(
+        "📄 This step only accepts **text** or a **photo** (screenshot), not PDF/files.\n\n"
+        "Send your lead details that way first. On the next screen you can tap **Yes** to attach a PDF.",
+        parse_mode="Markdown",
+    )
+    return STATE_PHASE1
 
 
 async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -852,19 +1028,34 @@ async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle file (photo/document) when in STATE_WAITING_FILE."""
+    msg = update.message
+    if not msg:
+        return STATE_WAITING_FILE
     files = context.user_data.get("phase1_attached_files") or []
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
         files.append({"type": "photo", "file_id": file_id})
-    elif update.message.document:
-        file_id = update.message.document.file_id
-        files.append({"type": "document", "file_id": file_id})
+    elif msg.document:
+        sz = msg.document.file_size
+        if sz is not None and sz > 20 * 1024 * 1024:
+            await msg.reply_text(
+                "❌ This file is too large for the bot (max ~20 MB). Please send a smaller file."
+            )
+            return STATE_WAITING_FILE
+        files.append({"type": "document", "file_id": msg.document.file_id})
+    else:
+        await msg.reply_text("Please send a photo or document file.")
+        return STATE_WAITING_FILE
     context.user_data["phase1_attached_files"] = files
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
         [InlineKeyboardButton("No", callback_data="another_file_no")],
     ])
-    await update.message.reply_text("Do you want to send another file?", reply_markup=keyboard)
+    try:
+        await msg.reply_text("Do you want to send another file?", reply_markup=keyboard)
+    except Exception as e:
+        logger.error("handle_file_upload reply failed: %s", e, exc_info=True)
+        await msg.reply_text("File saved. Tap Yes/No on the previous keyboard if you still see it, or send /cancel and /start.")
     return STATE_WAITING_FILE
 
 
@@ -882,9 +1073,10 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide phone number and price.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')"
+            "After that you can add an optional special-request note.\n"
+            "Format: Phone number and price (e.g., '+1234567890 $500')",
         )
-    return STATE_PHASE2
+        return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
 
@@ -895,12 +1087,14 @@ async def handle_phase1_ai_review_callback(update: Update, context: ContextTypes
     await query.answer()
     user_id = query.from_user.id
     if query.data == PH1_REVIEW_ACCEPT:
+        context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
     if query.data == PH1_REVIEW_EDIT:
         state = db.get_user_state(user_id)
         if not state or not state.get("data"):
             await query.message.reply_text("❌ Lead data not found. Please start over with /start")
             return ConversationHandler.END
+        context.user_data["phase1_recent_edits"] = []
         await query.message.reply_text(
             "Pick a field to edit (each button shows label:current value):",
             reply_markup=_phase1_edit_fields_keyboard(state["data"]),
@@ -919,6 +1113,7 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
         if not state or not state.get("data"):
             await query.message.reply_text("❌ Lead data not found. Please start over with /start")
             return ConversationHandler.END
+        context.user_data.pop("phase1_recent_edits", None)
         await query.message.reply_text(
             _format_phase1_ai_review_text(state["data"]),
             reply_markup=_phase1_review_keyboard(),
@@ -962,6 +1157,13 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
     _clean_vin_and_car(state_data)
     db.set_user_state(user_id, "phase1", state_data)
     context.user_data.pop("phase1_pending_edit_key", None)
+    label = PH1_EDIT_PROMPT_LABEL.get(ek, ek)
+    preview = _preview_value_after_phase1_edit(state_data, ek)
+    context.user_data.setdefault("phase1_recent_edits", [])
+    re_list = context.user_data["phase1_recent_edits"]
+    re_list.append({"label": label, "value": preview})
+    if len(re_list) > 15:
+        context.user_data["phase1_recent_edits"] = re_list[-15:]
     await update.message.reply_text(
         "✅ Updated.\n\n"
         "Need another change, or continue the lead?",
@@ -971,7 +1173,7 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_phase1_edit_followup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """After an edit: more fields or finish and run VIN / files flow."""
+    """After an edit: more fields, final review + confirm, or run VIN / files flow."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -985,8 +1187,20 @@ async def handle_phase1_edit_followup_callback(update: Update, context: ContextT
             reply_markup=_phase1_edit_fields_keyboard(state["data"]),
         )
         return STATE_AI_EDIT_MENU
-    if query.data == PH1_EDIT_DONE:
+    if query.data == PH1_FINAL_CONFIRM:
+        context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
+    if query.data == PH1_EDIT_DONE:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        recent = context.user_data.get("phase1_recent_edits") or []
+        await query.message.reply_text(
+            _format_phase1_final_review_text(state["data"], recent),
+            reply_markup=_phase1_final_confirm_keyboard(),
+        )
+        return STATE_AI_EDIT_INPUT
     return STATE_AI_EDIT_INPUT
 
 
@@ -1107,7 +1321,7 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle Phase 2: Phone number and price, then process the lead."""
+    """Handle Phase 2: Phone number and price, then ask for optional special-request note."""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     message_text = update.message.text
@@ -1139,12 +1353,46 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return STATE_PHASE2
     # Normalize to +1XXXXXXXXXX for storage (no double 1)
     phone_number = "+1" + digits_only
-    
-    # Encrypt phone number via OneTimeSecret
+
+    state_data = phase1_data.copy()
+    state_data["pending_phone_number"] = phone_number
+    state_data["pending_price"] = price
+    db.set_user_state(user_id, "special_request_note", state_data)
+    await update.message.reply_text(
+        "✅ Phone and price received!\n\n"
+        "📝 **Special request note** (optional)\n\n"
+        "Reply with any note for dispatchers, or send **-** if you have none:",
+        parse_mode="Markdown",
+    )
+    return STATE_SPECIAL_REQUEST_NOTE
+
+
+async def handle_special_request_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """After phone+price: optional dispatcher note, then encrypt and continue to group/driver selection."""
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
+        return ConversationHandler.END
+
+    state_data = state["data"].copy()
+    phone_number = state_data.pop("pending_phone_number", None)
+    price = state_data.pop("pending_price", None)
+    if not phone_number or not price:
+        await update.message.reply_text("❌ Missing phone or price. Please start over with /start")
+        return ConversationHandler.END
+
+    raw_note = (update.message.text or "").strip()
+    skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
+    special_request_note = "" if not raw_note or raw_note.lower() in skip_tokens else raw_note
+
     await update.message.reply_text("🔐 Encrypting phone number...")
     encrypted_data = ots.encrypt_phone(phone_number)
-    
     if not encrypted_data:
+        state_data["pending_phone_number"] = phone_number
+        state_data["pending_price"] = price
+        db.set_user_state(user_id, "special_request_note", state_data)
         reason = (getattr(ots, "last_error", "") or "").strip()
         if reason:
             await update.message.reply_text(
@@ -1152,90 +1400,77 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 f"Reason: {reason}\n\n"
                 "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
                 "(SUPABASE_URL/SUPABASE_KEY and ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY) on Vercel "
-                "or the bot has wrong credentials."
+                "or the bot has wrong credentials.\n\n"
+                "Send your special request note again when ready (or **-** for none).",
+                parse_mode="Markdown",
             )
         else:
-            await update.message.reply_text("❌ Error encrypting phone number. Please try again.")
-        return STATE_PHASE2
-    
-    # Generate unique reference ID for this lead
+            await update.message.reply_text(
+                "❌ Error encrypting phone number. Please try again.\n\n"
+                "Send your special request note again (or **-** for none).",
+                parse_mode="Markdown",
+            )
+        return STATE_SPECIAL_REQUEST_NOTE
+
     reference_id = generate_reference_id()
-    
-    # Determine which group this lead belongs to
+    state_data["special_request_note"] = special_request_note
+    state_data["phone_number"] = phone_number
+    state_data["price"] = price
+    state_data["encrypted_data"] = encrypted_data
+    state_data["reference_id"] = reference_id
+    state_data["username"] = username
+
     groups = db.get_all_groups()
-    active_groups = [g for g in groups if g.get('is_active', True)]
-    
+    active_groups = [g for g in groups if g.get("is_active", True)]
     if not active_groups:
         await update.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
-    
+
     assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
-    
+
     if assistants_choose_group:
-        # Anyone can send; they choose driver then group. Show group picker first (order: choose group then driver).
-        # Actually user said: "choose a driver then choose a group". So order is: driver first, then group.
-        # Re-read: "assistants prefer to choose groups" and "if assistants can choose groups ... anyone at all can send data choose a driver then choose a group".
-        # So flow when toggle is on: send data → choose driver → choose group. So we need to show driver picker first, then group picker.
-        # Wait - "assistants prefer to choose groups to send the lead to. so follow that order" - so the preferred order is choose group first. Then "if assistants can choose groups ... anyone at all can send data choose a driver then choose a group" - that might mean: anyone can send, and they choose driver then choose group (as in: they do two things: choose driver and choose group). So the order could be either. I'll do: when toggle on, show GROUP picker first, then driver picker (so: choose group → choose driver). That matches "assistants prefer to choose groups" (group choice first).
-        state_data = phase1_data.copy()
-        state_data.update({
-            "phone_number": phone_number,
-            "price": price,
-            "encrypted_data": encrypted_data,
-            "reference_id": reference_id,
-            "username": username
-        })
         db.set_user_state(user_id, "select_group", state_data)
         group_keyboard = _build_group_keyboard(active_groups, include_all=True)
         await update.message.reply_text(
-            "✅ Phone and price received!\n\n**Select which group to send this lead to:**",
+            "✅ Ready.\n\n**Select which group to send this lead to:**",
             parse_mode="Markdown",
-            reply_markup=group_keyboard
+            reply_markup=group_keyboard,
         )
         return STATE_SELECT_GROUP
-    
-    # Use assigned group (assistant's group or first active)
+
     user_telegram_id = str(update.effective_user.id)
     assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
-    if assistant_group and assistant_group.get('is_active', True):
+    if assistant_group and assistant_group.get("is_active", True):
         selected_group = assistant_group
-        group_id = selected_group['id']
+        group_id = selected_group["id"]
         logger.info(f"User is assistant for group '{selected_group.get('group_name')}'; using that group for lead")
     else:
         selected_group = active_groups[0]
-        group_id = selected_group['id']
+        group_id = selected_group["id"]
     logger.info(
         f"Using group '{selected_group.get('group_name')}' (id={group_id}, "
         f"group_telegram_id={selected_group.get('group_telegram_id')}) for lead"
     )
-    
-    state_data = phase1_data.copy()
-    state_data.update({
-        "phone_number": phone_number,
-        "price": price,
-        "encrypted_data": encrypted_data,
-        "reference_id": reference_id,
-        "group_id": group_id,
-        "selected_group": selected_group,
-        "username": username
-    })
+
+    state_data["group_id"] = group_id
+    state_data["selected_group"] = selected_group
     db.set_user_state(user_id, "select_driver", state_data)
-    
+
     drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if d.get('is_active', True)]
+    active_drivers = [d for d in drivers if d.get("is_active", True)]
     if not active_drivers:
         await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
-    
+
     driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
     driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
     await update.message.reply_text(
-        f"✅ Phone and price received!\n\n"
-        f"**Select which driver(s) to notify:**\n\n"
+        "✅ Ready.\n\n"
+        "**Select which driver(s) to notify:**\n\n"
         f"Available drivers:\n{driver_list}\n\n"
-        f"Click a driver below or send to all:",
+        "Click a driver below or send to all:",
         parse_mode="Markdown",
-        reply_markup=driver_keyboard
+        reply_markup=driver_keyboard,
     )
     return STATE_SELECT_DRIVER
 
@@ -1255,7 +1490,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         import asyncio
         from telegram.error import RetryAfter
 
-        phase1_data = {k: v for k, v in lead_data.items() if k not in ['phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group', 'resend', 'lead_id']}
+        phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
         groups = db.get_all_groups()
         active_groups = [g for g in groups if g.get("is_active", True)]
         # group_id is NOT NULL for driver assignments, so pick a primary group for the lead record.
@@ -1278,6 +1513,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "reference_id": lead_data.get("reference_id"),
             "group_id": primary_group.get("id"),
             "extra_info": lead_data.get("extra_info", ""),
+            "special_request_note": lead_data.get("special_request_note", "") or "",
         }
         lead = db.create_lead(final_lead_data)
         if not lead:
@@ -1285,13 +1521,16 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         reference_id = lead.get("reference_id", "N/A")
-        username = query.from_user.username or "Unknown"
-        # Plain text: legacy Markdown breaks on underscores in usernames (e.g. foo_bar → parse error → 0 groups sent).
+        un = query.from_user.username
+        from_line = f"@{un}" if un else (query.from_user.first_name or "Unknown")
         group_offer_message = (
-            f"🏷 NEW CLIENT\n\n"
-            f"📋 Reference ID: {reference_id}\n"
-            f"👤 Submitted by: @{username}\n\n"
-            f"Tap Accept or Decline for your group. If another group accepts first, this will show as taken."
+            "🏷 NEW CLIENT\n"
+            f"📋 Ref ID: {reference_id}\n"
+            f"👤 From: {from_line}\n\n"
+            "✅ Double-check the tag for mistakes\n"
+            "📲 Send tag to driver with @krabsender\n"
+            "📋 Copy/paste client phone, address, and delivery time\n\n"
+            "Tap Accept or Decline."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
         short_lead = _short_uuid(lead["id"])
@@ -1434,11 +1673,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             update, context, lead_data, query.data, user_id,
         )
     
-    _phase1_exclude = {
-        'phone_number', 'price', 'encrypted_data', 'reference_id', 'group_id', 'selected_group',
-        'resend', 'lead_id', 'follow_after_broadcast', 'broadcast',
-    }
-    phase1_data = {k: v for k, v in lead_data.items() if k not in _phase1_exclude}
+    phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
     phone_number = lead_data.get('phone_number')
     price = lead_data.get('price')
     encrypted_data = lead_data.get('encrypted_data', {})
@@ -1518,7 +1753,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "reference_id": reference_id,
         "group_id": group_id,
         # Store extra_info explicitly so we can show it to drivers/supervisors later
-        "extra_info": lead_data.get("extra_info", "")
+        "extra_info": lead_data.get("extra_info", ""),
+        "special_request_note": lead_data.get("special_request_note", "") or "",
     }
     
     if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
@@ -1532,7 +1768,11 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
-    
+
+    special_note_disp = (
+        (lead_data.get("special_request_note") or lead.get("special_request_note") or "").strip()
+    )
+
     # Build vehicle block from individual fields so VIN and car are NEVER sanitized (no link in those lines)
     def _safe(s: str) -> str:
         return _sanitize_phones_for_send(s or "") or "-"
@@ -1549,6 +1789,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         _safe(phase1_data.get("insurance_policy_number")),
         _safe(phase1_data.get("extra_info")),
     ]
+    if special_note_disp:
+        vehicle_lines_display.append(_safe("📝 " + special_note_disp))
     vehicle_safe = "\n".join(vehicle_lines_display)
     delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
     extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
@@ -1568,8 +1810,10 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "delivery_city_state_zip": phase1_data.get("delivery_city_state_zip", ""),
             "group_message": (
                 "🏷NEW CLIENT❗️\n\n"
-                f"🚗 Vehicle: {vehicle_safe}\n"
+                f"📋 Reference ID: {reference_id}\n"
+                f"🚗 Vehicle:\n{vehicle_safe}\n\n"
                 f"🔗 Encrypted Link: {encrypted_data.get('link')}"
+                + (f"\n\n📝 Special request:\n{special_note_disp}" if special_note_disp else "")
             ),
             # Supervisor/group info (using group name as identifier)
             "supervisor_name": selected_group.get("group_name", ""),
@@ -1630,17 +1874,19 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
-    
-    # Group message – no raw phone; vehicle content sanitized; include reference ID for linking
-    group_message = (
-        f"🏷NEW CLIENT❗️\n\n"
-        f"📋 Reference ID: `{reference_id}`\n"
-        f"🚗 Vehicle: {vehicle_safe}\n"
-        f"🔗 Encrypted Link: {encrypted_data.get('link')}\n"
-        f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
-        f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
+    if special_note_disp:
+        full_message += f"\n\n📝 Special request:\n{_sanitize_phones_for_send(special_note_disp)}"
+
+    # Group message – HTML with <pre> copy block; no raw phone in body outside pre
+    group_message = _format_group_lead_message_html(
+        reference_id,
+        phase1_data,
+        encrypted_data.get("link") or "",
+        monday_result["issue_date"] if monday_result else None,
+        monday_result["expiration_date"] if monday_result else None,
+        special_note_disp,
     )
-    
+
     # Driver assignment message (sent to selected drivers with accept/decline)
     # NOTE: Phone and price are only revealed after driver accepts.
     driver_request_message = (
@@ -1648,7 +1894,10 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f"📍 Delivery (City, State, Zip): {phase1_data.get('delivery_city_state_zip', '')}\n"
         f"📋 Reference ID: `{reference_id}`\n"
         f" Delivery Time 🏷️: {extra_safe}\n"
-        f"Please have Car, Driver License, and Laser Printer Ready✅")
+        f"Please have Car, Driver License, and Laser Printer Ready✅"
+    )
+    if special_note_disp:
+        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(special_note_disp)}"
     
     # Create accept/decline keyboard for driver assignment
     accept_keyboard = InlineKeyboardMarkup([
@@ -1710,8 +1959,23 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         group_chat_id = _parse_chat_id(group_telegram_id_raw)
         try:
             logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
-            # No parse_mode so user content (vehicle_details, etc.) can't break Markdown
-            await context.bot.send_message(chat_id=group_chat_id, text=group_message)
+            try:
+                await context.bot.send_message(
+                    chat_id=group_chat_id, text=group_message, parse_mode="HTML",
+                )
+            except Exception as html_err:
+                logger.warning(
+                    "Group lead HTML send failed for %s, retrying plain: %s",
+                    group_name,
+                    html_err,
+                )
+                plain_fallback = (
+                    f"🏷NEW CLIENT❗️\n\n📋 Reference ID: {reference_id}\n🚗 Vehicle:\n{vehicle_safe}\n\n"
+                    f"🔗 Encrypted Link: {encrypted_data.get('link')}\n\n"
+                    f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
+                    f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
+                )
+                await context.bot.send_message(chat_id=group_chat_id, text=plain_fallback)
             logger.info(f"Lead sent to group '{group_name}' successfully")
         except Exception as e:
             logger.error(
@@ -1929,6 +2193,7 @@ async def _handle_resend_to_drivers(
             await update.callback_query.message.reply_text("❌ Driver not found.")
             return STATE_SELECT_DRIVER
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    spec = (lead.get("special_request_note") or "").strip()
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
         f"📍 Delivery: {lead.get('delivery_details', '')}\n"
@@ -1936,6 +2201,8 @@ async def _handle_resend_to_drivers(
         f" Delivery Time 🏷️: {extra_safe}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
+    if spec:
+        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(spec)}"
     accept_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
@@ -2101,13 +2368,19 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Send confirmation to driver – phone only via one-time link; sanitize user content
         delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
         extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
+        spec_accept = (lead.get("special_request_note") or "").strip()
         confirmation_message = (
             "✅ **Lead Accepted!**\n\n"
             f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
             f"📝 Extra info: {extra_safe}\n"
             f"📞 Phone (one-time link): {lead.get('encrypted_link', 'N/A')}\n"
             f"💰 Price: {lead.get('price', 'N/A')}\n"
-            f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`\n\n"
+            f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`\n"
+        )
+        if spec_accept:
+            confirmation_message += f"📝 Special request: {_sanitize_phones_for_send(spec_accept)}\n"
+        confirmation_message += (
+            "\n"
             "Security 🚨 client must pay dealership directly\n"
             "PLEASE HAVE CLIENT PAY US THE 💵MONEY DIRECTLY\n"
             "WE ACCEPT ALL ELECTRONIC PAYMENTS:\n"
@@ -2121,7 +2394,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Fasten your seatbelt, both hands on the wheel. And most importantly, upload receipt 🧾 today ✅\n"
             "🙏Thank you & 🚘Drive Safe !"
         )
-        
+
         # Add receipt submission button
         receipt_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
@@ -2161,12 +2434,15 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if group_telegram_id:
                 try:
                     extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
+                    spec_grp = (lead.get("special_request_note") or "").strip()
                     acceptance_message = (
                         "✅ **Lead Accepted**\n\n"
                         f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
                         f"📝 Extra info: {extra_safe}\n"
                         f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
                     )
+                    if spec_grp:
+                        acceptance_message += f"\n📝 Special request: {_sanitize_phones_for_send(spec_grp)}"
                     await context.bot.send_message(
                         chat_id=group_telegram_id,
                         text=acceptance_message,
@@ -2785,6 +3061,7 @@ def main():
             STATE_PHASE1: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
+                MessageHandler(filters.Document.ALL, handle_phase1_document),
             ],
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=f"^({PH1_REVIEW_ACCEPT}|{PH1_REVIEW_EDIT})$"),
@@ -2794,16 +3071,28 @@ def main():
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
-                CallbackQueryHandler(handle_phase1_edit_followup_callback, pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE})$"),
+                CallbackQueryHandler(
+                    handle_phase1_edit_followup_callback,
+                    pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
+                ),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
-            STATE_ADD_FILES: [CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$")],
+            STATE_ADD_FILES: [
+                CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$"),
+                MessageHandler(
+                    (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+                    handle_add_files_stray_message,
+                ),
+            ],
             STATE_WAITING_FILE: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file_upload),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_file_text),
                 CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
             ],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
+            STATE_SPECIAL_REQUEST_NOTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_note),
+            ],
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
             STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],

@@ -422,7 +422,7 @@ class AdminDatabase:
         try:
             assignments_resp = self.client.table("lead_assignments").select(
                 "id, driver_id, accepted_at, lead:leads("
-                "id, reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, monday_status"
+                "id, reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, monday_status"
                 ")"
             ).eq("status", "accepted").eq("driver_id", driver_id).order("accepted_at").execute()
 
@@ -441,6 +441,7 @@ class AdminDatabase:
                     "vehicle_details": lead.get("vehicle_details"),
                     "delivery_details": lead.get("delivery_details"),
                     "extra_info": lead.get("extra_info"),
+                    "special_request_note": lead.get("special_request_note"),
                 })
             return out
         except Exception:

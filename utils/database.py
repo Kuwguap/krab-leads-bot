@@ -793,7 +793,7 @@ class Database:
             return []
         try:
             r = self.client.table("lead_assignments").select(
-                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info)"
+                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note)"
             ).eq("driver_id", driver_id).eq("status", "accepted").execute()
             out = []
             for row in r.data or []:

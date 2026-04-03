@@ -1,9 +1,14 @@
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_KEY = (
+  process.env.SUPABASE_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  ""
+).trim();
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  // Route handlers will fail with clearer messages if env is missing.
-  // Keep this module import-safe.
+function ensureSupabaseEnv() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    throw new Error("Supabase env missing");
+  }
 }
 
 function restUrl(table, query = "") {
@@ -12,6 +17,7 @@ function restUrl(table, query = "") {
 }
 
 async function supabaseFetch(path, options = {}) {
+  ensureSupabaseEnv();
   const res = await fetch(path, {
     ...options,
     headers: {
@@ -38,7 +44,7 @@ async function supabaseFetch(path, options = {}) {
 }
 
 export async function getClientsPhoneConfig() {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  ensureSupabaseEnv();
   // Single-row config, id=1
   const query = `select=passphrase,ttl_enabled,ttl_days,one_time_delete_enabled&id=eq.1&limit=1`;
   const rows = await supabaseFetch(restUrl("clientsphonenumber_config", query), { method: "GET" });
@@ -46,7 +52,7 @@ export async function getClientsPhoneConfig() {
 }
 
 export async function upsertClientsPhoneConfig(config) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  ensureSupabaseEnv();
 
   // Update first; if no row exists, insert.
   const existing = await getClientsPhoneConfig();
@@ -76,7 +82,7 @@ export async function upsertClientsPhoneConfig(config) {
 }
 
 export async function insertSecretRecord({ secret_key, metadata_key, secret_text, expires_at }) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error("Supabase env missing");
+  ensureSupabaseEnv();
 
   await supabaseFetch(restUrl("clientsphonenumber_secrets"), {
     method: "POST",
@@ -91,7 +97,7 @@ export async function insertSecretRecord({ secret_key, metadata_key, secret_text
 }
 
 export async function getSecretByKey(secret_key) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  ensureSupabaseEnv();
   const query = `select=secret_key,secret_text,expires_at,deleted_at&secret_key=eq.${encodeURIComponent(
     secret_key
   )}&limit=1`;
@@ -100,7 +106,7 @@ export async function getSecretByKey(secret_key) {
 }
 
 export async function markSecretDeleted(secret_key, deleted_at = null) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error("Supabase env missing");
+  ensureSupabaseEnv();
   const query = `secret_key=eq.${encodeURIComponent(secret_key)}`;
   await supabaseFetch(restUrl("clientsphonenumber_secrets", query), {
     method: "PATCH",
