@@ -919,6 +919,56 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
     return STATE_WAITING_FILE
 
 
+async def handle_add_files_stray_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    In STATE_ADD_FILES only inline buttons were handled, so sending a PDF/photo first
+    matched no handler and the bot looked stuck. Accept document/photo as implicit Yes,
+    and nudge for plain text.
+    """
+    msg = update.effective_message
+    if not msg:
+        return STATE_ADD_FILES
+    files = context.user_data.get("phase1_attached_files")
+    if files is None:
+        files = []
+        context.user_data["phase1_attached_files"] = files
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
+        [InlineKeyboardButton("No", callback_data="another_file_no")],
+    ])
+    if msg.document:
+        files.append({"type": "document", "file_id": msg.document.file_id})
+        await msg.reply_text(
+            "✅ File received. Send another if needed, or tap **No** to continue.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return STATE_WAITING_FILE
+    if msg.photo:
+        files.append({"type": "photo", "file_id": msg.photo[-1].file_id})
+        await msg.reply_text(
+            "✅ File received. Send another if needed, or tap **No** to continue.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return STATE_WAITING_FILE
+    await msg.reply_text(
+        "Please tap **Yes** to attach files (then send your PDF or photo), or **No** to continue without files.",
+        parse_mode="Markdown",
+    )
+    return STATE_ADD_FILES
+
+
+async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Step 1 only parses text/photos; documents were ignored with no reply."""
+    await update.message.reply_text(
+        "📄 This step only accepts **text** or a **photo** (screenshot), not PDF/files.\n\n"
+        "Send your lead details that way first. On the next screen you can tap **Yes** to attach a PDF.",
+        parse_mode="Markdown",
+    )
+    return STATE_PHASE1
+
+
 async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User sent text instead of file; remind them."""
     await update.message.reply_text(
@@ -929,19 +979,34 @@ async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle file (photo/document) when in STATE_WAITING_FILE."""
+    msg = update.message
+    if not msg:
+        return STATE_WAITING_FILE
     files = context.user_data.get("phase1_attached_files") or []
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
         files.append({"type": "photo", "file_id": file_id})
-    elif update.message.document:
-        file_id = update.message.document.file_id
-        files.append({"type": "document", "file_id": file_id})
+    elif msg.document:
+        sz = msg.document.file_size
+        if sz is not None and sz > 20 * 1024 * 1024:
+            await msg.reply_text(
+                "❌ This file is too large for the bot (max ~20 MB). Please send a smaller file."
+            )
+            return STATE_WAITING_FILE
+        files.append({"type": "document", "file_id": msg.document.file_id})
+    else:
+        await msg.reply_text("Please send a photo or document file.")
+        return STATE_WAITING_FILE
     context.user_data["phase1_attached_files"] = files
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
         [InlineKeyboardButton("No", callback_data="another_file_no")],
     ])
-    await update.message.reply_text("Do you want to send another file?", reply_markup=keyboard)
+    try:
+        await msg.reply_text("Do you want to send another file?", reply_markup=keyboard)
+    except Exception as e:
+        logger.error("handle_file_upload reply failed: %s", e, exc_info=True)
+        await msg.reply_text("File saved. Tap Yes/No on the previous keyboard if you still see it, or send /cancel and /start.")
     return STATE_WAITING_FILE
 
 
@@ -2925,6 +2990,7 @@ def main():
             STATE_PHASE1: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
+                MessageHandler(filters.Document.ALL, handle_phase1_document),
             ],
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=f"^({PH1_REVIEW_ACCEPT}|{PH1_REVIEW_EDIT})$"),
@@ -2937,7 +3003,13 @@ def main():
                 CallbackQueryHandler(handle_phase1_edit_followup_callback, pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE})$"),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
-            STATE_ADD_FILES: [CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$")],
+            STATE_ADD_FILES: [
+                CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$"),
+                MessageHandler(
+                    (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+                    handle_add_files_stray_message,
+                ),
+            ],
             STATE_WAITING_FILE: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file_upload),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_file_text),
