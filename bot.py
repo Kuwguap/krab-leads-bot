@@ -415,6 +415,7 @@ PH1_REVIEW_EDIT = "ph1_edit"
 PH1_EDIT_BACK = "ph1_back"
 PH1_EDIT_MORE = "ph1_more"
 PH1_EDIT_DONE = "ph1_done"
+PH1_FINAL_CONFIRM = "ph1_final_ok"
 # edit key -> state_data key (None = first/last name parts)
 PH1_EDIT_TO_STATE_KEY = {
     "fn": None,
@@ -464,11 +465,10 @@ def _set_full_name(state_data: dict, first: str, last: str) -> None:
         state_data["name"] = f"{f} {l}".strip() if f else l
 
 
-def _format_phase1_ai_review_text(state_data: dict) -> str:
-    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+def _format_phase1_field_lines(state_data: dict) -> str:
+    """Plain-text list of all Phase 1 fields (same labels as the edit picker)."""
     first, last = _name_parts_from_full(state_data.get("name"))
     lines = [
-        "📝 Here's how I understood your lead:\n",
         f"First name: {first}",
         f"Last name: {last}",
         f"Registration address: {state_data.get('address') or '-'}",
@@ -481,9 +481,50 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
         f"Insurance company: {state_data.get('insurance_company') or '-'}",
         f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
         f"Date/time & notes: {state_data.get('extra_info') or '-'}",
-        "\nTap Accept to continue, or Make changes to fix any field.",
     ]
     return "\n".join(lines)
+
+
+def _format_phase1_ai_review_text(state_data: dict) -> str:
+    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+    return (
+        "📝 Here's how I understood your lead:\n\n"
+        + _format_phase1_field_lines(state_data)
+        + "\n\nTap Accept to continue, or Make changes to fix any field."
+    )
+
+
+def _preview_value_after_phase1_edit(state_data: dict, edit_key: str) -> str:
+    """Current display value for a field after an edit (for recent-changes list)."""
+    if edit_key == "fn":
+        first, _ = _name_parts_from_full(state_data.get("name"))
+        return first
+    if edit_key == "ln":
+        _, last = _name_parts_from_full(state_data.get("name"))
+        return last
+    sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
+    if sk:
+        return str(state_data.get(sk) or "-")
+    return "-"
+
+
+def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> str:
+    """After Done — show full list like the edit flow, plus recent changes, then confirm."""
+    blocks = ["📋 Final review before continuing the lead.\n"]
+    if recent_edits:
+        ch_lines = "\n".join(
+            f"• {e.get('label', '?')}: {_truncate_btn_val(str(e.get('value', '-')), 56)}"
+            for e in recent_edits
+        )
+        blocks.append("📌 Most recent change(s) in this session:\n" + ch_lines + "\n")
+    blocks.append(
+        "📄 All fields (same list as when you pick a field to edit):\n"
+        + _format_phase1_field_lines(state_data)
+    )
+    blocks.append(
+        "\nTap Confirm to continue the lead (VIN check / files), or Change another field."
+    )
+    return "\n".join(blocks)
 
 
 def _truncate_btn_val(val: str, max_len: int = 22) -> str:
@@ -528,6 +569,13 @@ def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE),
             InlineKeyboardButton("➡️ Done — continue lead", callback_data=PH1_EDIT_DONE),
         ]
+    ])
+
+
+def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm & continue lead", callback_data=PH1_FINAL_CONFIRM)],
+        [InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE)],
     ])
 
 
@@ -644,6 +692,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
         context.user_data.pop("phase1_pending_edit_key", None)
+        context.user_data.pop("phase1_recent_edits", None)
     
     # Initialize new state
     db.set_user_state(user_id, "phase1", {})
@@ -1038,12 +1087,14 @@ async def handle_phase1_ai_review_callback(update: Update, context: ContextTypes
     await query.answer()
     user_id = query.from_user.id
     if query.data == PH1_REVIEW_ACCEPT:
+        context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
     if query.data == PH1_REVIEW_EDIT:
         state = db.get_user_state(user_id)
         if not state or not state.get("data"):
             await query.message.reply_text("❌ Lead data not found. Please start over with /start")
             return ConversationHandler.END
+        context.user_data["phase1_recent_edits"] = []
         await query.message.reply_text(
             "Pick a field to edit (each button shows label:current value):",
             reply_markup=_phase1_edit_fields_keyboard(state["data"]),
@@ -1062,6 +1113,7 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
         if not state or not state.get("data"):
             await query.message.reply_text("❌ Lead data not found. Please start over with /start")
             return ConversationHandler.END
+        context.user_data.pop("phase1_recent_edits", None)
         await query.message.reply_text(
             _format_phase1_ai_review_text(state["data"]),
             reply_markup=_phase1_review_keyboard(),
@@ -1105,6 +1157,13 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
     _clean_vin_and_car(state_data)
     db.set_user_state(user_id, "phase1", state_data)
     context.user_data.pop("phase1_pending_edit_key", None)
+    label = PH1_EDIT_PROMPT_LABEL.get(ek, ek)
+    preview = _preview_value_after_phase1_edit(state_data, ek)
+    context.user_data.setdefault("phase1_recent_edits", [])
+    re_list = context.user_data["phase1_recent_edits"]
+    re_list.append({"label": label, "value": preview})
+    if len(re_list) > 15:
+        context.user_data["phase1_recent_edits"] = re_list[-15:]
     await update.message.reply_text(
         "✅ Updated.\n\n"
         "Need another change, or continue the lead?",
@@ -1114,7 +1173,7 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_phase1_edit_followup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """After an edit: more fields or finish and run VIN / files flow."""
+    """After an edit: more fields, final review + confirm, or run VIN / files flow."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1128,8 +1187,20 @@ async def handle_phase1_edit_followup_callback(update: Update, context: ContextT
             reply_markup=_phase1_edit_fields_keyboard(state["data"]),
         )
         return STATE_AI_EDIT_MENU
-    if query.data == PH1_EDIT_DONE:
+    if query.data == PH1_FINAL_CONFIRM:
+        context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
+    if query.data == PH1_EDIT_DONE:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        recent = context.user_data.get("phase1_recent_edits") or []
+        await query.message.reply_text(
+            _format_phase1_final_review_text(state["data"], recent),
+            reply_markup=_phase1_final_confirm_keyboard(),
+        )
+        return STATE_AI_EDIT_INPUT
     return STATE_AI_EDIT_INPUT
 
 
@@ -3000,7 +3071,10 @@ def main():
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
-                CallbackQueryHandler(handle_phase1_edit_followup_callback, pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE})$"),
+                CallbackQueryHandler(
+                    handle_phase1_edit_followup_callback,
+                    pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
+                ),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
             STATE_ADD_FILES: [
