@@ -55,13 +55,15 @@ STATE_VIN_RETYPE = 14  # User chose to retype VIN; waiting for new VIN input
 STATE_MISSING_FIELD = 11  # User must add missing field (e.g. color)
 STATE_ADD_FILES = 12  # Ask "Do you want to add files?"
 STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
-STATE_SPECIAL_REQUEST_NOTE = 19  # After phone + price: optional note for dispatchers
+STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issuers
+STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 
 # Keys in user state data that are not Phase 1 vehicle/delivery fields
 _PHASE1_STATE_EXCLUDE = frozenset({
     "phone_number", "price", "encrypted_data", "reference_id", "group_id", "selected_group",
     "resend", "lead_id", "follow_after_broadcast", "broadcast",
-    "pending_phone_number", "pending_price", "special_request_note", "username",
+    "pending_phone_number", "pending_price",
+    "special_request_note", "special_request_issuers", "special_request_drivers", "username",
 })
 
 # Receipt submission states
@@ -225,7 +227,7 @@ async def _send_driver_requests_for_group(
         return (0, "")
     reference_id = lead.get("reference_id", "N/A")
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
-    spec = (lead.get("special_request_note") or "").strip()
+    spec = _lead_driver_note(lead)
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
         f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
@@ -234,7 +236,7 @@ async def _send_driver_requests_for_group(
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
     if spec:
-        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(spec)}"
+        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
     accept_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead['id']}"),
         InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead['id']}"),
@@ -742,7 +744,7 @@ def _format_group_lead_message_html(
     encrypted_link: str,
     issue_dt,
     expiry_dt,
-    special_request_note: str,
+    special_request_issuers: str,
 ) -> str:
     """Telegram HTML for the detailed group lead: copy section in <pre> for tap-to-copy."""
     def _safe_raw(s: str) -> str:
@@ -764,9 +766,9 @@ def _format_group_lead_message_html(
         _h(_safe_raw(phase1_data.get("insurance_policy_number"))),
         _h(_safe_raw(phase1_data.get("extra_info"))),
     ]
-    note = (special_request_note or "").strip()
-    if note:
-        tail_lines.append(_h("📝 " + _safe_raw(note)))
+    note_i = (special_request_issuers or "").strip()
+    if note_i:
+        tail_lines.append(_h("📝 " + _safe_raw(note_i)))
     vehicle_block = f"🚗 Vehicle: {name_line}\n" + "\n".join(tail_lines)
 
     d_street = (phase1_data.get("delivery_address") or "").strip()
@@ -800,6 +802,71 @@ def _format_group_lead_message_html(
         f"📅 Issue Date: {_h(issue_s)}\n"
         f"⏰ Expires: {_h(expiry_s)}"
     )
+
+
+def _lead_issuer_note(lead: dict) -> str:
+    """Note for group / issuers; falls back to legacy special_request_note."""
+    v = (lead.get("special_request_issuers") or "").strip()
+    if v:
+        return v
+    return (lead.get("special_request_note") or "").strip()
+
+
+def _lead_driver_note(lead: dict) -> str:
+    return (lead.get("special_request_drivers") or "").strip()
+
+
+def _delivery_block_plain(lead: dict) -> str:
+    raw = (lead.get("delivery_details") or "").strip()
+    if not raw:
+        return "N/A"
+    return raw.replace("\r\n", "\n")
+
+
+def _build_driver_lead_accepted_message(lead: dict) -> str:
+    """Full post-accept DM for drivers (plain text; avoids Markdown parse issues)."""
+    link = (lead.get("encrypted_link") or "").strip() or "N/A"
+    price = (lead.get("price") or "").strip() or "N/A"
+    ref = (lead.get("reference_id") or "").strip() or "N/A"
+    extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
+    delivery = _delivery_block_plain(lead)
+    spec_d = _lead_driver_note(lead)
+    lines = [
+        "✅ LEAD ACCEPTED — 🕊LET'S FLY 💸",
+        "",
+        "📍 Delivery Address",
+        delivery,
+        "",
+        f"📝Extra info: {extra}",
+        "📞 Call Client Now Confirm: 💰 Price • ⏱️ Time • 📍 Location • 🏷 Tag",
+        f"📞Phone {link}",
+        "📞 Click link 🔗 enter password to view",
+        f"💰 Price: {price}",
+        f"🆔 Reference ID: {ref}",
+    ]
+    if spec_d:
+        lines.extend(["", f"📝 Special request (driver): {_sanitize_phones_for_send(spec_d)}"])
+    lines.extend([
+        "",
+        "🚨Client must pay dealership directly🚨",
+        "💳 We Accept all electronic payment methods:",
+        f"CashApp: {Config.DRIVER_PAYMENT_CASHAPP}",
+        f"Venmo: {Config.DRIVER_PAYMENT_VENMO}",
+        f"Zelle: {Config.DRIVER_PAYMENT_ZELLE}",
+        f"PayPal: {Config.DRIVER_PAYMENT_PAYPAL}",
+        "🌐 Payment Page",
+        Config.DRIVER_PAYMENT_PAGE_URL,
+        "🏦ask client to pay⚡️ electronically🏦",
+        "",
+        "⚠️ Important Message ‼️",
+        "• Be fast, polite, professional🤵",
+        "• Double-check all info ℹ️",
+        "• Drive safely 🚘",
+        "• Upload receipt 🧾 within 1 hour ⚡️",
+        "",
+        "👇 Upload Payment Receipt Below 📸",
+    ])
+    return "\n".join(lines)
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -959,7 +1026,7 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide phone number and price.\n"
-            "After that you can add an optional special-request note.\n"
+            "After that: optional notes for issuers (group) and for drivers only.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')",
         )
         return STATE_PHASE2
@@ -1073,7 +1140,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide phone number and price.\n"
-            "After that you can add an optional special-request note.\n"
+            "After that: optional notes for issuers (group) and for drivers only.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')",
         )
         return STATE_PHASE2
@@ -1321,19 +1388,18 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle Phase 2: Phone number and price, then ask for optional special-request note."""
+    """Handle Phase 2: Phone number and price, then issuer note, then driver-only note, then encrypt."""
     user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
     message_text = update.message.text
-    
+
     # Get phase 1 data
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
-    
+
     phase1_data = state.get("data", {})
-    
+
     # Parse phone and price: any token containing $ is the price; phone = any format accepted (digits only)
     parts = message_text.split()
     price = next((p for p in parts if "$" in p), None)
@@ -1357,18 +1423,44 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     state_data = phase1_data.copy()
     state_data["pending_phone_number"] = phone_number
     state_data["pending_price"] = price
-    db.set_user_state(user_id, "special_request_note", state_data)
+    db.set_user_state(user_id, "special_request_issuers", state_data)
     await update.message.reply_text(
         "✅ Phone and price received!\n\n"
-        "📝 **Special request note** (optional)\n\n"
-        "Reply with any note for dispatchers, or send **-** if you have none:",
+        "📝 **Special request to issuers** (optional)\n\n"
+        "This will be included in the **group** lead message. Send **-** if none:",
         parse_mode="Markdown",
     )
-    return STATE_SPECIAL_REQUEST_NOTE
+    return STATE_SPECIAL_REQUEST_ISSUERS
 
 
-async def handle_special_request_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """After phone+price: optional dispatcher note, then encrypt and continue to group/driver selection."""
+async def handle_special_request_issuers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save note for group/issuers, then ask for driver-only note (still before encrypt)."""
+    user_id = update.effective_user.id
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
+        return ConversationHandler.END
+
+    state_data = state["data"].copy()
+    if not state_data.get("pending_phone_number") or not state_data.get("pending_price"):
+        await update.message.reply_text("❌ Missing phone or price. Please start over with /start")
+        return ConversationHandler.END
+
+    raw = (update.message.text or "").strip()
+    skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
+    issuers_note = "" if not raw or raw.lower() in skip_tokens else raw
+    state_data["special_request_issuers"] = issuers_note
+    db.set_user_state(user_id, "special_request_drivers", state_data)
+    await update.message.reply_text(
+        "📝 **Special request to drivers** (optional)\n\n"
+        "Only **drivers** see this (not the group). Send **-** if none:",
+        parse_mode="Markdown",
+    )
+    return STATE_SPECIAL_REQUEST_DRIVERS
+
+
+async def handle_special_request_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """After issuer + driver notes: encrypt phone and continue to group/driver selection."""
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     state = db.get_user_state(user_id)
@@ -1383,16 +1475,18 @@ async def handle_special_request_note(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("❌ Missing phone or price. Please start over with /start")
         return ConversationHandler.END
 
-    raw_note = (update.message.text or "").strip()
+    raw_d = (update.message.text or "").strip()
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
-    special_request_note = "" if not raw_note or raw_note.lower() in skip_tokens else raw_note
+    drivers_note = "" if not raw_d or raw_d.lower() in skip_tokens else raw_d
+    state_data["special_request_drivers"] = drivers_note
+    issuers_note = (state_data.get("special_request_issuers") or "").strip()
 
     await update.message.reply_text("🔐 Encrypting phone number...")
     encrypted_data = ots.encrypt_phone(phone_number)
     if not encrypted_data:
         state_data["pending_phone_number"] = phone_number
         state_data["pending_price"] = price
-        db.set_user_state(user_id, "special_request_note", state_data)
+        db.set_user_state(user_id, "special_request_drivers", state_data)
         reason = (getattr(ots, "last_error", "") or "").strip()
         if reason:
             await update.message.reply_text(
@@ -1401,19 +1495,21 @@ async def handle_special_request_note(update: Update, context: ContextTypes.DEFA
                 "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
                 "(SUPABASE_URL/SUPABASE_KEY and ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY) on Vercel "
                 "or the bot has wrong credentials.\n\n"
-                "Send your special request note again when ready (or **-** for none).",
+                "Send **Special request to drivers** again when ready (or **-** for none).",
                 parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(
                 "❌ Error encrypting phone number. Please try again.\n\n"
-                "Send your special request note again (or **-** for none).",
+                "Send **Special request to drivers** again (or **-** for none).",
                 parse_mode="Markdown",
             )
-        return STATE_SPECIAL_REQUEST_NOTE
+        return STATE_SPECIAL_REQUEST_DRIVERS
 
     reference_id = generate_reference_id()
-    state_data["special_request_note"] = special_request_note
+    state_data["special_request_issuers"] = issuers_note
+    state_data["special_request_drivers"] = drivers_note
+    state_data["special_request_note"] = issuers_note
     state_data["phone_number"] = phone_number
     state_data["price"] = price
     state_data["encrypted_data"] = encrypted_data
@@ -1513,7 +1609,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "reference_id": lead_data.get("reference_id"),
             "group_id": primary_group.get("id"),
             "extra_info": lead_data.get("extra_info", ""),
-            "special_request_note": lead_data.get("special_request_note", "") or "",
+            "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
+            "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
+            "special_request_note": lead_data.get("special_request_issuers", "") or "",
         }
         lead = db.create_lead(final_lead_data)
         if not lead:
@@ -1530,7 +1628,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "✅ Double-check the tag for mistakes\n"
             "📲 Send tag to driver with @krabsender\n"
             "📋 Copy/paste client phone, address, and delivery time\n\n"
-            "Tap Accept or Decline."
+            "Tap Accept or Decline.\n"
+            "If another group accepts first, it will show as taken."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
         short_lead = _short_uuid(lead["id"])
@@ -1754,9 +1853,11 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "group_id": group_id,
         # Store extra_info explicitly so we can show it to drivers/supervisors later
         "extra_info": lead_data.get("extra_info", ""),
-        "special_request_note": lead_data.get("special_request_note", "") or "",
+        "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
+        "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
+        "special_request_note": lead_data.get("special_request_issuers", "") or "",
     }
-    
+
     if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
         lead = db.get_lead_by_id(lead_data["lead_id"])
         if not lead:
@@ -1769,9 +1870,11 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
 
-    special_note_disp = (
-        (lead_data.get("special_request_note") or lead.get("special_request_note") or "").strip()
+    issuer_note_disp = (
+        (lead_data.get("special_request_issuers") or lead.get("special_request_issuers")
+         or lead_data.get("special_request_note") or lead.get("special_request_note") or "").strip()
     )
+    driver_note_disp = (lead_data.get("special_request_drivers") or lead.get("special_request_drivers") or "").strip()
 
     # Build vehicle block from individual fields so VIN and car are NEVER sanitized (no link in those lines)
     def _safe(s: str) -> str:
@@ -1789,8 +1892,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         _safe(phase1_data.get("insurance_policy_number")),
         _safe(phase1_data.get("extra_info")),
     ]
-    if special_note_disp:
-        vehicle_lines_display.append(_safe("📝 " + special_note_disp))
+    if issuer_note_disp:
+        vehicle_lines_display.append(_safe("📝 " + issuer_note_disp))
     vehicle_safe = "\n".join(vehicle_lines_display)
     delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
     extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
@@ -1813,7 +1916,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 f"📋 Reference ID: {reference_id}\n"
                 f"🚗 Vehicle:\n{vehicle_safe}\n\n"
                 f"🔗 Encrypted Link: {encrypted_data.get('link')}"
-                + (f"\n\n📝 Special request:\n{special_note_disp}" if special_note_disp else "")
+                + (f"\n\n📝 Issuers note:\n{issuer_note_disp}" if issuer_note_disp else "")
+                + (f"\n\n📝 Driver-only note:\n{driver_note_disp}" if driver_note_disp else "")
             ),
             # Supervisor/group info (using group name as identifier)
             "supervisor_name": selected_group.get("group_name", ""),
@@ -1874,8 +1978,10 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
         f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
     )
-    if special_note_disp:
-        full_message += f"\n\n📝 Special request:\n{_sanitize_phones_for_send(special_note_disp)}"
+    if issuer_note_disp:
+        full_message += f"\n\n📝 Special request (issuers / group):\n{_sanitize_phones_for_send(issuer_note_disp)}"
+    if driver_note_disp:
+        full_message += f"\n\n📝 Special request (drivers only):\n{_sanitize_phones_for_send(driver_note_disp)}"
 
     # Group message – HTML with <pre> copy block; no raw phone in body outside pre
     group_message = _format_group_lead_message_html(
@@ -1884,7 +1990,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         encrypted_data.get("link") or "",
         monday_result["issue_date"] if monday_result else None,
         monday_result["expiration_date"] if monday_result else None,
-        special_note_disp,
+        issuer_note_disp,
     )
 
     # Driver assignment message (sent to selected drivers with accept/decline)
@@ -1896,8 +2002,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         f" Delivery Time 🏷️: {extra_safe}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
-    if special_note_disp:
-        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(special_note_disp)}"
+    if driver_note_disp:
+        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(driver_note_disp)}"
     
     # Create accept/decline keyboard for driver assignment
     accept_keyboard = InlineKeyboardMarkup([
@@ -2193,7 +2299,7 @@ async def _handle_resend_to_drivers(
             await update.callback_query.message.reply_text("❌ Driver not found.")
             return STATE_SELECT_DRIVER
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
-    spec = (lead.get("special_request_note") or "").strip()
+    spec = _lead_driver_note(lead)
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
         f"📍 Delivery: {lead.get('delivery_details', '')}\n"
@@ -2202,7 +2308,7 @@ async def _handle_resend_to_drivers(
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
     if spec:
-        driver_request_message += f"\n\n📝 Special request: {_sanitize_phones_for_send(spec)}"
+        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
     accept_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
@@ -2365,35 +2471,8 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception as e:
                 logger.error(f"Error updating Monday.com driver column: {e}")
         
-        # Send confirmation to driver – phone only via one-time link; sanitize user content
-        delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
-        extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
-        spec_accept = (lead.get("special_request_note") or "").strip()
-        confirmation_message = (
-            "✅ **Lead Accepted!**\n\n"
-            f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
-            f"📝 Extra info: {extra_safe}\n"
-            f"📞 Phone (one-time link): {lead.get('encrypted_link', 'N/A')}\n"
-            f"💰 Price: {lead.get('price', 'N/A')}\n"
-            f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`\n"
-        )
-        if spec_accept:
-            confirmation_message += f"📝 Special request: {_sanitize_phones_for_send(spec_accept)}\n"
-        confirmation_message += (
-            "\n"
-            "Security 🚨 client must pay dealership directly\n"
-            "PLEASE HAVE CLIENT PAY US THE 💵MONEY DIRECTLY\n"
-            "WE ACCEPT ALL ELECTRONIC PAYMENTS:\n"
-            "Cashapp: $RoyalSpending3\n"
-            "Venmo: @PrivateDealership\n"
-            "Zelle: OrganizeDataOnline@gmail.com\n"
-            "PayPal: privatedealership@gmail.com\n\n"
-            "❗️Important Message:\n"
-            "Please be fast, professional, polite, the client is always right. Double check all info.\n"
-            "📞Call client now to confirm 💲PRICE, ⏱️TIME, & 📍LOCATION.\n"
-            "Fasten your seatbelt, both hands on the wheel. And most importantly, upload receipt 🧾 today ✅\n"
-            "🙏Thank you & 🚘Drive Safe !"
-        )
+        # Send confirmation to driver (plain text — long template with payment lines from Config)
+        confirmation_message = _build_driver_lead_accepted_message(lead)
 
         # Add receipt submission button
         receipt_keyboard = InlineKeyboardMarkup([
@@ -2406,8 +2485,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await query.message.reply_text(
             confirmation_message,
-            parse_mode="Markdown",
-            reply_markup=receipt_keyboard
+            reply_markup=receipt_keyboard,
         )
         # Strike message: remind about pending receipts
         pending = db.get_driver_pending_receipts(driver["id"])
@@ -2434,7 +2512,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if group_telegram_id:
                 try:
                     extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
-                    spec_grp = (lead.get("special_request_note") or "").strip()
+                    spec_grp = _lead_issuer_note(lead)
                     acceptance_message = (
                         "✅ **Lead Accepted**\n\n"
                         f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
@@ -2442,7 +2520,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
                     )
                     if spec_grp:
-                        acceptance_message += f"\n📝 Special request: {_sanitize_phones_for_send(spec_grp)}"
+                        acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
                     await context.bot.send_message(
                         chat_id=group_telegram_id,
                         text=acceptance_message,
@@ -2450,6 +2528,22 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception as e:
                     logger.error(f"Error forwarding acceptance to group: {e}")
+        # Schedule 28-day renewal
+        try:
+            from datetime import datetime, timedelta, timezone as _tz
+            renewal_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
+            existing_renewal = db.get_active_renewal_for_lead(lead_id)
+            if not existing_renewal:
+                db.schedule_renewal(
+                    lead_id=lead_id,
+                    group_id=group_id if group_id else None,
+                    driver_id=driver["id"],
+                    renewal_due_at=renewal_due.isoformat(),
+                )
+                logger.info("Renewal scheduled for lead %s in %d days", lead.get("reference_id", "?"), Config.RENEWAL_DAYS)
+        except Exception as e:
+            logger.warning("Could not schedule renewal: %s", e)
+
         await _notify_lead_lifecycle(
             context,
             lead,
@@ -2955,6 +3049,396 @@ def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
     return False
 
 
+# ── Renewal system ────────────────────────────────────────────────────────
+
+def _build_renewal_group_message(renewal: dict) -> str:
+    """Build the group-facing renewal notice (plain text)."""
+    lead = renewal.get("lead") or {}
+    ref = lead.get("reference_id") or "N/A"
+    vehicle = (lead.get("vehicle_details") or "")[:200]
+    delivery = _sanitize_phones_for_send(lead.get("delivery_details") or "") or "N/A"
+    extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
+    note = _lead_issuer_note(lead)
+    lines = [
+        "🔄 RENEWAL DUE",
+        f"📋 Ref ID: {ref}",
+        "",
+        f"🚗 Vehicle: {vehicle}",
+        f"📍 Delivery: {delivery}",
+        f"📝 Extra info: {extra}",
+    ]
+    if note:
+        lines.append(f"📝 Issuers note: {_sanitize_phones_for_send(note)}")
+    lines.extend([
+        "",
+        "Tap Accept to keep this renewal.",
+        "Tap Reassign to pass it to another team.",
+    ])
+    return "\n".join(lines)
+
+
+def _build_renewal_driver_message(renewal: dict) -> str:
+    """Build the driver-facing renewal notice (plain text)."""
+    lead = renewal.get("lead") or {}
+    ref = lead.get("reference_id") or "N/A"
+    delivery = _delivery_block_plain(lead)
+    extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
+    link = (lead.get("encrypted_link") or "").strip() or "N/A"
+    price = (lead.get("price") or "").strip() or "N/A"
+    spec_d = _lead_driver_note(lead)
+    lines = [
+        "🔄 RENEWAL DELIVERY AVAILABLE",
+        "",
+        "📍 Delivery Address",
+        delivery,
+        f"📝 Extra info: {extra}",
+        f"📞Phone {link}",
+        "📞 Click link 🔗 enter password to view",
+        f"💰 Price: {price}",
+        f"🆔 Reference ID: {ref}",
+    ]
+    if spec_d:
+        lines.extend(["", f"📝 Special request (driver): {_sanitize_phones_for_send(spec_d)}"])
+    lines.extend([
+        "",
+        "Tap Accept to take this renewal delivery.",
+        "Tap Reassign to pass it to another driver.",
+    ])
+    return "\n".join(lines)
+
+
+async def _send_renewal_to_group(context: ContextTypes.DEFAULT_TYPE, renewal: dict, group: dict) -> bool:
+    """Send a renewal offer to a single group chat. Returns True if sent."""
+    gid = group.get("group_telegram_id")
+    chat_id = _parse_chat_id(gid)
+    if not chat_id:
+        return False
+    short_r = _short_uuid(renewal["id"])
+    short_g = _short_uuid(group["id"])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accept", callback_data=f"rga_{short_r}_{short_g}"),
+        InlineKeyboardButton("🔄 Reassign", callback_data=f"rgr_{short_r}_{short_g}"),
+    ]])
+    text = _build_renewal_group_message(renewal)
+    try:
+        msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        db.update_renewal(renewal["id"], {
+            "group_message_chat_id": str(chat_id),
+            "group_message_id": msg.message_id,
+        })
+        return True
+    except Exception as e:
+        logger.warning("Could not send renewal to group %s: %s", group.get("group_name"), e)
+        return False
+
+
+async def _send_renewal_to_driver(context: ContextTypes.DEFAULT_TYPE, renewal: dict, driver: dict) -> bool:
+    """Send a renewal offer to a single driver. Returns True if sent."""
+    cid = _parse_chat_id(driver.get("driver_telegram_id"))
+    if not cid:
+        return False
+    short_r = _short_uuid(renewal["id"])
+    short_d = _short_uuid(driver["id"])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}_{short_d}"),
+        InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}_{short_d}"),
+    ]])
+    text = _build_renewal_driver_message(renewal)
+    try:
+        msg = await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+        db.update_renewal(renewal["id"], {
+            "driver_message_chat_id": str(cid),
+            "driver_message_id": msg.message_id,
+        })
+        return True
+    except Exception as e:
+        logger.warning("Could not send renewal to driver %s: %s", driver.get("driver_name"), e)
+        return False
+
+
+async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id: str) -> None:
+    """Timer callback: original group didn't accept within the escalation window — broadcast to all."""
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    if renewal.get("group_status") == "accepted":
+        return  # already handled
+    logger.info("Renewal %s: group escalation triggered", renewal_id)
+    db.update_renewal(renewal_id, {
+        "group_status": "escalated",
+        "group_escalated_at": "now()",
+    })
+    groups = db.get_all_groups()
+    active = [g for g in groups if g.get("is_active", True)]
+    original_gid = renewal.get("original_group_id")
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    for g in active:
+        if g.get("id") == original_gid:
+            continue
+        await _send_renewal_to_group(context, refreshed, g)
+
+
+async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_id: str) -> None:
+    """Timer callback: original driver didn't accept — send to all drivers in the accepted group."""
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    if renewal.get("driver_status") == "accepted":
+        return  # already handled
+    logger.info("Renewal %s: driver escalation triggered", renewal_id)
+    db.update_renewal(renewal_id, {
+        "driver_status": "escalated",
+        "driver_escalated_at": "now()",
+    })
+    group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
+    drivers = db.get_active_drivers_for_group(group_id) if group_id else []
+    suspended = _get_suspended_driver_ids()
+    original_did = renewal.get("original_driver_id")
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    for d in (drivers or []):
+        if d.get("id") == original_did:
+            continue
+        if d.get("id") in suspended:
+            continue
+        await _send_renewal_to_driver(context, refreshed, d)
+
+
+async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group member taps Accept on a renewal offer."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("rga_", "")
+    try:
+        short_r, short_g = raw.split("_", 1)
+        renewal_id = _long_uuid(short_r)
+        group_id = _long_uuid(short_g)
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    renewal = db.get_renewal_by_id(renewal_id)
+    group = db.get_group_by_id(group_id)
+    if not renewal or not group:
+        try:
+            await query.message.edit_text("❌ Renewal not found or expired.")
+        except Exception:
+            pass
+        return
+
+    accepted = db.accept_renewal_group(renewal_id, group_id)
+    if not accepted:
+        try:
+            await query.message.edit_text("❌ This renewal was already accepted by another team.")
+        except Exception:
+            pass
+        return
+
+    ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
+    gname = group.get("group_name", "Group")
+    try:
+        await query.message.edit_text(
+            f"✅ **Renewal accepted by {gname}**\n\n"
+            f"Reference ID: `{ref}`\n\n"
+            "Now sending to driver…",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    original_did = renewal.get("original_driver_id")
+    original_driver = None
+    if original_did:
+        all_drivers = db.get_all_drivers()
+        original_driver = next((d for d in all_drivers if d.get("id") == original_did), None)
+
+    # Phase 2: send to original driver first
+    sent_to_driver = False
+    if original_driver and original_driver.get("is_active", True):
+        db.update_renewal(renewal_id, {
+            "driver_status": "sent",
+            "driver_sent_at": "now()",
+        })
+        sent_to_driver = await _send_renewal_to_driver(context, refreshed, original_driver)
+
+    if sent_to_driver:
+        esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
+        if context.application.job_queue:
+            async def _driver_esc_job(ctx, _rid=renewal_id):
+                await _escalate_renewal_driver(ctx, _rid)
+            context.application.job_queue.run_once(
+                _driver_esc_job,
+                when=esc_seconds,
+                name=f"renewal_driver_esc_{renewal_id}",
+            )
+    else:
+        # No original driver available — immediately escalate to all drivers in group
+        await _escalate_renewal_driver(context, renewal_id)
+
+
+async def handle_renewal_group_reassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group member taps Reassign — immediately escalate to other groups."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("rgr_", "")
+    try:
+        short_r, short_g = raw.split("_", 1)
+        renewal_id = _long_uuid(short_r)
+        group_id = _long_uuid(short_g)
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    if renewal.get("group_status") == "accepted":
+        try:
+            await query.message.edit_text("❌ Already accepted by a team.")
+        except Exception:
+            pass
+        return
+
+    ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
+    try:
+        await query.message.edit_text(
+            f"🔄 **Reassigned** — this renewal (`{ref}`) has been sent to other teams.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+    await _escalate_renewal_group(context, renewal_id)
+
+
+async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Driver taps Accept on a renewal delivery."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("rda_", "")
+    try:
+        short_r, short_d = raw.split("_", 1)
+        renewal_id = _long_uuid(short_r)
+        driver_id = _long_uuid(short_d)
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        try:
+            await query.message.edit_text("❌ Renewal not found or expired.")
+        except Exception:
+            pass
+        return
+
+    accepted = db.accept_renewal_driver(renewal_id, driver_id)
+    if not accepted:
+        try:
+            await query.message.edit_text("❌ This renewal delivery was already accepted by another driver.")
+        except Exception:
+            pass
+        return
+
+    lead = renewal.get("lead") or {}
+    ref = lead.get("reference_id", "N/A")
+    driver = None
+    all_drivers = db.get_all_drivers()
+    driver = next((d for d in all_drivers if d.get("id") == driver_id), None)
+    dname = driver.get("driver_name", "Driver") if driver else "Driver"
+
+    try:
+        await query.message.edit_text(
+            f"✅ **Renewal accepted!**\n\nReference ID: `{ref}`",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    # Send the full accepted lead details to the driver
+    lead_full = db.get_lead_by_id(renewal.get("lead_id")) or lead
+    confirmation = _build_driver_lead_accepted_message(lead_full)
+    receipt_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
+    ])
+    try:
+        await query.message.reply_text(confirmation, reply_markup=receipt_kb)
+    except Exception as e:
+        logger.warning("Could not send renewal confirmation to driver: %s", e)
+
+    # Notify the accepted group
+    group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
+    group = db.get_group_by_id(group_id) if group_id else None
+    if group:
+        gcid = _parse_chat_id(group.get("group_telegram_id"))
+        if gcid:
+            try:
+                await context.bot.send_message(
+                    chat_id=gcid,
+                    text=(
+                        f"✅ **Renewal Delivery Accepted**\n\n"
+                        f"🚗 Driver: {dname}\n"
+                        f"📋 Reference ID: `{ref}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("Could not notify group about renewal driver accept: %s", e)
+
+    # Schedule the NEXT renewal cycle (28 more days from now)
+    try:
+        from datetime import datetime, timedelta, timezone as _tz
+        next_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
+        lead_id = renewal.get("lead_id")
+        accepted_group = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
+        existing = db.get_active_renewal_for_lead(lead_id) if lead_id else None
+        if not existing and lead_id:
+            db.schedule_renewal(
+                lead_id=lead_id,
+                group_id=accepted_group,
+                driver_id=driver_id,
+                renewal_due_at=next_due.isoformat(),
+            )
+            logger.info("Next renewal scheduled for lead %s in %d days", ref, Config.RENEWAL_DAYS)
+    except Exception as e:
+        logger.warning("Could not schedule next renewal cycle: %s", e)
+
+    logger.info("Renewal %s completed — driver %s accepted", renewal_id, dname)
+
+
+async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Driver taps Reassign — immediately escalate to other drivers."""
+    query = update.callback_query
+    await query.answer()
+    raw = query.data.replace("rdr_", "")
+    try:
+        short_r, short_d = raw.split("_", 1)
+        renewal_id = _long_uuid(short_r)
+        driver_id = _long_uuid(short_d)
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    if renewal.get("driver_status") == "accepted":
+        try:
+            await query.message.edit_text("❌ Already accepted by a driver.")
+        except Exception:
+            pass
+        return
+
+    ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
+    try:
+        await query.message.edit_text(
+            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) has been sent to other drivers.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+    await _escalate_renewal_driver(context, renewal_id)
+
+
 def main():
     """Main function to start the bot."""
     import signal
@@ -3090,8 +3574,11 @@ def main():
                 CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
             ],
             STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
-            STATE_SPECIAL_REQUEST_NOTE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_note),
+            STATE_SPECIAL_REQUEST_ISSUERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
+            ],
+            STATE_SPECIAL_REQUEST_DRIVERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
             ],
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
             STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
@@ -3127,6 +3614,12 @@ def main():
     # Add accept/decline handlers for group broadcast offers
     application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^ag_"))
     application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^dg_"))
+
+    # Renewal accept / reassign handlers
+    application.add_handler(CallbackQueryHandler(handle_renewal_group_accept, pattern="^rga_"))
+    application.add_handler(CallbackQueryHandler(handle_renewal_group_reassign, pattern="^rgr_"))
+    application.add_handler(CallbackQueryHandler(handle_renewal_driver_accept, pattern="^rda_"))
+    application.add_handler(CallbackQueryHandler(handle_renewal_driver_reassign, pattern="^rdr_"))
     
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3215,6 +3708,50 @@ def main():
     if application.job_queue:
         application.job_queue.run_repeating(send_receipt_reminders, interval=3600, first=60)
         logger.info("Receipt reminder job scheduled (every hour, first in 60s)")
+
+    # Renewal checker: every 5 minutes, find leads whose 28-day renewal is due
+    async def check_renewals(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            due = db.get_due_renewals()
+            for renewal in due:
+                renewal_id = renewal.get("id")
+                if not renewal_id:
+                    continue
+                original_gid = renewal.get("original_group_id")
+                original_group = db.get_group_by_id(original_gid) if original_gid else None
+                db.update_renewal(renewal_id, {
+                    "status": "group_phase",
+                    "group_status": "sent",
+                    "group_sent_at": "now()",
+                })
+                sent = False
+                if original_group and original_group.get("is_active", True):
+                    sent = await _send_renewal_to_group(context, renewal, original_group)
+
+                if sent:
+                    esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
+                    if context.application.job_queue:
+                        async def _group_esc_job(ctx, _rid=renewal_id):
+                            await _escalate_renewal_group(ctx, _rid)
+                        context.application.job_queue.run_once(
+                            _group_esc_job,
+                            when=esc_seconds,
+                            name=f"renewal_group_esc_{renewal_id}",
+                        )
+                    lead = renewal.get("lead") or {}
+                    ref = lead.get("reference_id", "?")
+                    logger.info(
+                        "Renewal %s (ref %s) sent to original group, escalation in %d min",
+                        renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
+                    )
+                else:
+                    await _escalate_renewal_group(context, renewal_id)
+        except Exception as e:
+            logger.error("Renewal checker job failed: %s", e)
+
+    if application.job_queue:
+        application.job_queue.run_repeating(check_renewals, interval=300, first=180)
+        logger.info("Renewal checker job scheduled (every 5 min, first in 180s)")
 
     # Daily motivation (Pro Mode): morning PSYCHOLOGY, evening AGGRESSIVE, no-lead-24h AGGRESSIVE, top performer BONUS
     async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:

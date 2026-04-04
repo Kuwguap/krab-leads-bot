@@ -422,7 +422,7 @@ class AdminDatabase:
         try:
             assignments_resp = self.client.table("lead_assignments").select(
                 "id, driver_id, accepted_at, lead:leads("
-                "id, reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, monday_status"
+                "id, reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers, monday_status"
                 ")"
             ).eq("status", "accepted").eq("driver_id", driver_id).order("accepted_at").execute()
 
@@ -442,6 +442,8 @@ class AdminDatabase:
                     "delivery_details": lead.get("delivery_details"),
                     "extra_info": lead.get("extra_info"),
                     "special_request_note": lead.get("special_request_note"),
+                    "special_request_issuers": lead.get("special_request_issuers"),
+                    "special_request_drivers": lead.get("special_request_drivers"),
                 })
             return out
         except Exception:
@@ -1439,6 +1441,68 @@ def api_toggle_driver(driver_id):
         return jsonify({"success": False, "error": "Error updating driver"}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/renewals/upcoming', methods=['GET'])
+def api_upcoming_renewals():
+    """Return upcoming (pending) renewals with days remaining, client/group/driver names."""
+    try:
+        from datetime import datetime, timezone
+        r = db.client.table("lead_renewals").select(
+            "id, lead_id, renewal_due_at, status, original_group_id, original_driver_id, "
+            "group_accepted_by_id, driver_accepted_by_id, "
+            "lead:leads(reference_id, telegram_username, vehicle_details)"
+        ).in_("status", ["pending", "group_phase", "driver_phase"]).order("renewal_due_at").execute()
+        rows = r.data or []
+        groups_cache = {}
+        drivers_cache = {}
+        now = datetime.now(timezone.utc)
+        out = []
+        for row in rows:
+            lead = row.get("lead") or {}
+            due_str = row.get("renewal_due_at") or ""
+            days_left = None
+            if due_str:
+                try:
+                    due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                    days_left = max(0, (due_dt - now).days)
+                except Exception:
+                    pass
+            gid = row.get("group_accepted_by_id") or row.get("original_group_id")
+            did = row.get("driver_accepted_by_id") or row.get("original_driver_id")
+            gname = "—"
+            if gid:
+                if gid not in groups_cache:
+                    try:
+                        gr = db.client.table("groups").select("group_name").eq("id", gid).limit(1).execute()
+                        groups_cache[gid] = (gr.data[0].get("group_name") if gr.data else "—")
+                    except Exception:
+                        groups_cache[gid] = "—"
+                gname = groups_cache[gid]
+            dname = "—"
+            if did:
+                if did not in drivers_cache:
+                    try:
+                        dr = db.client.table("drivers").select("driver_name").eq("id", did).limit(1).execute()
+                        drivers_cache[did] = (dr.data[0].get("driver_name") if dr.data else "—")
+                    except Exception:
+                        drivers_cache[did] = "—"
+                dname = drivers_cache[did]
+            out.append({
+                "id": row.get("id"),
+                "reference_id": lead.get("reference_id", "—"),
+                "client_name": lead.get("telegram_username") or "—",
+                "vehicle": (lead.get("vehicle_details") or "")[:120],
+                "group_name": gname,
+                "driver_name": dname,
+                "days_left": days_left,
+                "status": row.get("status"),
+                "renewal_due_at": due_str,
+            })
+        return jsonify(out)
+    except Exception as e:
+        logger.error("Error fetching upcoming renewals: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':

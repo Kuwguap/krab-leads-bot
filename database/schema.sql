@@ -46,8 +46,10 @@ CREATE TABLE IF NOT EXISTS leads (
     
     -- Extra info from Phase 1 (e.g., delivery time / notes)
     extra_info TEXT,
-    -- Note from Phase 2 (after phone/price); shown at bottom of forwarded lead
+    -- Phase 2 notes after phone/price (legacy single column; issuers/drivers split below)
     special_request_note TEXT,
+    special_request_issuers TEXT,  -- note for group / issuers (broadcast + group post)
+    special_request_drivers TEXT,   -- note only for drivers (DM + accept message)
     
     -- Metadata
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

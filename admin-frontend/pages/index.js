@@ -22,6 +22,7 @@ export default function AdminPanel() {
   const [receiptSelectedAssignmentId, setReceiptSelectedAssignmentId] = useState(null);
   const [receiptModalLoading, setReceiptModalLoading] = useState(false);
   const [submittedReceipts, setSubmittedReceipts] = useState([]);
+  const [upcomingRenewals, setUpcomingRenewals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState(null);
   const [messageType, setMessageType] = useState('success');
@@ -116,6 +117,20 @@ export default function AdminPanel() {
     }
   }, []);
 
+  const fetchUpcomingRenewals = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/renewals/upcoming`);
+      if (res.ok) {
+        const data = await res.json();
+        setUpcomingRenewals(Array.isArray(data) ? data : []);
+      } else {
+        setUpcomingRenewals([]);
+      }
+    } catch {
+      setUpcomingRenewals([]);
+    }
+  }, []);
+
   const fetchContactSources = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/contact_sources`);
@@ -148,10 +163,11 @@ export default function AdminPanel() {
         fetchSubmittedReceipts(),
         fetchContactSources(),
         fetchAssignments(),
+        fetchUpcomingRenewals(),
       ]);
       setLoading(false);
     })();
-  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchSubmittedReceipts, fetchContactSources, fetchAssignments]);
+  }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchSubmittedReceipts, fetchContactSources, fetchAssignments, fetchUpcomingRenewals]);
 
   useEffect(() => {
     if (groups.length === 0) return;
@@ -1161,9 +1177,10 @@ export default function AdminPanel() {
                             </pre>
                           </div>
 
-                          {receiptSelectedItem.special_request_note ? (
+                          {(receiptSelectedItem.special_request_issuers ||
+                            receiptSelectedItem.special_request_note) ? (
                             <div style={{ marginBottom: 12 }}>
-                              <strong>Special request note:</strong>
+                              <strong>Special request (issuers / group):</strong>
                               <pre
                                 style={{
                                   background: '#f6f6f6',
@@ -1175,7 +1192,27 @@ export default function AdminPanel() {
                                   overflow: 'auto',
                                 }}
                               >
-                                {receiptSelectedItem.special_request_note}
+                                {receiptSelectedItem.special_request_issuers ||
+                                  receiptSelectedItem.special_request_note ||
+                                  ''}
+                              </pre>
+                            </div>
+                          ) : null}
+                          {receiptSelectedItem.special_request_drivers ? (
+                            <div style={{ marginBottom: 12 }}>
+                              <strong>Special request (drivers only):</strong>
+                              <pre
+                                style={{
+                                  background: '#f6f6f6',
+                                  padding: 12,
+                                  borderRadius: 8,
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                  maxHeight: 220,
+                                  overflow: 'auto',
+                                }}
+                              >
+                                {receiptSelectedItem.special_request_drivers}
                               </pre>
                             </div>
                           ) : null}
@@ -1199,6 +1236,81 @@ export default function AdminPanel() {
             </div>
           </div>
         )}
+        {/* ── Upcoming Renewals ── */}
+        <section className="admin-section" style={styles.section}>
+          <h2 style={styles.sectionTitle}>Upcoming Renewals</h2>
+          <p style={{ marginBottom: 12, color: '#555' }}>
+            Leads approaching their 28-day renewal window. Sorted by days remaining.
+          </p>
+          <div className="admin-table-wrap">
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th>Ref ID</th>
+                  <th>Client</th>
+                  <th>Vehicle</th>
+                  <th>Issuer Group</th>
+                  <th>Driver</th>
+                  <th>Days Left</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {upcomingRenewals.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} style={{ textAlign: 'center', color: '#888' }}>
+                      No upcoming renewals
+                    </td>
+                  </tr>
+                ) : (
+                  upcomingRenewals.map((r) => (
+                    <tr key={r.id}>
+                      <td style={{ fontFamily: 'monospace', fontWeight: 600 }}>{r.reference_id}</td>
+                      <td>{r.client_name}</td>
+                      <td style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {r.vehicle || '—'}
+                      </td>
+                      <td>{r.group_name}</td>
+                      <td>{r.driver_name}</td>
+                      <td>
+                        <span style={{
+                          fontWeight: 700,
+                          color: r.days_left === 0 ? '#dc3545'
+                            : r.days_left != null && r.days_left <= 3 ? '#fd7e14'
+                            : '#28a745',
+                        }}>
+                          {r.days_left != null ? `${r.days_left} day${r.days_left !== 1 ? 's' : ''}` : '—'}
+                        </span>
+                      </td>
+                      <td>
+                        <span style={{
+                          padding: '2px 8px',
+                          borderRadius: 4,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          background: r.status === 'pending' ? '#fff3cd'
+                            : r.status === 'group_phase' ? '#cce5ff'
+                            : r.status === 'driver_phase' ? '#d4edda'
+                            : '#e2e3e5',
+                          color: r.status === 'pending' ? '#856404'
+                            : r.status === 'group_phase' ? '#004085'
+                            : r.status === 'driver_phase' ? '#155724'
+                            : '#383d41',
+                        }}>
+                          {r.status === 'pending' ? 'Waiting'
+                            : r.status === 'group_phase' ? 'Group deciding'
+                            : r.status === 'driver_phase' ? 'Driver deciding'
+                            : r.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
       </div>
     </div>
   );
