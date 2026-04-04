@@ -3,8 +3,6 @@ import io
 import logging
 import os
 import sys
-from datetime import time as dt_time
-import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
 from telegram.ext import (
