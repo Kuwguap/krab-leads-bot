@@ -1,29 +1,27 @@
-# Render Blueprint: KrabsLeads + Paper Investigator
-# Set shared env vars once in the "krableads-shared" env group — all 3 services inherit them.
+# Render Blueprint — 3 independent services (set env vars on each separately)
+#
+#  1. krabsleads-admin    (Web)    — Flask admin dashboard API
+#  2. krabsleads-bot      (Worker) — KrabLeads Telegram bot (1 instance only)
+#  3. paper-investigator  (Worker) — Paper Investigator Telegram bot (1 instance only)
+#
+# All three share the same Supabase database. Each has its own env vars.
 previews:
   generation: off
 
-envVarGroups:
-  - name: krableads-shared
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-
 services:
-  # ── 1. Admin Dashboard (Flask web) ─────────────────────────────────────
+  # ── 1. Admin Dashboard (Flask web) ────────────────────────────────────
   - type: web
     name: krabsleads-admin
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python admin_dashboard.py
-    envVarGroups:
-      - krableads-shared
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
 
-  # ── 2. KrabsLeads Telegram Bot (single worker) ────────────────────────
+  # ── 2. KrabLeads Bot (single worker) ─────────────────────────────────
   - type: worker
     name: krabsleads-bot
     runtime: python
@@ -31,8 +29,6 @@ services:
     maxShutdownDelaySeconds: 60
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    envVarGroups:
-      - krableads-shared
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -50,11 +46,17 @@ services:
         sync: false
       - key: ONETIMESECRET_PASSPHRASE
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
       - key: DRIVER_TELEGRAM_ID
         sync: false
       - key: GROUP_TELEGRAM_ID
         sync: false
       - key: SUPERVISORY_TELEGRAM_ID
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_VISION_MODEL
         sync: false
@@ -63,7 +65,7 @@ services:
       - key: VIN_PROVIDER
         sync: false
 
-  # ── 3. Paper Investigator Telegram Bot (single worker) ─────────────────
+  # ── 3. Paper Investigator Bot (single worker) ────────────────────────
   - type: worker
     name: paper-investigator-bot
     runtime: python
@@ -72,14 +74,18 @@ services:
     rootDir: paper_investigator
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    envVarGroups:
-      - krableads-shared
     envVars:
       - key: PAPER_BOT_TOKEN
         sync: false
       - key: PAPER_SUPERVISOR_TELEGRAM_ID
         sync: false
       - key: PAPER_GIRL_TELEGRAM_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
         sync: false
