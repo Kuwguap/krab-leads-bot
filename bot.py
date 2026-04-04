@@ -180,20 +180,28 @@ async def _notify_lead_lifecycle(
     """
     Standard 3-step alerts to lead initiator + SUPERVISORY_TELEGRAM_ID.
     step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
+    Deduplicates so the same chat_id never receives the same message twice.
     """
     lines = [f"🔔 **({step}/3)** {title_line}", ""]
     lines.extend(extra_lines or [])
     text = "\n".join(lines)
     initiator_id = lead.get("user_id")
     sup = (Config.SUPERVISORY_TELEGRAM_ID or "").strip()
-    targets = []
+    seen: set[int] = set()
+    targets: list[int] = []
     if initiator_id is not None:
         try:
-            targets.append(int(initiator_id))
+            cid = int(initiator_id)
+            if cid not in seen:
+                targets.append(cid)
+                seen.add(cid)
         except (TypeError, ValueError):
             logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
     if sup:
-        targets.append(_parse_chat_id(sup))
+        cid = _parse_chat_id(sup)
+        if cid is not None and cid not in seen:
+            targets.append(cid)
+            seen.add(cid)
     for cid in targets:
         if cid is None:
             continue
@@ -2926,7 +2934,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             photo_url=stored_url,
         )
         
-        # Notify group supervisory + ST (same copy as step 3)
+        # Notify group supervisory + ST — dedup against lifecycle targets
         group_id = lead.get("group_id")
         group_name = "—"
         group = db.get_group_by_id(group_id) if group_id else None
@@ -2938,37 +2946,47 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Group: **{group_name}**\n"
             f"[Open receipt]({stored_url})"
         )
+        _receipt_sent: set[int] = set()
+        initiator_cid = _parse_chat_id(lead.get("user_id"))
+        if initiator_cid:
+            _receipt_sent.add(initiator_cid)
+        global_sup = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+        if global_sup:
+            _receipt_sent.add(global_sup)
+
         if group and (group.get("supervisory_telegram_id") or "").strip():
-            supervisory_telegram_id = (group.get("supervisory_telegram_id") or "").strip()
             try:
-                sup_chat_id = int(supervisory_telegram_id.strip())
+                sup_chat_id = int(str(group["supervisory_telegram_id"]).strip())
             except (ValueError, TypeError):
-                sup_chat_id = supervisory_telegram_id
-            try:
-                await context.bot.send_message(
-                    chat_id=sup_chat_id,
-                    text=receipt_notice,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except (ValueError, TypeError) as e:
-                logger.warning("Invalid supervisory_telegram_id for group %s: %s", group_id, e)
-            except Exception as e:
-                logger.warning("Could not send receipt notification to supervisory %s: %s", supervisory_telegram_id, e)
+                sup_chat_id = None
+            if sup_chat_id and sup_chat_id not in _receipt_sent:
+                _receipt_sent.add(sup_chat_id)
+                try:
+                    await context.bot.send_message(
+                        chat_id=sup_chat_id,
+                        text=receipt_notice,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.warning("Could not send receipt notification to supervisory %s: %s", sup_chat_id, e)
         st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
         if st_telegram_id:
             try:
                 st_chat_id = int(st_telegram_id.strip())
-                await context.bot.send_message(
-                    chat_id=st_chat_id,
-                    text=receipt_notice,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except (ValueError, TypeError) as e:
-                logger.warning("Invalid st_telegram_id: %s", e)
-            except Exception as e:
-                logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e)
+            except (ValueError, TypeError):
+                st_chat_id = None
+            if st_chat_id and st_chat_id not in _receipt_sent:
+                _receipt_sent.add(st_chat_id)
+                try:
+                    await context.bot.send_message(
+                        chat_id=st_chat_id,
+                        text=receipt_notice,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e)
         
         # Send completion message via @krabsenderbot to driver_name
         try:
@@ -2998,11 +3016,11 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
+def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 120) -> bool:
     """
     Wait until no other process is polling this bot token.
-    Render starts the new worker before killing the old one; this loop lets
-    the new process survive that overlap instead of crashing with 409.
+    Render starts the new worker before killing the old one; this loop
+    retries until the old process releases getUpdates.
     Returns True when the slot is free, False if timed out.
     """
     import requests as _req
@@ -3015,8 +3033,16 @@ def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
         pass
 
     waited = 0
-    backoff = 2
+    backoff = 3
+    attempt = 0
     while waited < max_wait:
+        attempt += 1
+        # Re-clear webhook every few attempts (another deploy may have set one)
+        if attempt % 5 == 0:
+            try:
+                _req.post(f"{api}/deleteWebhook", json={"drop_pending_updates": True}, timeout=5)
+            except Exception:
+                pass
         try:
             r = _req.post(f"{api}/getUpdates", json={"timeout": 1, "limit": 1}, timeout=10)
             if r.status_code == 200:
@@ -3024,12 +3050,12 @@ def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 90) -> bool:
                 return True
             if r.status_code == 409:
                 logger.info(
-                    "Another instance still polling (409). Waiting %ds for it to shut down… (%d/%ds)",
+                    "Another instance still polling (409). Retrying in %ds… (%d/%ds elapsed)",
                     backoff, waited, max_wait,
                 )
                 _time.sleep(backoff)
                 waited += backoff
-                backoff = min(backoff * 2, 15)
+                backoff = min(backoff + 2, 10)
                 continue
             logger.warning("getUpdates probe returned HTTP %s, retrying…", r.status_code)
             _time.sleep(3)
@@ -3435,17 +3461,11 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
 
 def main():
     """Main function to start the bot."""
-    import signal
+    import time
 
     logger.info("Bot starting...")
     sys.stdout.flush()
     sys.stderr.flush()
-
-    def _handle_sigterm(signum, frame):
-        logger.info("Received SIGTERM — shutting down gracefully.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # Validate configuration
     try:
@@ -3456,70 +3476,46 @@ def main():
         return
 
     bot_token = Config.TELEGRAM_BOT_TOKEN
-    if not _wait_for_exclusive_polling(bot_token, max_wait=90):
-        logger.error("Could not acquire polling slot. Exiting.")
+    if not _wait_for_exclusive_polling(bot_token, max_wait=120):
+        logger.error("Could not acquire polling slot after 120s. Exiting.")
         sys.exit(1)
 
     # Create application
     application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-    
-    # Always delete webhook before polling (avoids 409 when webhook was set elsewhere)
+
+    # Clear webhook before polling (avoids 409 when webhook was set elsewhere)
     import requests
-    import time
-    bot_token = Config.TELEGRAM_BOT_TOKEN
     delete_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
     try:
         logger.info("Clearing webhook...")
-        delete_response = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=5)
-        if delete_response.status_code == 200:
-            data = delete_response.json()
-            if data.get("ok"):
-                logger.info("Webhook cleared (or was already clear) - safe to poll.")
-            else:
-                logger.warning(f"deleteWebhook response: {data}")
+        resp = requests.post(delete_url, json={"drop_pending_updates": True}, timeout=5)
+        if resp.status_code == 200 and resp.json().get("ok"):
+            logger.info("Webhook cleared — safe to poll.")
         else:
-            logger.warning(f"deleteWebhook HTTP {delete_response.status_code}: {delete_response.text}")
+            logger.warning("deleteWebhook response: %s", resp.text)
     except Exception as e:
-        logger.warning(f"Could not clear webhook (continuing anyway): {e}")
+        logger.warning("Could not clear webhook (continuing): %s", e)
     time.sleep(1)
+    
+    _conflict_logged = False
 
-    # During Render redeploys, old and new worker can briefly overlap; stagger polling start
-    # so the previous instance is more likely to have released getUpdates.
-    if os.environ.get("RENDER", "").lower() == "true":
-        import random
-        stagger = random.uniform(2.0, 12.0)
-        logger.info("Render: waiting %.1fs before polling (deploy overlap guard).", stagger)
-        time.sleep(stagger)
-    
-    # Add error handler for all errors
-    _conflict_logged = False  # Flag to prevent repeated logging
-    
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle errors."""
+        """Handle errors — on Conflict, hard-exit so Render restarts us."""
         nonlocal _conflict_logged
         error = context.error
-        
-        # Handle Telegram Conflict (multiple bot instances)
+
         if isinstance(error, Conflict):
             if not _conflict_logged:
                 _conflict_logged = True
                 logger.error(
-                    "\n" + "="*60 + "\n"
-                    "TELEGRAM CONFLICT ERROR: Another process is already receiving updates for this bot.\n\n"
-                    "On Render: Use only ONE Background Worker running 'python bot.py'. "
-                    "Do not run bot.py on a Web service (it can spawn multiple instances).\n"
-                    "Also: clear any webhook (e.g. run check_webhook.py once), then redeploy.\n"
-                    "="*60
+                    "TELEGRAM CONFLICT: another process is polling this token. "
+                    "Hard-exiting so Render restarts a clean instance."
                 )
-                # Exit gracefully after logging
-                logger.info("Exiting due to conflict error...")
-                import asyncio
-                # Schedule application shutdown
-                asyncio.create_task(application.stop())
-            # Suppress the error to prevent spam
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
             return
-        
-        # Log other errors (only once per error type)
+
         if isinstance(error, Exception):
             error_type = type(error).__name__
             if not hasattr(error_handler, f'_logged_{error_type}'):
@@ -3796,36 +3792,21 @@ def main():
         application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=18, minute=0, tzinfo=eastern))
         logger.info("Daily motivation jobs scheduled (8 AM ET, 6 PM ET)")
 
-    logger.info("Make sure only ONE instance of the bot is running!")
-    logger.info("Starting polling - bot is live. Press Ctrl+C to stop.")
-    
+    logger.info("Starting polling — bot is live.")
+
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
+            drop_pending_updates=True,
         )
-    except Conflict as e:
-        # This should only happen if conflict occurs during startup
-        logger.error(
-            "\n" + "="*60 + "\n"
-            "TELEGRAM CONFLICT ERROR: Multiple bot instances detected!\n\n"
-            "Possible causes:\n"
-            "1. Another instance of THIS bot is running\n"
-            "2. A webhook is set for this bot token\n"
-            "3. A background process is still running\n\n"
-            "Solution:\n"
-            "1. Run: python stop_bot.py (to find running processes)\n"
-            "2. Stop all bot instances (Ctrl+C in all terminals)\n"
-            "3. Wait 10 seconds\n"
-            "4. Run: python check_webhook.py (to clear webhooks)\n"
-            "5. Start only ONE instance: python bot.py\n"
-            "="*60
-        )
+    except Conflict:
+        logger.error("Conflict at polling startup — exiting so Render restarts.")
         sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Bot stopped by user.")
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error("Fatal error: %s", e, exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
