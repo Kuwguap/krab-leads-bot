@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 
-const API = process.env.NEXT_PUBLIC_ADMIN_BACKEND_URL || '';
+/**
+ * Same-origin proxy (pages/api/backend/...) → Render Flask admin.
+ * Set ADMIN_BACKEND_URL or NEXT_PUBLIC_ADMIN_BACKEND_URL on Vercel (server reads both for the proxy).
+ * Direct browser→Render calls often fail (CORS, cold start, env not baked into client).
+ */
+const API = '/api/backend';
 
 export default function AdminPanel() {
   const [groups, setGroups] = useState([]);
@@ -104,7 +109,7 @@ export default function AdminPanel() {
       }
     } catch {
       showMessage(
-        'Could not reach the Render admin backend receipt tracker API. Check NEXT_PUBLIC_ADMIN_BACKEND_URL.',
+        'Could not reach the admin backend. In Vercel set ADMIN_BACKEND_URL (or NEXT_PUBLIC_ADMIN_BACKEND_URL) to your Render URL and redeploy.',
         'error'
       );
       setReceiptDebtsDrivers([]);
@@ -132,11 +137,6 @@ export default function AdminPanel() {
   }, []);
 
   useEffect(() => {
-    if (!API) {
-      setLoading(false);
-      showMessage('Set NEXT_PUBLIC_ADMIN_BACKEND_URL in Vercel to your Render admin URL.', 'error');
-      return;
-    }
     (async () => {
       setLoading(true);
       await Promise.all([
@@ -154,7 +154,7 @@ export default function AdminPanel() {
   }, [fetchGroups, fetchDrivers, fetchSettings, fetchStats, fetchReceiptDebts, fetchSubmittedReceipts, fetchContactSources, fetchAssignments]);
 
   useEffect(() => {
-    if (!API || groups.length === 0) return;
+    if (groups.length === 0) return;
     fetchAssistantsForGroups(groups);
   }, [API, groups, fetchAssistantsForGroups]);
 
