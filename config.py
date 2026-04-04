@@ -41,6 +41,17 @@ class Config:
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
     API_NINJAS_API_KEY = (os.getenv("API_NINJAS_API_KEY") or "").strip() or None
 
+    # Shown in the Telegram message when a driver accepts a lead (override in .env)
+    DRIVER_PAYMENT_CASHAPP = (os.getenv("DRIVER_PAYMENT_CASHAPP") or "$TriStateTags").strip()
+    DRIVER_PAYMENT_VENMO = (os.getenv("DRIVER_PAYMENT_VENMO") or "@TriStateTags").strip()
+    DRIVER_PAYMENT_ZELLE = (os.getenv("DRIVER_PAYMENT_ZELLE") or "OrganizeDataOnline@gmail.com").strip()
+    DRIVER_PAYMENT_PAYPAL = (os.getenv("DRIVER_PAYMENT_PAYPAL") or "privatedealership@gmail.com").strip()
+    DRIVER_PAYMENT_PAGE_URL = (os.getenv("DRIVER_PAYMENT_PAGE_URL") or "www.TriStateTags.com/Payments").strip()
+
+    # Renewal cycle
+    RENEWAL_DAYS = int(os.getenv("RENEWAL_DAYS", "28"))
+    RENEWAL_ESCALATION_MINUTES = int(os.getenv("RENEWAL_ESCALATION_MINUTES", "5"))
+
     @classmethod
     def is_vin_lookup_configured(cls) -> bool:
         """True if VIN lookup is available (nhtsa always, or api_ninjas when key set)."""
