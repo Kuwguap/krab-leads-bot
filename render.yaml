@@ -72,8 +72,9 @@ services:
     numInstances: 1
     maxShutdownDelaySeconds: 30
     rootDir: paper_investigator
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    # Explicit pytz: some dashboards skip subfolder builds or run stale images; runtime pip is a safety net.
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt "pytz>=2024.1"
+    startCommand: python -m pip install -q "pytz>=2024.1" && python bot.py
     envVars:
       - key: PAPER_BOT_TOKEN
         sync: false
