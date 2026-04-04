@@ -511,14 +511,8 @@ def _preview_value_after_phase1_edit(state_data: dict, edit_key: str) -> str:
 
 
 def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> str:
-    """After Done — show full list like the edit flow, plus recent changes, then confirm."""
+    """After Done — show full field list, then confirm."""
     blocks = ["📋 Final review before continuing the lead.\n"]
-    if recent_edits:
-        ch_lines = "\n".join(
-            f"• {e.get('label', '?')}: {_truncate_btn_val(str(e.get('value', '-')), 56)}"
-            for e in recent_edits
-        )
-        blocks.append("📌 Most recent change(s) in this session:\n" + ch_lines + "\n")
     blocks.append(
         "📄 All fields (same list as when you pick a field to edit):\n"
         + _format_phase1_field_lines(state_data)
