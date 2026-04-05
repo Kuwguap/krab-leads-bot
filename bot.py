@@ -7,7 +7,7 @@ import html
 import sys
 import secrets
 import string
-from datetime import time as dt_time
+from datetime import datetime, time as dt_time
 import pytz
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -914,6 +914,102 @@ def _format_group_lead_message_html(
         f"📅 Issue Date: {_h(issue_s)}\n"
         f"⏰ Expires: {_h(expiry_s)}"
     )
+
+
+def _dt_from_lead_field(val) -> datetime | None:
+    """Parse issue_date / expiration_date from DB (ISO string or datetime)."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _phase1_from_stored_lead(lead: dict) -> dict:
+    """Rebuild phase1 field dict from a persisted leads row (for group HTML message)."""
+    vd = (lead.get("vehicle_details") or "").strip()
+    dd = (lead.get("delivery_details") or "").strip()
+    extra = (lead.get("extra_info") or "").strip()
+    phase1 = parse_phase1_structured(vd) if vd else parse_phase1_structured("")
+    if dd:
+        phase1["delivery_details"] = dd
+        dlines = [L.strip() for L in dd.splitlines() if L.strip()]
+        if len(dlines) >= 1:
+            phase1["delivery_address"] = dlines[0]
+        if len(dlines) >= 2:
+            phase1["delivery_city_state_zip"] = dlines[1]
+    if extra:
+        phase1["extra_info"] = extra
+    return phase1
+
+
+async def _send_full_group_lead_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    group: dict,
+    lead: dict,
+    *,
+    html_prefix: str | None = None,
+) -> None:
+    """Post the same detailed HTML lead as the issuer flow (copy block, vehicle, issuer note, dates)."""
+    reference_id = (lead.get("reference_id") or "N/A").strip()
+    phase1 = _phase1_from_stored_lead(lead)
+    link = (lead.get("encrypted_link") or "").strip()
+    issuer_note = _lead_issuer_note(lead)
+    issue_dt = _dt_from_lead_field(lead.get("issue_date"))
+    exp_dt = _dt_from_lead_field(lead.get("expiration_date"))
+    body = _format_group_lead_message_html(
+        reference_id, phase1, link, issue_dt, exp_dt, issuer_note,
+    )
+    full_html = f"{html_prefix}{body}" if html_prefix else body
+    chat_id = _parse_chat_id(group.get("group_telegram_id"))
+    group_name = group.get("group_name", "")
+    if not chat_id:
+        logger.warning("Cannot post full lead: group %s missing group_telegram_id", group_name)
+        return
+    try:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=full_html, parse_mode="HTML")
+        except Exception as html_err:
+            logger.warning("Full group lead HTML failed for %s: %s", group_name, html_err)
+
+            def _sr(s: str) -> str:
+                return (_sanitize_phones_for_send(s or "") or "").strip() or "-"
+
+            vehicle_safe = "\n".join([
+                _sr(phase1.get("name")),
+                _sr(phase1.get("address")),
+                _sr(phase1.get("city_state_zip")),
+                (phase1.get("vin") or "").strip() or "-",
+                (phase1.get("car") or "").strip() or "-",
+                _sr(phase1.get("color")),
+                _sr(phase1.get("insurance_company")),
+                _sr(phase1.get("insurance_policy_number")),
+                _sr(phase1.get("extra_info")),
+            ])
+            if issuer_note:
+                vehicle_safe += "\n" + _sr("📝 " + issuer_note)
+            iss = issue_dt.strftime("%Y-%m-%d %H:%M") if issue_dt else "N/A"
+            exs = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "N/A"
+            plain = (
+                "✅ Your group claimed this client\n\n"
+                "🏷NEW CLIENT❗️\n\n"
+                f"📋 Reference ID: {reference_id}\n"
+                f"🚗 Vehicle:\n{vehicle_safe}\n\n"
+                f"🔗 Encrypted Link: {link}\n\n"
+                f"📅 Issue Date: {iss}\n"
+                f"⏰ Expires: {exs}"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=plain)
+    except Exception as e:
+        logger.error("Could not send full lead to group %s: %s", group_name, e)
 
 
 def _lead_issuer_note(lead: dict) -> str:
@@ -2786,15 +2882,27 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     # If the sender already went through driver selection, do not DM drivers again.
     if db.lead_has_assignments(lead_id):
         try:
-            await context.bot.send_message(
-                chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                text=(
-                    f"✅ **Your group claimed this lead**\n\n"
-                    f"Reference: `{reference_id}`\n\n"
-                    f"The sender already notified driver(s). This group is now recorded as the accepting group."
-                ),
-                parse_mode="Markdown",
-            )
+            lead_for_group = db.get_lead_by_id(lead_id) or lead
+            if offers:
+                await _send_full_group_lead_to_chat(
+                    context,
+                    group,
+                    lead_for_group,
+                    html_prefix=(
+                        "<b>✅ Your group claimed this client</b>\n"
+                        "<i>Sender already notified driver(s).</i>\n\n"
+                    ),
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    text=(
+                        f"✅ **Your group claimed this lead**\n\n"
+                        f"Reference: `{reference_id}`\n\n"
+                        f"The sender already notified driver(s). This group is now recorded as the accepting group."
+                    ),
+                    parse_mode="Markdown",
+                )
         except Exception as e:
             logger.warning("Could not notify group after accept (assignments already exist): %s", e)
     else:
@@ -2802,18 +2910,15 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         # Do not fan out to drivers from here (avoids requiring group_drivers and duplicate DMs).
         if offers:
             try:
-                await context.bot.send_message(
-                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                    text=(
-                        f"✅ **Your group claimed this lead**\n\n"
-                        f"Reference: `{reference_id}`\n\n"
-                        "The sender is choosing which driver(s) to notify next in their bot chat. "
-                        "Drivers will get the offer there."
-                    ),
-                    parse_mode="Markdown",
+                lead_for_group = db.get_lead_by_id(lead_id) or lead
+                await _send_full_group_lead_to_chat(
+                    context,
+                    group,
+                    lead_for_group,
+                    html_prefix="<b>✅ Your group claimed this client</b>\n\n",
                 )
             except Exception as e:
-                logger.warning("Could not notify group after broadcast accept: %s", e)
+                logger.warning("Could not post full lead to group after broadcast accept: %s", e)
         else:
             count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
                 context, lead, group,
