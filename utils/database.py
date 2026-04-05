@@ -603,24 +603,69 @@ class Database:
             return None
 
     def accept_group_lead_offer(self, lead_id: str, group_id: str, accepted_by_telegram_id: str) -> bool:
-        """Accept a group offer (first group to accept wins); declines all other pending offers."""
+        """Accept a group offer (first group to accept wins); declines all other pending offers.
+
+        Concurrency: a read-then-update race allowed two groups' rows to both become
+        ``accepted``. We now atomically ``UPDATE … WHERE status='pending'`` for this row only,
+        and require DB partial unique index ``(lead_id) WHERE status='accepted'`` so a second
+        group cannot commit accepted (see migration_group_lead_offers_one_accepted_per_lead.sql).
+
+        Idempotency: if this group's row is already ``accepted``, return False so the bot does
+        not re-send notifications.
+        """
         if not self._check_tables_exist():
             return False
         try:
-            existing = self.client.table("group_lead_offers").select("id").eq("lead_id", lead_id).eq("status", "accepted").execute()
-            if existing.data:
+            cur = (
+                self.client.table("group_lead_offers")
+                .select("status")
+                .eq("lead_id", lead_id)
+                .eq("group_id", group_id)
+                .limit(1)
+                .execute()
+            )
+            if not cur.data:
                 return False
-            self.client.table("group_lead_offers").update({
-                "status": "accepted",
-                "accepted_by_telegram_id": str(accepted_by_telegram_id),
-                "accepted_at": "now()",
-            }).eq("lead_id", lead_id).eq("group_id", group_id).execute()
-            self.client.table("group_lead_offers").update({
-                "status": "declined",
-            }).eq("lead_id", lead_id).eq("status", "pending").neq("group_id", group_id).execute()
+            st = (cur.data[0].get("status") or "").lower()
+            if st == "accepted":
+                return False
+            if st != "pending":
+                return False
+
+            self.client.table("group_lead_offers").update(
+                {
+                    "status": "accepted",
+                    "accepted_by_telegram_id": str(accepted_by_telegram_id),
+                    "accepted_at": "now()",
+                }
+            ).eq("lead_id", lead_id).eq("group_id", group_id).eq("status", "pending").execute()
+
+            verify = (
+                self.client.table("group_lead_offers")
+                .select("status")
+                .eq("lead_id", lead_id)
+                .eq("group_id", group_id)
+                .limit(1)
+                .execute()
+            )
+            if not verify.data or verify.data[0].get("status") != "accepted":
+                return False
+
+            self.client.table("group_lead_offers").update({"status": "declined"}).eq(
+                "lead_id", lead_id
+            ).eq("status", "pending").neq("group_id", group_id).execute()
             return True
         except Exception as e:
-            logger.error(f"Error accepting group lead offer: {e}")
+            err = str(e)
+            if "23505" in err or "unique" in err.lower() or "duplicate" in err.lower():
+                logger.info(
+                    "Group lead accept lost race (lead=%s group=%s): %s",
+                    lead_id,
+                    group_id,
+                    err[:200],
+                )
+            else:
+                logger.error(f"Error accepting group lead offer: {e}")
             return False
 
     def decline_group_lead_offer(self, lead_id: str, group_id: str) -> bool:
