@@ -22,7 +22,7 @@ from telegram.ext import (
     ContextTypes
 )
 from config import Config
-from utils.database import Database
+from utils.database import Database, record_is_active
 from utils.onetimesecret import OneTimeSecret
 from utils.monday import MondayClient
 from utils import ai_vision
@@ -142,6 +142,10 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
 def _parse_chat_id(raw: str | int | None) -> int | str | None:
     if raw is None:
         return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
     # Render/GUI copy-paste mistakes sometimes include a leading '=' (e.g. "= -100123...")
     s = str(raw).strip()
     if not s:
@@ -150,6 +154,12 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
     try:
         return int(s)
     except (ValueError, TypeError):
+        try:
+            f = float(s)
+            if f.is_integer():
+                return int(f)
+        except (ValueError, TypeError):
+            pass
         return s
 
 
@@ -225,14 +235,45 @@ async def _send_driver_requests_for_group(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
     group: dict,
-) -> tuple[int, str]:
-    """Send accept/decline requests to drivers assigned to a group. Returns (count, driver_names)."""
+) -> tuple[int, str, str | None]:
+    """Send accept/decline requests to drivers assigned to a group.
+
+    Returns (assigned_count, driver_names, reason_code_or_none). reason_code when count==0:
+    ``no_drivers_linked``, ``all_inactive``, ``all_suspended``, ``missing_telegram``, ``send_failed``.
+    """
     group_id = group.get("id")
-    drivers = db.get_active_drivers_for_group(group_id) if group_id else []
+    group_label = group.get("group_name") or "this group"
+    if not group_id:
+        return (0, "", "no_drivers_linked")
+
+    rows = db.get_group_driver_rows_for_group(group_id)
+    if not rows:
+        logger.warning(
+            "Group %s (%s): no rows in group_drivers — assign drivers in admin",
+            group_label,
+            group_id,
+        )
+        return (0, "", "no_drivers_linked")
+
     suspended = _get_suspended_driver_ids()
-    selected_drivers = [d for d in (drivers or []) if d.get("id") not in suspended]
+    active_rows = [d for d in rows if d and record_is_active(d)]
+    if not active_rows:
+        return (0, "", "all_inactive")
+
+    selected_drivers = [d for d in active_rows if d.get("id") not in suspended]
     if not selected_drivers:
-        return (0, "")
+        return (0, "", "all_suspended")
+
+    without_tg = [d for d in selected_drivers if _parse_chat_id(d.get("driver_telegram_id")) is None]
+    if without_tg and len(without_tg) == len(selected_drivers):
+        names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+        logger.warning(
+            "Group %s: %s driver(s) have no parseable Telegram ID",
+            group_label,
+            len(without_tg),
+        )
+        return (0, names, "missing_telegram")
+
     reference_id = lead.get("reference_id", "N/A")
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
     spec = _lead_driver_note(lead)
@@ -261,7 +302,48 @@ async def _send_driver_requests_for_group(
         except Exception as e:
             logger.error("Error sending driver request to %s: %s", driver.get("driver_name"), e)
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
-    return (assigned_count, driver_names)
+    if assigned_count == 0:
+        return (0, driver_names, "send_failed")
+    return (assigned_count, driver_names, None)
+
+
+def _group_accept_notify_fail_text(reference_id: str, reason: str | None) -> str:
+    """User-visible explanation when group accept did not reach any driver."""
+    ref = f"Reference: `{reference_id}`"
+    if reason == "no_drivers_linked":
+        return (
+            "⚠️ **No drivers are linked to this group** in the admin dashboard.\n\n"
+            "Add drivers under Group ↔ Driver assignments for this team.\n\n"
+            + ref
+        )
+    if reason == "all_inactive":
+        return (
+            "⚠️ **All drivers linked to this group are inactive** in admin.\n\n"
+            "Re-activate a driver or fix assignments.\n\n"
+            + ref
+        )
+    if reason == "all_suspended":
+        return (
+            "⚠️ **All drivers in this group are suspended** (pending receipts penalty).\n\n"
+            "Resolve strikes in admin or notify drivers another way.\n\n"
+            + ref
+        )
+    if reason == "missing_telegram":
+        return (
+            "⚠️ **Drivers in this group have no valid Telegram user ID** in admin.\n\n"
+            "Set each driver’s Telegram ID (numeric) so the bot can DM them.\n\n"
+            + ref
+        )
+    if reason == "send_failed":
+        return (
+            "⚠️ **Could not DM any driver** (Telegram blocked or wrong chat ID).\n\n"
+            "Drivers must open a private chat with the bot and press **Start**.\n\n"
+            + ref
+        )
+    return (
+        "⚠️ **No drivers could be notified** for this group.\n\n"
+        + ref
+    )
 
 
 def generate_reference_id() -> str:
@@ -1519,7 +1601,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     state_data["username"] = username
 
     groups = db.get_all_groups()
-    active_groups = [g for g in groups if g.get("is_active", True)]
+    active_groups = [g for g in groups if record_is_active(g)]
     if not active_groups:
         await update.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
@@ -1538,7 +1620,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
 
     user_telegram_id = str(update.effective_user.id)
     assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
-    if assistant_group and assistant_group.get("is_active", True):
+    if assistant_group and record_is_active(assistant_group):
         selected_group = assistant_group
         group_id = selected_group["id"]
         logger.info(f"User is assistant for group '{selected_group.get('group_name')}'; using that group for lead")
@@ -1555,7 +1637,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     db.set_user_state(user_id, "select_driver", state_data)
 
     drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if d.get("is_active", True)]
+    active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
@@ -1590,10 +1672,10 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
         phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
         groups = db.get_all_groups()
-        active_groups = [g for g in groups if g.get("is_active", True)]
+        active_groups = [g for g in groups if record_is_active(g)]
         # group_id is NOT NULL for driver assignments, so pick a primary group for the lead record.
         primary_group = db.get_group_by_assistant_telegram_id(str(user_id))
-        if not primary_group or not primary_group.get("is_active", True):
+        if not primary_group or not record_is_active(primary_group):
             primary_group = active_groups[0] if active_groups else None
         if not primary_group:
             await query.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
@@ -1696,7 +1778,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data.pop("resend", None)
         db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
-        active_drivers = [d for d in drivers if d.get("is_active", True)]
+        active_drivers = [d for d in drivers if record_is_active(d)]
         if not active_drivers:
             await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
             return ConversationHandler.END
@@ -1729,14 +1811,14 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
     group_id = query.data.replace("select_group_", "")
     selected_group = db.get_group_by_id(group_id)
-    if not selected_group or not selected_group.get("is_active", True):
+    if not selected_group or not record_is_active(selected_group):
         await query.message.reply_text("❌ Group not found or inactive. Please start over with /start")
         return ConversationHandler.END
     lead_data["group_id"] = group_id
     lead_data["selected_group"] = selected_group
     db.set_user_state(user_id, "select_driver", lead_data)
     drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if d.get("is_active", True)]
+    active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
@@ -1787,7 +1869,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # Drivers work for all groups, so get all active drivers
     callback_data = query.data
     all_drivers = db.get_all_drivers()
-    active_drivers = [d for d in all_drivers if d.get('is_active', True)]
+    active_drivers = [d for d in all_drivers if record_is_active(d)]
     
     suspended = _get_suspended_driver_ids()
     if callback_data == "select_driver_all":
@@ -2291,7 +2373,7 @@ async def _handle_resend_to_drivers(
         db.clear_user_state(user_id)
         return ConversationHandler.END
     all_drivers = db.get_all_drivers()
-    active_drivers = [d for d in all_drivers if d.get("is_active", True)]
+    active_drivers = [d for d in all_drivers if record_is_active(d)]
     if callback_data == "select_driver_all":
         selected_drivers = active_drivers
     else:
@@ -2401,7 +2483,7 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     }
     db.set_user_state(user_id, "select_driver", resend_data)
     drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if d.get("is_active", True)]
+    active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await query.message.reply_text("❌ No active drivers found. Please contact admin.")
         return
@@ -2608,7 +2690,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
 
     lead = db.get_lead_by_id(lead_id)
     group = db.get_group_by_id(group_id)
-    if not lead or not group or not group.get("is_active", True):
+    if not lead or not group or not record_is_active(group):
         try:
             await query.message.edit_text("❌ Offer not found or expired.")
         except Exception:
@@ -2688,7 +2770,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.warning("Could not notify group after accept (assignments already exist): %s", e)
     else:
-        count, driver_names = await _send_driver_requests_for_group(context, lead, group)
+        count, driver_names, fail_reason = await _send_driver_requests_for_group(context, lead, group)
         if count > 0:
             await context.bot.send_message(
                 chat_id=_parse_chat_id(group.get("group_telegram_id")),
@@ -2698,7 +2780,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         else:
             await context.bot.send_message(
                 chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                text=f"⚠️ No eligible drivers to notify for this group (inactive/suspended/missing Telegram IDs).\nReference: `{reference_id}`",
+                text=_group_accept_notify_fail_text(reference_id, fail_reason),
                 parse_mode="Markdown",
             )
 
@@ -3189,7 +3271,7 @@ async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id
         "group_escalated_at": "now()",
     })
     groups = db.get_all_groups()
-    active = [g for g in groups if g.get("is_active", True)]
+    active = [g for g in groups if record_is_active(g)]
     original_gid = renewal.get("original_group_id")
     refreshed = db.get_renewal_by_id(renewal_id) or renewal
     for g in active:
@@ -3274,7 +3356,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
 
     # Phase 2: send to original driver first
     sent_to_driver = False
-    if original_driver and original_driver.get("is_active", True):
+    if original_driver and record_is_active(original_driver):
         db.update_renewal(renewal_id, {
             "driver_status": "sent",
             "driver_sent_at": "now()",
@@ -3715,7 +3797,7 @@ def main():
                     "group_sent_at": "now()",
                 })
                 sent = False
-                if original_group and original_group.get("is_active", True):
+                if original_group and record_is_active(original_group):
                     sent = await _send_renewal_to_group(context, renewal, original_group)
 
                 if sent:

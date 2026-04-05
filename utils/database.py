@@ -9,6 +9,17 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 
+def record_is_active(row: Optional[dict], key: str = "is_active") -> bool:
+    """True unless the row explicitly has ``is_active`` = False.
+
+    Supabase/Postgres often returns JSON ``null`` for unset booleans; ``row.get("is_active", True)``
+    would then yield ``None``, which wrongly treated the driver/group as inactive.
+    """
+    if not row:
+        return False
+    return row.get(key) is not False
+
+
 class Database:
     """Supabase database client wrapper."""
     
@@ -399,25 +410,29 @@ class Database:
             logger.error(f"Error getting drivers: {e}")
             return []
     
-    def get_active_drivers_for_group(self, group_id: str) -> list:
-        """Get all active drivers for a specific group."""
+    def get_group_driver_rows_for_group(self, group_id: str) -> list:
+        """All drivers linked to a group via group_drivers (any is_active)."""
         if not self._check_tables_exist():
             return []
-        
         try:
             response = self.client.table("group_drivers").select(
                 "driver:drivers(*)"
             ).eq("group_id", group_id).execute()
-            
-            drivers = []
+            out = []
             for item in response.data or []:
-                driver = item.get('driver')
-                if driver and driver.get('is_active', True):
-                    drivers.append(driver)
-            return drivers
+                driver = item.get("driver")
+                if driver:
+                    out.append(driver)
+            return out
         except Exception as e:
-            logger.error(f"Error getting drivers for group: {e}")
+            logger.error(f"Error getting group driver rows: {e}")
             return []
+
+    def get_active_drivers_for_group(self, group_id: str) -> list:
+        """Get all active drivers for a specific group."""
+        if not self._check_tables_exist():
+            return []
+        return [d for d in self.get_group_driver_rows_for_group(group_id) if record_is_active(d)]
     
     def toggle_driver_status(self, driver_id: str) -> bool:
         """Toggle driver active status."""
