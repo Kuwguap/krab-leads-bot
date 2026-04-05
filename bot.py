@@ -4026,12 +4026,11 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     
-    # Create conversation handler for receipt submission
+    # Receipt flow: callbacks enter the conversation; /receipt, /receipts, /recipts show the
+    # owed-receipts menu. Those commands are fallbacks here (ends receipt flow) and a standalone
+    # handler after conv_handler (so they still work during the main lead conversation).
     receipt_handler = ConversationHandler(
         entry_points=[
-            CommandHandler("receipts", handle_driver_receipts_menu_command),
-            CommandHandler("receipt", handle_driver_receipts_menu_command),
-            CommandHandler("recipts", handle_driver_receipts_menu_command),
             CallbackQueryHandler(handle_driver_receipt_callback, pattern="^driver_receipt$"),
             CallbackQueryHandler(handle_receipt_for_ref_callback, pattern="^receipt_for_"),
         ],
@@ -4040,12 +4039,18 @@ def main():
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
             STATE_WAITING_RECEIPT_IMAGE: [MessageHandler(filters.PHOTO, handle_receipt_image)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
+        ],
     )
-    
-    # Add handlers
-    application.add_handler(conv_handler)
+
     application.add_handler(receipt_handler)
+    application.add_handler(conv_handler)
+    application.add_handler(
+        CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command)
+    )
     
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
