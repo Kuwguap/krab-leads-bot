@@ -1,4 +1,5 @@
 """Main Telegram bot application."""
+import base64
 import io
 import logging
 import os
@@ -7,6 +8,7 @@ import html
 import sys
 import secrets
 import string
+import uuid as _uuid_mod
 from datetime import datetime, time as dt_time
 import pytz
 from typing import Optional
@@ -82,9 +84,20 @@ SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
-_VIN_CONFLICT_INTRO = "Pulling up your Vin with DMV portal🧐\n\n"
+_VIN_CONFLICT_INTRO = (
+    "Pulling up 17 Digit Vin in DMV portal🧐\n\n"
+    "Your Vehicle pulls up in the system!\n"
+)
 
-import base64, uuid as _uuid_mod
+
+def _vin_conflict_body(stated_car: str, api_car: str) -> str:
+    return (
+        f"{_VIN_CONFLICT_INTRO}"
+        f"• VIN result you entered : {stated_car}\n"
+        f"• VIN result in DMV : {api_car}\n\n"
+        "Choose which to use:"
+    )
+
 
 def _short_uuid(u: str) -> str:
     """Compress a UUID string (36 chars) to 22-char base64url (no padding)."""
@@ -194,6 +207,48 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
         except (ValueError, TypeError):
             pass
         return s
+
+
+def _supervisory_delivery_chat_ids(group_supervisory_raw: object) -> list:
+    """Chats for full supervisory copies: per-group supervisory + SUPERVISORY_TELEGRAM_ID, deduped."""
+    seen: set = set()
+    out: list = []
+    for raw in (group_supervisory_raw, Config.SUPERVISORY_TELEGRAM_ID):
+        cid = _parse_chat_id(raw if raw is not None else None)
+        if cid is None:
+            continue
+        if isinstance(cid, int):
+            dedupe_key = cid
+        else:
+            try:
+                dedupe_key = int(str(cid).strip().lstrip("=").split(".", 1)[0])
+            except (ValueError, TypeError):
+                dedupe_key = str(cid)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(cid)
+    return out
+
+
+async def _send_to_supervisory_chats(
+    context: ContextTypes.DEFAULT_TYPE,
+    group_supervisory_raw: object,
+    text: str,
+    *,
+    parse_mode: str | None = "Markdown",
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    for cid in _supervisory_delivery_chat_ids(group_supervisory_raw):
+        try:
+            await context.bot.send_message(
+                chat_id=cid,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            logger.warning("Could not send to supervisory chat %s: %s", cid, e)
 
 
 _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
@@ -593,11 +648,11 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
 
 
 def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
-    """Build keyboard for VIN conflict: keep driver details, use VIN search result, or retype VIN."""
+    """Build keyboard for VIN conflict: DMV result, keep entered vehicle line, or retype VIN."""
     _ = api_car, stated_car  # context shown in message body above the buttons
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Continue with same Vin", callback_data="vin_keep")],
-        [InlineKeyboardButton("Use Vin Lookup", callback_data="vin_use")],
+        [InlineKeyboardButton("Use DMV system VIN", callback_data="vin_use")],
+        [InlineKeyboardButton("Continue with Same Vin", callback_data="vin_keep")],
         [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
     ])
 
@@ -790,10 +845,7 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await message.reply_text(
-            f"{_VIN_CONFLICT_INTRO}"
-            f"• Driver details in lead: {stated_car}\n"
-            f"• VIN lookup result: {api_car}\n\n"
-            "Choose which to use:",
+            _vin_conflict_body(stated_car, api_car),
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
@@ -1030,8 +1082,9 @@ async def _send_full_group_lead_to_chat(
     lead: dict,
     *,
     html_prefix: str | None = None,
+    mirror_supervisory: bool = False,
 ) -> None:
-    """Post the same detailed HTML lead as the issuer flow (copy block, vehicle, issuer note, dates)."""
+    """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s)."""
     reference_id = (lead.get("reference_id") or "N/A").strip()
     phase1 = _phase1_from_stored_lead(lead)
     link = (lead.get("encrypted_link") or "").strip()
@@ -1044,45 +1097,65 @@ async def _send_full_group_lead_to_chat(
     full_html = f"{html_prefix}{body}" if html_prefix else body
     chat_id = _parse_chat_id(group.get("group_telegram_id"))
     group_name = group.get("group_name", "")
-    if not chat_id:
-        logger.warning("Cannot post full lead: group %s missing group_telegram_id", group_name)
+    sup_ids = (
+        _supervisory_delivery_chat_ids(group.get("supervisory_telegram_id"))
+        if mirror_supervisory
+        else []
+    )
+
+    def _plain_fallback() -> str:
+        def _sr(s: str) -> str:
+            return (_sanitize_phones_for_send(s or "") or "").strip() or "-"
+
+        vehicle_safe = "\n".join([
+            _sr(phase1.get("name")),
+            _sr(phase1.get("address")),
+            _sr(phase1.get("city_state_zip")),
+            (phase1.get("vin") or "").strip() or "-",
+            (phase1.get("car") or "").strip() or "-",
+            _sr(phase1.get("color")),
+            _sr(phase1.get("insurance_company")),
+            _sr(phase1.get("insurance_policy_number")),
+            _sr(phase1.get("extra_info")),
+        ])
+        if issuer_note:
+            vehicle_safe += "\n" + _sr("📝 " + issuer_note)
+        iss = issue_dt.strftime("%Y-%m-%d %H:%M") if issue_dt else "N/A"
+        exs = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "N/A"
+        return (
+            "✅ Your group claimed this client\n\n"
+            "🏷NEW CLIENT❗️\n\n"
+            f"📋 Reference ID: {reference_id}\n"
+            f"🚗 Vehicle:\n{vehicle_safe}\n\n"
+            f"🔗 Encrypted Link: {link}\n\n"
+            f"📅 Issue Date: {iss}\n"
+            f"⏰ Expires: {exs}"
+        )
+
+    targets: list[tuple] = []
+    if chat_id:
+        targets.append((chat_id, group_name or "group"))
+    for sid in sup_ids:
+        targets.append((sid, f"supervisory {sid}"))
+    if not targets:
+        logger.warning(
+            "Cannot post full lead: group %s missing group_telegram_id and no supervisory targets",
+            group_name,
+        )
         return
-    try:
+
+    async def _post_one(target_cid, label: str) -> None:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=full_html, parse_mode="HTML")
-        except Exception as html_err:
-            logger.warning("Full group lead HTML failed for %s: %s", group_name, html_err)
+            try:
+                await context.bot.send_message(chat_id=target_cid, text=full_html, parse_mode="HTML")
+            except Exception as html_err:
+                logger.warning("Full lead HTML failed for %s: %s", label, html_err)
+                await context.bot.send_message(chat_id=target_cid, text=_plain_fallback())
+        except Exception as e:
+            logger.error("Could not send full lead to %s: %s", label, e)
 
-            def _sr(s: str) -> str:
-                return (_sanitize_phones_for_send(s or "") or "").strip() or "-"
-
-            vehicle_safe = "\n".join([
-                _sr(phase1.get("name")),
-                _sr(phase1.get("address")),
-                _sr(phase1.get("city_state_zip")),
-                (phase1.get("vin") or "").strip() or "-",
-                (phase1.get("car") or "").strip() or "-",
-                _sr(phase1.get("color")),
-                _sr(phase1.get("insurance_company")),
-                _sr(phase1.get("insurance_policy_number")),
-                _sr(phase1.get("extra_info")),
-            ])
-            if issuer_note:
-                vehicle_safe += "\n" + _sr("📝 " + issuer_note)
-            iss = issue_dt.strftime("%Y-%m-%d %H:%M") if issue_dt else "N/A"
-            exs = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "N/A"
-            plain = (
-                "✅ Your group claimed this client\n\n"
-                "🏷NEW CLIENT❗️\n\n"
-                f"📋 Reference ID: {reference_id}\n"
-                f"🚗 Vehicle:\n{vehicle_safe}\n\n"
-                f"🔗 Encrypted Link: {link}\n\n"
-                f"📅 Issue Date: {iss}\n"
-                f"⏰ Expires: {exs}"
-            )
-            await context.bot.send_message(chat_id=chat_id, text=plain)
-    except Exception as e:
-        logger.error("Could not send full lead to group %s: %s", group_name, e)
+    for tid, label in targets:
+        await _post_one(tid, label)
 
 
 def _lead_issuer_note(lead: dict) -> str:
@@ -1261,10 +1334,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             context.user_data["vin_choice_stated_car"] = stated_car
             keyboard = _vin_choice_keyboard(api_car, stated_car)
             await update.message.reply_text(
-                f"{_VIN_CONFLICT_INTRO}"
-                f"• Driver details in lead: {stated_car}\n"
-                f"• VIN lookup result: {api_car}\n\n"
-                "Choose which to use:",
+                _vin_conflict_body(stated_car, api_car),
                 reply_markup=keyboard,
                 parse_mode="Markdown",
             )
@@ -1587,10 +1657,7 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
-            f"{_VIN_CONFLICT_INTRO}"
-            f"• Driver details in lead: {stated_car}\n"
-            f"• VIN lookup result: {api_car}\n\n"
-            "Choose which to use:",
+            _vin_conflict_body(stated_car, api_car),
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
@@ -1655,10 +1722,7 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
-            f"{_VIN_CONFLICT_INTRO}"
-            f"• Driver details in lead: {stated_car}\n"
-            f"• VIN lookup result: {api_car}\n\n"
-            "Choose which to use:",
+            _vin_conflict_body(stated_car, api_car),
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
@@ -2343,6 +2407,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     logger.info(f"Sent lead request to {assigned_count} drivers")
     
+    group_telegram_id_raw = selected_group.get("group_telegram_id")
     # Send to Group (detailed message without user, phone, and price).
     # Broadcast winner already received full HTML on group Accept — do not post again to another chat.
     if skip_duplicate_full_group_post:
@@ -2351,7 +2416,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             lead.get("id"),
         )
     else:
-        group_telegram_id_raw = selected_group.get('group_telegram_id')
         group_name = selected_group.get('group_name', 'N/A')
         if not group_telegram_id_raw:
             logger.warning(
@@ -2386,41 +2450,26 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     "Ensure the bot is added to the group and has permission to post."
                 )
     
-    # Supervisory message with reference ID (use group's supervisory ID)
-    supervisory_telegram_id = selected_group.get('supervisory_telegram_id')
+    # Supervisory: full log with phone and price — per-group supervisory + SUPERVISORY_TELEGRAM_ID (deduped)
+    supervisory_telegram_id = selected_group.get("supervisory_telegram_id")
     supervisory_message = (
         f"{full_message}\n\n"
         f"👥 Group: {selected_group.get('group_name', 'N/A')}"
     )
-    
-    # Create inline keyboard for supervisory (same receipt button)
     supervisory_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
     ])
-    
-    # Send to Supervisory (full log with phone and price)
-    if supervisory_telegram_id:
-        try:
-            sup_chat_id = int(str(supervisory_telegram_id).strip())
-        except (ValueError, TypeError):
-            sup_chat_id = supervisory_telegram_id
-        try:
-            await context.bot.send_message(
-                chat_id=sup_chat_id,
-                text=supervisory_message,
-                parse_mode="Markdown",
-                reply_markup=supervisory_keyboard
-            )
-        except Exception as e:
-            logger.error(f"Error sending to supervisory (chat_id={sup_chat_id}): {e!r}")
-    
-    # Forward attached files to group and supervisory
+    await _send_to_supervisory_chats(
+        context,
+        supervisory_telegram_id,
+        supervisory_message,
+        reply_markup=supervisory_keyboard,
+    )
+
+    # Forward attached files to group and every supervisory chat
     attached_files = phase1_data.get("attached_files") or []
     _group_cid = _parse_chat_id(group_telegram_id_raw)
-    try:
-        _sup_cid = int(str(supervisory_telegram_id).strip()) if supervisory_telegram_id else None
-    except (ValueError, TypeError):
-        _sup_cid = None
+    _sup_cids = _supervisory_delivery_chat_ids(supervisory_telegram_id)
     for f in attached_files:
         ftype = f.get("type")
         fid = f.get("file_id")
@@ -2431,10 +2480,11 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 await context.bot.send_photo(chat_id=_group_cid, photo=fid)
             elif ftype == "document" and _group_cid:
                 await context.bot.send_document(chat_id=_group_cid, document=fid)
-            if ftype == "photo" and _sup_cid:
-                await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
-            elif ftype == "document" and _sup_cid:
-                await context.bot.send_document(chat_id=_sup_cid, document=fid)
+            for _sup_cid in _sup_cids:
+                if ftype == "photo":
+                    await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
+                elif ftype == "document":
+                    await context.bot.send_document(chat_id=_sup_cid, document=fid)
         except Exception as e:
             logger.warning("Could not forward attached file to group/supervisory: %s", e)
     
@@ -2803,28 +2853,35 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(ref_buttons),
             )
-        # Forward acceptance message to group
+        # Forward acceptance message to group and supervisory (global + per-group)
+        extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+        spec_grp = _lead_issuer_note(lead)
+        acceptance_message = (
+            "✅ **Lead Accepted**\n\n"
+            f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
+            f"📝 Extra info: {extra_safe}\n"
+            f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
+        )
+        if spec_grp:
+            acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
         if group:
-            group_telegram_id = group.get('group_telegram_id')
+            group_telegram_id = group.get("group_telegram_id")
             if group_telegram_id:
                 try:
-                    extra_safe = _sanitize_phones_for_send(lead.get('extra_info') or '')
-                    spec_grp = _lead_issuer_note(lead)
-                    acceptance_message = (
-                        "✅ **Lead Accepted**\n\n"
-                        f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
-                        f"📝 Extra info: {extra_safe}\n"
-                        f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
-                    )
-                    if spec_grp:
-                        acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
                     await context.bot.send_message(
                         chat_id=group_telegram_id,
                         text=acceptance_message,
-                        parse_mode="Markdown"
+                        parse_mode="Markdown",
                     )
                 except Exception as e:
                     logger.error(f"Error forwarding acceptance to group: {e}")
+            await _send_to_supervisory_chats(
+                context,
+                group.get("supervisory_telegram_id"),
+                acceptance_message,
+            )
+        else:
+            await _send_to_supervisory_chats(context, None, acceptance_message)
         # Schedule 28-day renewal
         try:
             from datetime import datetime, timedelta, timezone as _tz
@@ -3015,16 +3072,21 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         "<b>✅ Your group claimed this client</b>\n"
                         "<i>Sender already notified driver(s).</i>\n\n"
                     ),
+                    mirror_supervisory=True,
                 )
             else:
+                _claimed_txt = (
+                    f"✅ **Your group claimed this lead**\n\n"
+                    f"Reference: `{reference_id}`\n\n"
+                    f"The sender already notified driver(s). This group is now recorded as the accepting group."
+                )
                 await context.bot.send_message(
                     chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                    text=(
-                        f"✅ **Your group claimed this lead**\n\n"
-                        f"Reference: `{reference_id}`\n\n"
-                        f"The sender already notified driver(s). This group is now recorded as the accepting group."
-                    ),
+                    text=_claimed_txt,
                     parse_mode="Markdown",
+                )
+                await _send_to_supervisory_chats(
+                    context, group.get("supervisory_telegram_id"), _claimed_txt
                 )
         except Exception as e:
             logger.warning("Could not notify group after accept (assignments already exist): %s", e)
@@ -3039,6 +3101,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     group,
                     lead_for_group,
                     html_prefix="<b>✅ Your group claimed this client</b>\n\n",
+                    mirror_supervisory=True,
                 )
             except Exception as e:
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
@@ -3047,16 +3110,24 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 context, lead, group,
             )
             if count > 0:
+                _drv_txt = f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`"
                 await context.bot.send_message(
                     chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                    text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
+                    text=_drv_txt,
                     parse_mode="Markdown",
                 )
+                await _send_to_supervisory_chats(
+                    context, group.get("supervisory_telegram_id"), _drv_txt
+                )
             else:
+                _fail_txt = _group_accept_notify_fail_text(reference_id, fail_reason, driver_scope)
                 await context.bot.send_message(
                     chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                    text=_group_accept_notify_fail_text(reference_id, fail_reason, driver_scope),
+                    text=_fail_txt,
                     parse_mode="Markdown",
+                )
+                await _send_to_supervisory_chats(
+                    context, group.get("supervisory_telegram_id"), _fail_txt
                 )
 
 
@@ -3371,31 +3442,30 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         if global_sup:
             _receipt_sent.add(global_sup)
 
-        if group and (group.get("supervisory_telegram_id") or "").strip():
+        for sup_chat_id in _supervisory_delivery_chat_ids(
+            group.get("supervisory_telegram_id") if group else None
+        ):
+            if sup_chat_id in _receipt_sent:
+                continue
+            _receipt_sent.add(sup_chat_id)
             try:
-                sup_chat_id = int(str(group["supervisory_telegram_id"]).strip())
-            except (ValueError, TypeError):
-                sup_chat_id = None
-            if sup_chat_id and sup_chat_id not in _receipt_sent:
-                _receipt_sent.add(sup_chat_id)
+                await context.bot.send_photo(
+                    chat_id=sup_chat_id,
+                    photo=photo.file_id,
+                    caption=receipt_caption,
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("Could not send receipt photo to supervisory %s: %s", sup_chat_id, e)
                 try:
-                    await context.bot.send_photo(
+                    await context.bot.send_message(
                         chat_id=sup_chat_id,
-                        photo=photo.file_id,
-                        caption=receipt_caption,
+                        text=receipt_link_fallback,
                         parse_mode="Markdown",
+                        disable_web_page_preview=True,
                     )
-                except Exception as e:
-                    logger.warning("Could not send receipt photo to supervisory %s: %s", sup_chat_id, e)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=sup_chat_id,
-                            text=receipt_link_fallback,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception as e2:
-                        logger.warning("Could not send receipt notification to supervisory %s: %s", sup_chat_id, e2)
+                except Exception as e2:
+                    logger.warning("Could not send receipt notification to supervisory %s: %s", sup_chat_id, e2)
         st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
         if st_telegram_id:
             try:
