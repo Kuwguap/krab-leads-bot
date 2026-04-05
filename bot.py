@@ -92,6 +92,35 @@ def _long_uuid(s: str) -> str:
     return str(_uuid_mod.UUID(bytes=base64.urlsafe_b64decode(padded)))
 
 
+# Unpadded base64url of 16 bytes is always 22 characters; alphabet includes "_" and "-".
+_SHORT_UUID_B64URL_LEN = 22
+
+
+def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str] | None:
+    """Unpack two short UUID tokens from callback_data.
+
+    Canonical form is ``prefix + token1 + token2`` (44 chars of id payload) so an
+    underscore inside a token does not break parsing. Legacy form ``tok1_tok2`` is
+    accepted only when both parts are exactly 22 chars (old buttons with no ``_``
+    inside tokens).
+    """
+    if not callback_data.startswith(prefix):
+        return None
+    body = callback_data[len(prefix) :]
+    L = _SHORT_UUID_B64URL_LEN
+    if len(body) == L * 2:
+        return body[:L], body[L:]
+    if len(body) >= L * 2 + 1 and body[L] == "_":
+        second = body[L + 1 : L + 1 + L]
+        if len(second) == L:
+            return body[:L], second
+    if "_" in body:
+        a, b = body.split("_", 1)
+        if len(a) == L and len(b) == L:
+            return a, b
+    return None
+
+
 def _get_suspended_driver_ids() -> set:
     """Driver IDs with 3+ pending receipts (suspended)."""
     suspended = set()
@@ -1847,8 +1876,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 continue
             short_gid = _short_uuid(gid)
             offer_kb_by_group[gid] = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}_{short_gid}"),
-                InlineKeyboardButton("❌ Decline", callback_data=f"dg_{short_lead}_{short_gid}"),
+                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}{short_gid}"),
+                InlineKeyboardButton("❌ Decline", callback_data=f"dg_{short_lead}{short_gid}"),
             ]])
         sent_count = 0
         failures: list[tuple[str, str]] = []
@@ -2803,9 +2832,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     """Handle a group member accepting a broadcast lead offer."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("ag_", "")
+    pair = _parse_paired_short_uuids(query.data, "ag_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_lead, short_group = pair
     try:
-        short_lead, short_group = raw.split("_", 1)
         lead_id = _long_uuid(short_lead)
         group_id = _long_uuid(short_group)
     except (ValueError, Exception):
@@ -2941,9 +2973,12 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
     """Handle a group member declining a broadcast lead offer (for that group only)."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("dg_", "")
+    pair = _parse_paired_short_uuids(query.data, "dg_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_lead, short_group = pair
     try:
-        short_lead, short_group = raw.split("_", 1)
         lead_id = _long_uuid(short_lead)
         group_id = _long_uuid(short_group)
     except (ValueError, Exception):
@@ -3370,8 +3405,8 @@ async def _send_renewal_to_group(context: ContextTypes.DEFAULT_TYPE, renewal: di
     short_r = _short_uuid(renewal["id"])
     short_g = _short_uuid(group["id"])
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=f"rga_{short_r}_{short_g}"),
-        InlineKeyboardButton("🔄 Reassign", callback_data=f"rgr_{short_r}_{short_g}"),
+        InlineKeyboardButton("✅ Accept", callback_data=f"rga_{short_r}{short_g}"),
+        InlineKeyboardButton("🔄 Reassign", callback_data=f"rgr_{short_r}{short_g}"),
     ]])
     text = _build_renewal_group_message(renewal)
     try:
@@ -3394,8 +3429,8 @@ async def _send_renewal_to_driver(context: ContextTypes.DEFAULT_TYPE, renewal: d
     short_r = _short_uuid(renewal["id"])
     short_d = _short_uuid(driver["id"])
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}_{short_d}"),
-        InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}_{short_d}"),
+        InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}{short_d}"),
+        InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}{short_d}"),
     ]])
     text = _build_renewal_driver_message(renewal)
     try:
@@ -3461,9 +3496,12 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     """Group member taps Accept on a renewal offer."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("rga_", "")
+    pair = _parse_paired_short_uuids(query.data, "rga_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_r, short_g = pair
     try:
-        short_r, short_g = raw.split("_", 1)
         renewal_id = _long_uuid(short_r)
         group_id = _long_uuid(short_g)
     except (ValueError, Exception):
@@ -3534,11 +3572,14 @@ async def handle_renewal_group_reassign(update: Update, context: ContextTypes.DE
     """Group member taps Reassign — immediately escalate to other groups."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("rgr_", "")
+    pair = _parse_paired_short_uuids(query.data, "rgr_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_r, short_g = pair
     try:
-        short_r, short_g = raw.split("_", 1)
         renewal_id = _long_uuid(short_r)
-        group_id = _long_uuid(short_g)
+        _long_uuid(short_g)  # validate group id in payload
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
@@ -3568,9 +3609,12 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
     """Driver taps Accept on a renewal delivery."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("rda_", "")
+    pair = _parse_paired_short_uuids(query.data, "rda_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_r, short_d = pair
     try:
-        short_r, short_d = raw.split("_", 1)
         renewal_id = _long_uuid(short_r)
         driver_id = _long_uuid(short_d)
     except (ValueError, Exception):
@@ -3663,11 +3707,14 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
     """Driver taps Reassign — immediately escalate to other drivers."""
     query = update.callback_query
     await query.answer()
-    raw = query.data.replace("rdr_", "")
+    pair = _parse_paired_short_uuids(query.data, "rdr_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_r, short_d = pair
     try:
-        short_r, short_d = raw.split("_", 1)
         renewal_id = _long_uuid(short_r)
-        driver_id = _long_uuid(short_d)
+        _long_uuid(short_d)  # validate second token (driver id in button payload)
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
