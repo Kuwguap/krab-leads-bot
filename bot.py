@@ -235,49 +235,41 @@ async def _send_driver_requests_for_group(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
     group: dict,
-) -> tuple[int, str, str | None, str | None]:
-    """Send accept/decline requests to drivers assigned to a group.
+) -> tuple[int, str, str | None, str]:
+    """Send accept/decline requests after a group claims a broadcast lead.
 
-    Returns (assigned_count, driver_names, fail_reason_or_none, success_note_or_none).
-    If ``group_drivers`` is empty, falls back to **all** active non-suspended drivers (same pool as issuer “send to all”).
+    Uses drivers linked in ``group_drivers`` when present; otherwise the same global pool
+    as issuer driver pick ("Drivers work for all groups") — no admin Group↔Driver rows required.
 
-    fail_reason when count==0: ``no_drivers_linked``, ``all_inactive``, ``all_suspended``,
-    ``missing_telegram``, ``send_failed``.
-    success_note when count>0: optional extra line for the group chat (e.g. fallback used).
+    Returns (assigned_count, driver_names, reason_code_or_none, scope) where scope is
+    ``group_linked`` or ``all_drivers``.
     """
     group_id = group.get("id")
     group_label = group.get("group_name") or "this group"
     if not group_id:
-        return (0, "", "no_drivers_linked", None)
+        return (0, "", "no_drivers_linked", "group_linked")
 
-    rows = db.get_group_driver_rows_for_group(group_id)
-    used_global_fallback = False
-    if not rows:
-        rows = [d for d in (db.get_all_drivers() or []) if d]
-        used_global_fallback = bool(rows)
-        if used_global_fallback:
-            logger.warning(
-                "Group %s (%s): no group_drivers rows — notifying all %s active-driver pool driver(s)",
+    linked_rows = db.get_group_driver_rows_for_group(group_id)
+    if linked_rows:
+        rows = linked_rows
+        scope = "group_linked"
+    else:
+        rows = [d for d in db.get_all_drivers() if d]
+        scope = "all_drivers"
+        if rows:
+            logger.info(
+                "Group '%s': no Group↔Driver assignments; notifying all active drivers (issuer-style pool).",
                 group_label,
-                group_id,
-                len(rows),
             )
-        if not rows:
-            logger.warning(
-                "Group %s (%s): no group_drivers and no drivers in database",
-                group_label,
-                group_id,
-            )
-            return (0, "", "no_drivers_linked", None)
 
     suspended = _get_suspended_driver_ids()
     active_rows = [d for d in rows if d and record_is_active(d)]
     if not active_rows:
-        return (0, "", "no_active_drivers" if used_global_fallback else "all_inactive", None)
+        return (0, "", "all_inactive", scope)
 
     selected_drivers = [d for d in active_rows if d.get("id") not in suspended]
     if not selected_drivers:
-        return (0, "", "all_suspended_everywhere" if used_global_fallback else "all_suspended", None)
+        return (0, "", "all_suspended", scope)
 
     without_tg = [d for d in selected_drivers if _parse_chat_id(d.get("driver_telegram_id")) is None]
     if without_tg and len(without_tg) == len(selected_drivers):
@@ -287,12 +279,7 @@ async def _send_driver_requests_for_group(
             group_label,
             len(without_tg),
         )
-        return (
-            0,
-            names,
-            "missing_telegram_everywhere" if used_global_fallback else "missing_telegram",
-            None,
-        )
+        return (0, names, "missing_telegram", scope)
 
     reference_id = lead.get("reference_id", "N/A")
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
@@ -323,58 +310,56 @@ async def _send_driver_requests_for_group(
             logger.error("Error sending driver request to %s: %s", driver.get("driver_name"), e)
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
     if assigned_count == 0:
-        return (0, driver_names, "send_failed", None)
-    success_note = None
-    if used_global_fallback:
-        success_note = (
-            "\n\nℹ️ _This group had no drivers linked in admin — **all active drivers** were notified._"
-        )
-    return (assigned_count, driver_names, None, success_note)
+        return (0, driver_names, "send_failed", scope)
+    return (assigned_count, driver_names, None, scope)
 
 
-def _group_accept_notify_fail_text(reference_id: str, reason: str | None) -> str:
+def _group_accept_notify_fail_text(
+    reference_id: str, reason: str | None, scope: str = "group_linked",
+) -> str:
     """User-visible explanation when group accept did not reach any driver."""
     ref = f"Reference: `{reference_id}`"
+    global_pool = scope == "all_drivers"
     if reason == "no_drivers_linked":
         return (
-            "⚠️ **No drivers to notify**: this group has no driver links **and** there are no drivers in the system.\n\n"
-            "Add drivers in admin, then link them under Group ↔ Driver assignments.\n\n"
+            "⚠️ **No drivers are linked to this group** in the admin dashboard.\n\n"
+            "Add drivers under Group ↔ Driver assignments for this team.\n\n"
             + ref
         )
     if reason == "all_inactive":
+        if global_pool:
+            return (
+                "⚠️ **No active drivers** in the system (admin).\n\n"
+                "Add or re-activate drivers.\n\n"
+                + ref
+            )
         return (
             "⚠️ **All drivers linked to this group are inactive** in admin.\n\n"
             "Re-activate a driver or fix assignments.\n\n"
             + ref
         )
-    if reason == "no_active_drivers":
-        return (
-            "⚠️ **No active drivers** in the admin roster (this group had no driver links, so the bot used the full list).\n\n"
-            "Activate at least one driver in admin.\n\n"
-            + ref
-        )
     if reason == "all_suspended":
+        if global_pool:
+            return (
+                "⚠️ **Every driver is suspended** (pending receipts penalty).\n\n"
+                "Resolve strikes in admin.\n\n"
+                + ref
+            )
         return (
             "⚠️ **All drivers in this group are suspended** (pending receipts penalty).\n\n"
             "Resolve strikes in admin or notify drivers another way.\n\n"
             + ref
         )
-    if reason == "all_suspended_everywhere":
-        return (
-            "⚠️ **Every driver is suspended** (receipt penalty). This group also had no driver links.\n\n"
-            "Resolve strikes in admin.\n\n"
-            + ref
-        )
     if reason == "missing_telegram":
+        if global_pool:
+            return (
+                "⚠️ **No driver has a valid Telegram user ID** in admin.\n\n"
+                "Set each driver’s numeric Telegram ID so the bot can DM them.\n\n"
+                + ref
+            )
         return (
             "⚠️ **Drivers in this group have no valid Telegram user ID** in admin.\n\n"
             "Set each driver’s Telegram ID (numeric) so the bot can DM them.\n\n"
-            + ref
-        )
-    if reason == "missing_telegram_everywhere":
-        return (
-            "⚠️ **No driver has a valid Telegram user ID** in admin (group had no links; full roster checked).\n\n"
-            "Set numeric Telegram IDs for your drivers.\n\n"
             + ref
         )
     if reason == "send_failed":
@@ -2813,22 +2798,38 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.warning("Could not notify group after accept (assignments already exist): %s", e)
     else:
-        count, driver_names, fail_reason, success_note = await _send_driver_requests_for_group(context, lead, group)
-        if count > 0:
-            body = f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`"
-            if success_note:
-                body += success_note
-            await context.bot.send_message(
-                chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                text=body,
-                parse_mode="Markdown",
-            )
+        # Multi-group broadcast: offers exist; issuer is already in the flow to pick driver(s) in DM.
+        # Do not fan out to drivers from here (avoids requiring group_drivers and duplicate DMs).
+        if offers:
+            try:
+                await context.bot.send_message(
+                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    text=(
+                        f"✅ **Your group claimed this lead**\n\n"
+                        f"Reference: `{reference_id}`\n\n"
+                        "The sender is choosing which driver(s) to notify next in their bot chat. "
+                        "Drivers will get the offer there."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("Could not notify group after broadcast accept: %s", e)
         else:
-            await context.bot.send_message(
-                chat_id=_parse_chat_id(group.get("group_telegram_id")),
-                text=_group_accept_notify_fail_text(reference_id, fail_reason),
-                parse_mode="Markdown",
+            count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
+                context, lead, group,
             )
+            if count > 0:
+                await context.bot.send_message(
+                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    text=_group_accept_notify_fail_text(reference_id, fail_reason, driver_scope),
+                    parse_mode="Markdown",
+                )
 
 
 async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
