@@ -79,6 +79,10 @@ monday = MondayClient() if Config.is_monday_configured() else None
 
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 
+# Clears inline keyboards on broadcast offer messages after accept/decline/taken
+_EMPTY_INLINE_KB = InlineKeyboardMarkup([])
+
+_VIN_CONFLICT_INTRO = "Pulling up your Vin with DMV portal🧐\n\n"
 
 import base64, uuid as _uuid_mod
 
@@ -786,7 +790,7 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await message.reply_text(
-            "⚠️ **VIN returned different car than stated**\n\n"
+            f"{_VIN_CONFLICT_INTRO}"
             f"• Driver details in lead: {stated_car}\n"
             f"• VIN lookup result: {api_car}\n\n"
             "Choose which to use:",
@@ -1257,7 +1261,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             context.user_data["vin_choice_stated_car"] = stated_car
             keyboard = _vin_choice_keyboard(api_car, stated_car)
             await update.message.reply_text(
-                "⚠️ **VIN returned different car than stated**\n\n"
+                f"{_VIN_CONFLICT_INTRO}"
                 f"• Driver details in lead: {stated_car}\n"
                 f"• VIN lookup result: {api_car}\n\n"
                 "Choose which to use:",
@@ -1583,7 +1587,7 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
-            "⚠️ **VIN returned different car than stated**\n\n"
+            f"{_VIN_CONFLICT_INTRO}"
             f"• Driver details in lead: {stated_car}\n"
             f"• VIN lookup result: {api_car}\n\n"
             "Choose which to use:",
@@ -1651,7 +1655,7 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
         await update.message.reply_text(
-            "⚠️ **VIN returned different car than stated**\n\n"
+            f"{_VIN_CONFLICT_INTRO}"
             f"• Driver details in lead: {stated_car}\n"
             f"• VIN lookup result: {api_car}\n\n"
             "Choose which to use:",
@@ -2147,6 +2151,15 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
 
+    had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
+    if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
+        won_gid = lead["group_id"]
+        group_id = won_gid
+        won_group = db.get_group_by_id(won_gid)
+        if won_group:
+            selected_group = won_group
+    skip_duplicate_full_group_post = bool(lead_data.get("follow_after_broadcast") and had_broadcast_offers)
+
     issuer_note_disp = (
         (lead_data.get("special_request_issuers") or lead.get("special_request_issuers")
          or lead_data.get("special_request_note") or lead.get("special_request_note") or "").strip()
@@ -2330,41 +2343,48 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     logger.info(f"Sent lead request to {assigned_count} drivers")
     
-    # Send to Group (detailed message without user, phone, and price)
-    group_telegram_id_raw = selected_group.get('group_telegram_id')
-    group_name = selected_group.get('group_name', 'N/A')
-    if not group_telegram_id_raw:
-        logger.warning(
-            f"No group_telegram_id for group '{group_name}' (id={selected_group.get('id')}). "
-            "Lead not sent to group. Check the group record in admin."
+    # Send to Group (detailed message without user, phone, and price).
+    # Broadcast winner already received full HTML on group Accept — do not post again to another chat.
+    if skip_duplicate_full_group_post:
+        logger.info(
+            "Skipping full group HTML post: broadcast lead %s — winner already notified on accept.",
+            lead.get("id"),
         )
     else:
-        group_chat_id = _parse_chat_id(group_telegram_id_raw)
-        try:
-            logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
-            try:
-                await context.bot.send_message(
-                    chat_id=group_chat_id, text=group_message, parse_mode="HTML",
-                )
-            except Exception as html_err:
-                logger.warning(
-                    "Group lead HTML send failed for %s, retrying plain: %s",
-                    group_name,
-                    html_err,
-                )
-                plain_fallback = (
-                    f"🏷NEW CLIENT❗️\n\n📋 Reference ID: {reference_id}\n🚗 Vehicle:\n{vehicle_safe}\n\n"
-                    f"🔗 Encrypted Link: {encrypted_data.get('link')}\n\n"
-                    f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
-                    f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
-                )
-                await context.bot.send_message(chat_id=group_chat_id, text=plain_fallback)
-            logger.info(f"Lead sent to group '{group_name}' successfully")
-        except Exception as e:
-            logger.error(
-                f"Error sending to group '{group_name}' (chat_id={group_chat_id}): {e!r}. "
-                "Ensure the bot is added to the group and has permission to post."
+        group_telegram_id_raw = selected_group.get('group_telegram_id')
+        group_name = selected_group.get('group_name', 'N/A')
+        if not group_telegram_id_raw:
+            logger.warning(
+                f"No group_telegram_id for group '{group_name}' (id={selected_group.get('id')}). "
+                "Lead not sent to group. Check the group record in admin."
             )
+        else:
+            group_chat_id = _parse_chat_id(group_telegram_id_raw)
+            try:
+                logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
+                try:
+                    await context.bot.send_message(
+                        chat_id=group_chat_id, text=group_message, parse_mode="HTML",
+                    )
+                except Exception as html_err:
+                    logger.warning(
+                        "Group lead HTML send failed for %s, retrying plain: %s",
+                        group_name,
+                        html_err,
+                    )
+                    plain_fallback = (
+                        f"🏷NEW CLIENT❗️\n\n📋 Reference ID: {reference_id}\n🚗 Vehicle:\n{vehicle_safe}\n\n"
+                        f"🔗 Encrypted Link: {encrypted_data.get('link')}\n\n"
+                        f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
+                        f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
+                    )
+                    await context.bot.send_message(chat_id=group_chat_id, text=plain_fallback)
+                logger.info(f"Lead sent to group '{group_name}' successfully")
+            except Exception as e:
+                logger.error(
+                    f"Error sending to group '{group_name}' (chat_id={group_chat_id}): {e!r}. "
+                    "Ensure the bot is added to the group and has permission to post."
+                )
     
     # Supervisory message with reference ID (use group's supervisory ID)
     supervisory_telegram_id = selected_group.get('supervisory_telegram_id')
@@ -2888,21 +2908,50 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     group = db.get_group_by_id(group_id)
     if not lead or not group or not record_is_active(group):
         try:
-            await query.message.edit_text("❌ Offer not found or expired.")
+            await query.message.edit_text(
+                "❌ Offer not found or expired.",
+                reply_markup=_EMPTY_INLINE_KB,
+            )
         except Exception:
             pass
         return
 
     accepted = db.accept_group_lead_offer(lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
     if not accepted:
-        # Someone else already accepted.
+        # Someone else already accepted — refresh every group's message so Accept is gone everywhere.
         accepted_row = db.get_accepted_group_for_lead(lead_id)
         accepted_group = db.get_group_by_id(accepted_row.get("group_id")) if accepted_row else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
-        try:
-            await query.message.edit_text(f"❌ **Taken**\n\nThis lead was accepted by **{gname}**.", parse_mode="Markdown")
-        except Exception:
-            pass
+        win_gid = accepted_row.get("group_id") if accepted_row else None
+        ref_show = lead.get("reference_id", "N/A")
+        for o in db.get_group_lead_offers(lead_id):
+            ocid = _parse_chat_id(o.get("group_chat_id"))
+            mid = o.get("group_message_id")
+            ogid = o.get("group_id")
+            if not ocid or not mid:
+                continue
+            try:
+                if win_gid and ogid == win_gid:
+                    await context.bot.edit_message_text(
+                        chat_id=ocid,
+                        message_id=int(mid),
+                        text=f"✅ **Accepted by {gname}**\n\nReference ID: `{ref_show}`",
+                        parse_mode="Markdown",
+                        reply_markup=_EMPTY_INLINE_KB,
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=ocid,
+                        message_id=int(mid),
+                        text=(
+                            f"❌ **Taken by another group**\n\n"
+                            f"Accepted by: **{gname}**\nReference ID: `{ref_show}`"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=_EMPTY_INLINE_KB,
+                    )
+            except Exception as e:
+                logger.warning("Could not refresh group offer message after late accept: %s", e)
         return
 
     # Set lead.group_id to winning group
@@ -2926,6 +2975,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     message_id=int(mid),
                     text=f"✅ **Accepted by {winner_name}**\n\nReference ID: `{reference_id}`",
                     parse_mode="Markdown",
+                    reply_markup=_EMPTY_INLINE_KB,
                 )
             else:
                 await context.bot.edit_message_text(
@@ -2933,6 +2983,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     message_id=int(mid),
                     text=f"❌ **Taken by another group**\n\nAccepted by: **{winner_name}**\nReference ID: `{reference_id}`",
                     parse_mode="Markdown",
+                    reply_markup=_EMPTY_INLINE_KB,
                 )
         except Exception as e:
             logger.warning("Could not edit group offer message: %s", e)
@@ -3026,7 +3077,11 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
         return
     db.decline_group_lead_offer(lead_id, group_id)
     try:
-        await query.message.edit_text("❌ **Declined**", parse_mode="Markdown")
+        await query.message.edit_text(
+            "❌ **Declined**",
+            parse_mode="Markdown",
+            reply_markup=_EMPTY_INLINE_KB,
+        )
     except Exception:
         pass
 
