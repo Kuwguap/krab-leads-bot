@@ -192,6 +192,31 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
         return s
 
 
+_TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
+
+
+def _normalize_receipt_image_url(url: str) -> str:
+    """Fix doubled Telegram file CDN prefix (e.g. bot path pasted into another bot URL)."""
+    u = (url or "").strip()
+    if not u or _TELEGRAM_FILE_API_MARKER not in u:
+        return u
+    chunks = [c for c in u.split(_TELEGRAM_FILE_API_MARKER) if c]
+    if len(chunks) >= 2:
+        return _TELEGRAM_FILE_API_MARKER + chunks[-1]
+    return u
+
+
+def _telegram_download_url_from_file_path(file_path: str) -> str:
+    """Build a single correct Telegram file URL; ``file_path`` is usually ``photos/file_N.jpg``."""
+    fp = (file_path or "").strip()
+    if not fp:
+        return ""
+    if fp.startswith("https://") or fp.startswith("http://"):
+        return _normalize_receipt_image_url(fp)
+    tok = (Config.TELEGRAM_BOT_TOKEN or "").strip()
+    return f"{_TELEGRAM_FILE_API_MARKER}{tok}/{fp.lstrip('/')}"
+
+
 async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, lead: dict, text: str) -> None:
     """Send a notification to the lead initiator and global supervisor (if configured)."""
     initiator_id = lead.get("user_id")
@@ -215,11 +240,13 @@ async def _notify_lead_lifecycle(
     title_line: str,
     extra_lines: Optional[list[str]] = None,
     photo_url: Optional[str] = None,
+    photo_file_id: Optional[str] = None,
 ) -> None:
     """
     Standard 3-step alerts to lead initiator + SUPERVISORY_TELEGRAM_ID.
     step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
     Deduplicates so the same chat_id never receives the same message twice.
+    Prefer ``photo_file_id`` (same bot) over URLs so links are not broken or doubled.
     """
     lines = [f"🔔 **({step}/3)** {title_line}", ""]
     lines.extend(extra_lines or [])
@@ -245,15 +272,28 @@ async def _notify_lead_lifecycle(
         if cid is None:
             continue
         try:
-            if photo_url and step == 3:
-                try:
-                    await context.bot.send_photo(chat_id=cid, photo=photo_url, caption=text, parse_mode="Markdown")
-                except Exception:
-                    await context.bot.send_message(
-                        chat_id=cid,
-                        text=text + f"\n\n[Receipt]({photo_url})",
-                        parse_mode="Markdown",
-                    )
+            if step == 3 and (photo_file_id or photo_url):
+                safe_url = _normalize_receipt_image_url(photo_url) if photo_url else None
+                sent = False
+                if photo_file_id:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=cid, photo=photo_file_id, caption=text, parse_mode="Markdown"
+                        )
+                        sent = True
+                    except Exception as e:
+                        logger.warning("Lifecycle send_photo file_id failed for %s: %s", cid, e)
+                if not sent and safe_url:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=cid, photo=safe_url, caption=text, parse_mode="Markdown"
+                        )
+                        sent = True
+                    except Exception:
+                        pass
+                if not sent:
+                    link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
+                    await context.bot.send_message(chat_id=cid, text=text + link, parse_mode="Markdown")
             else:
                 await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
         except Exception as e:
@@ -2992,6 +3032,54 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
 
 
 # Receipt submission handlers
+async def handle_driver_receipts_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Drivers: show every owed receipt with inline upload buttons. Commands: /receipts, /receipt, /recipts."""
+    user = update.effective_user
+    if not user or not update.message:
+        return ConversationHandler.END
+    uid = str(user.id)
+    drivers = db.get_all_drivers()
+    driver = next(
+        (d for d in drivers if str(d.get("driver_telegram_id", "")).strip() == uid),
+        None,
+    )
+    if not driver:
+        await update.message.reply_text(
+            "❌ This Telegram account is not registered as a driver.\n"
+            "Ask an admin to add your Telegram user ID in the dashboard."
+        )
+        return ConversationHandler.END
+    pending = db.get_driver_pending_receipts(driver["id"])
+    if not pending:
+        await update.message.reply_text("✅ You don't owe any receipts right now.")
+        return ConversationHandler.END
+    max_show = 90
+    if len(pending) > max_show:
+        await update.message.reply_text(
+            f"You owe {len(pending)} receipts. Showing the first {max_show} — upload those, then send /receipts again."
+        )
+        pending = pending[:max_show]
+    rows = []
+    for p in pending:
+        ref = (p.get("reference_id") or "").strip()
+        if not ref or ref.upper() == "N/A":
+            continue
+        rows.append(
+            [InlineKeyboardButton(f"📤 Upload {ref}", callback_data=f"receipt_for_{ref}")]
+        )
+    if not rows:
+        await update.message.reply_text(
+            "⚠️ You have pending receipts but no valid reference IDs. Contact support."
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"🧾 Receipts you owe: **{len(rows)}**\n\nTap a reference to upload that receipt.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return ConversationHandler.END
+
+
 async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """When driver clicks ref in strike message – show lead details and Upload button."""
     query = update.callback_query
@@ -3123,7 +3211,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     file = await context.bot.get_file(photo.file_id)
     
     # Telegram file URL (fallback if Supabase Storage upload fails)
-    telegram_file_url = f"https://api.telegram.org/file/bot{Config.TELEGRAM_BOT_TOKEN}/{file.file_path}"
+    telegram_file_url = _telegram_download_url_from_path(file.file_path or "")
     
     # Download bytes for Monday + optional Supabase Storage
     import io
@@ -3159,7 +3247,9 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             driver_name = driver.get('driver_name', 'Driver')
     
     storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
-    stored_url = (storage_url or "").strip() or telegram_file_url
+    stored_url = _normalize_receipt_image_url(
+        ((storage_url or "").strip() or telegram_file_url).strip()
+    )
 
     # Update lead with receipt URL (prefer durable Supabase Storage public URL)
     success = db.update_lead_receipt(lead_id, stored_url)
@@ -3201,6 +3291,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Receipt uploaded for lead ref# `{reference_id}`",
             [f"Driver: **{driver_name}**"],
             photo_url=stored_url,
+            photo_file_id=photo.file_id,
         )
         
         # Notify group supervisory + ST — dedup against lifecycle targets
@@ -3209,11 +3300,13 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         group = db.get_group_by_id(group_id) if group_id else None
         if group:
             group_name = group.get("group_name") or group_name
-        receipt_notice = (
+        receipt_caption = (
             f"🔔 **(3/3)** Receipt uploaded for lead ref# `{reference_id}`\n\n"
             f"Driver: **{driver_name}**\n"
-            f"Group: **{group_name}**\n"
-            f"[Open receipt]({stored_url})"
+            f"Group: **{group_name}**"
+        )
+        receipt_link_fallback = (
+            receipt_caption + f"\n\n[Open receipt]({_normalize_receipt_image_url(stored_url)})"
         )
         _receipt_sent: set[int] = set()
         initiator_cid = _parse_chat_id(lead.get("user_id"))
@@ -3231,14 +3324,23 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             if sup_chat_id and sup_chat_id not in _receipt_sent:
                 _receipt_sent.add(sup_chat_id)
                 try:
-                    await context.bot.send_message(
+                    await context.bot.send_photo(
                         chat_id=sup_chat_id,
-                        text=receipt_notice,
+                        photo=photo.file_id,
+                        caption=receipt_caption,
                         parse_mode="Markdown",
-                        disable_web_page_preview=True,
                     )
                 except Exception as e:
-                    logger.warning("Could not send receipt notification to supervisory %s: %s", sup_chat_id, e)
+                    logger.warning("Could not send receipt photo to supervisory %s: %s", sup_chat_id, e)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=sup_chat_id,
+                            text=receipt_link_fallback,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e2:
+                        logger.warning("Could not send receipt notification to supervisory %s: %s", sup_chat_id, e2)
         st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
         if st_telegram_id:
             try:
@@ -3248,14 +3350,23 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             if st_chat_id and st_chat_id not in _receipt_sent:
                 _receipt_sent.add(st_chat_id)
                 try:
-                    await context.bot.send_message(
+                    await context.bot.send_photo(
                         chat_id=st_chat_id,
-                        text=receipt_notice,
+                        photo=photo.file_id,
+                        caption=receipt_caption,
                         parse_mode="Markdown",
-                        disable_web_page_preview=True,
                     )
                 except Exception as e:
-                    logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e)
+                    logger.warning("Could not send receipt photo to ST %s: %s", st_telegram_id, e)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=st_chat_id,
+                            text=receipt_link_fallback,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e2:
+                        logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e2)
         
         # Send completion message via @krabsenderbot to driver_name
         try:
@@ -3863,6 +3974,9 @@ def main():
     # Create conversation handler for receipt submission
     receipt_handler = ConversationHandler(
         entry_points=[
+            CommandHandler("receipts", handle_driver_receipts_menu_command),
+            CommandHandler("receipt", handle_driver_receipts_menu_command),
+            CommandHandler("recipts", handle_driver_receipts_menu_command),
             CallbackQueryHandler(handle_driver_receipt_callback, pattern="^driver_receipt$"),
             CallbackQueryHandler(handle_receipt_for_ref_callback, pattern="^receipt_for_"),
         ],
