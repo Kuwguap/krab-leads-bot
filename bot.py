@@ -13,7 +13,7 @@ from datetime import datetime, time as dt_time
 import pytz
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -247,6 +247,16 @@ async def _send_to_supervisory_chats(
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
+        except BadRequest as e:
+            if parse_mode and "parse" in str(e).lower():
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid, text=text, reply_markup=reply_markup
+                    )
+                except Exception as e2:
+                    logger.warning("Could not send to supervisory chat %s: %s", cid, e2)
+            else:
+                logger.warning("Could not send to supervisory chat %s: %s", cid, e)
         except Exception as e:
             logger.warning("Could not send to supervisory chat %s: %s", cid, e)
 
@@ -352,9 +362,17 @@ async def _notify_lead_lifecycle(
                         pass
                 if not sent:
                     link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
-                    await context.bot.send_message(chat_id=cid, text=text + link, parse_mode="Markdown")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=cid, text=text + link, parse_mode="Markdown"
+                        )
+                    except BadRequest:
+                        await context.bot.send_message(chat_id=cid, text=text + (f"\n{safe_url}" if safe_url else ""))
             else:
-                await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+                try:
+                    await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+                except BadRequest:
+                    await context.bot.send_message(chat_id=cid, text=text.replace("*", "").replace("`", ""))
         except Exception as e:
             logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
 
@@ -975,6 +993,35 @@ def _sanitize_phones_for_send(text: str) -> str:
     return phone_redact.replace_phones_with_ots_links(str(text).strip(), ots)
 
 
+def _telegram_md1_escape(text: str) -> str:
+    """Escape text for Telegram legacy Markdown (entity parsing breaks on _ * ` [)."""
+    s = str(text or "")
+    out = []
+    for ch in s:
+        if ch in ("\\", "_", "*", "[", "`"):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Optional[dict]:
+    """Ensure we have a group dict (DB row); JSON state may omit or flatten selected_group."""
+    sg = lead_data.get("selected_group")
+    if isinstance(sg, dict) and sg.get("id") is not None:
+        return sg
+    gid = None
+    if lead and lead.get("group_id") is not None:
+        gid = lead.get("group_id")
+    if gid is None:
+        gid = lead_data.get("group_id")
+    if gid is not None:
+        g = db.get_group_by_id(gid)
+        if g:
+            return g
+    return None
+
+
 def _format_group_lead_message_html(
     reference_id: str,
     phase1_data: dict,
@@ -1029,7 +1076,7 @@ def _format_group_lead_message_html(
     pre_wrapped = f"<pre>{html.escape(copy_plain)}</pre>"
     return (
         "🏷NEW CLIENT❗️\n\n"
-        f"📋 Reference ID: {_h(reference_id)}\n"
+        f"📋 Reference ID: <code>{_h(reference_id)}</code>\n"
         f"{vehicle_block}\n\n"
         "Please use @Krabsenderbot 📧🚘\n"
         "-Tag 🏷\n"
@@ -1039,6 +1086,47 @@ def _format_group_lead_message_html(
         f"📅 Issue Date: {_h(issue_s)}\n"
         f"⏰ Expires: {_h(expiry_s)}"
     )
+
+
+def _format_supervisory_lead_html(
+    reference_id: str,
+    username: str,
+    vehicle_safe: str,
+    delivery_safe: str,
+    encrypted_link: str,
+    price,
+    issue_s: str,
+    exp_s: str,
+    issuer_note_disp: str,
+    driver_note_disp: str,
+    group_name: str,
+) -> str:
+    """HTML body for supervisory DMs: tap-to-copy reference in <code>, no Markdown parse errors."""
+    def esc(s: str) -> str:
+        return html.escape(str(s or ""), quote=False)
+
+    ref = esc(reference_id or "N/A")
+    parts = [
+        f"📋 Reference ID: <code>{ref}</code>",
+        f"👤 User: @{esc(username)}",
+        f"🚗 Vehicle:\n{esc(vehicle_safe)}",
+        f"📍 Delivery:\n{esc(delivery_safe)}",
+        f"💰 Price: {esc(price)}",
+        f"📅 Issue Date: {esc(issue_s)}",
+        f"⏰ Expires: {esc(exp_s)}",
+    ]
+    lk = (encrypted_link or "").strip()
+    if lk:
+        parts.insert(
+            4,
+            f'📞 Phone (one-time link): <a href="{html.escape(lk, quote=True)}">open encrypted link</a>',
+        )
+    if (issuer_note_disp or "").strip():
+        parts.append(f"📝 Special request (issuers / group):\n{esc(_sanitize_phones_for_send(issuer_note_disp))}")
+    if (driver_note_disp or "").strip():
+        parts.append(f"📝 Special request (drivers only):\n{esc(_sanitize_phones_for_send(driver_note_disp))}")
+    parts.append(f"👥 Group: {esc(group_name)}")
+    return "\n\n".join(parts)
 
 
 def _dt_from_lead_field(val) -> datetime | None:
@@ -1122,14 +1210,15 @@ async def _send_full_group_lead_to_chat(
             vehicle_safe += "\n" + _sr("📝 " + issuer_note)
         iss = issue_dt.strftime("%Y-%m-%d %H:%M") if issue_dt else "N/A"
         exs = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "N/A"
+        ref_h = html.escape(str(reference_id or "N/A"), quote=False)
         return (
             "✅ Your group claimed this client\n\n"
             "🏷NEW CLIENT❗️\n\n"
-            f"📋 Reference ID: {reference_id}\n"
-            f"🚗 Vehicle:\n{vehicle_safe}\n\n"
-            f"🔗 Encrypted Link: {link}\n\n"
-            f"📅 Issue Date: {iss}\n"
-            f"⏰ Expires: {exs}"
+            f"📋 Reference ID: <code>{ref_h}</code>\n"
+            f"🚗 Vehicle:\n{html.escape(vehicle_safe, quote=False)}\n\n"
+            f"🔗 Encrypted Link: {html.escape(link, quote=False)}\n\n"
+            f"📅 Issue Date: {html.escape(iss, quote=False)}\n"
+            f"⏰ Expires: {html.escape(exs, quote=False)}"
         )
 
     targets: list[tuple] = []
@@ -1150,7 +1239,9 @@ async def _send_full_group_lead_to_chat(
                 await context.bot.send_message(chat_id=target_cid, text=full_html, parse_mode="HTML")
             except Exception as html_err:
                 logger.warning("Full lead HTML failed for %s: %s", label, html_err)
-                await context.bot.send_message(chat_id=target_cid, text=_plain_fallback())
+                await context.bot.send_message(
+                    chat_id=target_cid, text=_plain_fallback(), parse_mode="HTML"
+                )
         except Exception as e:
             logger.error("Could not send full lead to %s: %s", label, e)
 
@@ -1968,8 +2059,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         from_line = f"@{un}" if un else (query.from_user.first_name or "Unknown")
         group_offer_message = (
             "🏷 NEW CLIENT\n"
-            f"📋 Ref ID: {reference_id}\n"
-            f"👤 From: {from_line}\n\n"
+            f"📋 Ref ID: `{reference_id}`\n"
+            f"👤 From: `{from_line}`\n\n"
             "✅ Double-check the tag for mistakes\n"
             "📲 Send tag to driver with @krabsender\n"
             "📋 Copy/paste client phone, address, and delivery time\n\n"
@@ -2006,6 +2097,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
                     text=group_offer_message,
+                    parse_mode="Markdown",
                     reply_markup=offer_kb_by_group.get(gid),
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
@@ -2019,6 +2111,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     msg = await context.bot.send_message(
                         chat_id=chat_id,
                         text=group_offer_message,
+                        parse_mode="Markdown",
                         reply_markup=offer_kb_by_group.get(gid),
                     )
                     db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
@@ -2054,11 +2147,20 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 summary_lines = [f"- {name}: {reason}" for (name, reason) in top]
                 more = f"\n- (+{len(failures) - len(top)} more)" if len(failures) > len(top) else ""
                 summary = "\n\nFailed group(s):\n" + "\n".join(summary_lines) + more
+            ref_h = html.escape(str(reference_id), quote=False)
+            body = (
+                "📣 Broadcast sent\n\n"
+                f"📋 Reference ID: <code>{ref_h}</code>\n"
+                f"Sent to {sent_count} group(s).\n\n"
+                "You do not need to wait for a group — pick drivers next. "
+                "Groups can still accept/decline in their chats.\n\n"
+                "Select which driver(s) to notify:\n\n"
+                f"{html.escape(driver_list, quote=False)}"
+                f"{html.escape(summary, quote=False)}"
+            )
             await query.message.reply_text(
-                f"📣 Broadcast sent\n\nReference ID: {reference_id}\nSent to {sent_count} group(s).\n\n"
-                f"You do not need to wait for a group — pick drivers next. Groups can still accept/decline in their chats.\n\n"
-                f"Select which driver(s) to notify:\n\n{driver_list}"
-                f"{summary}",
+                body,
+                parse_mode="HTML",
                 reply_markup=driver_keyboard,
             )
         except Exception as e:
@@ -2123,7 +2225,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     encrypted_data = lead_data.get('encrypted_data', {})
     reference_id = lead_data.get('reference_id')
     group_id = lead_data.get('group_id')
-    selected_group = lead_data.get('selected_group')
     username = query.from_user.username or "Unknown"
     
     # Determine which drivers to notify
@@ -2134,20 +2235,22 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     suspended = _get_suspended_driver_ids()
     if callback_data == "select_driver_all":
-        selected_drivers = [d for d in active_drivers if d['id'] not in suspended]
+        suspended_s = {str(x) for x in suspended}
+        selected_drivers = [d for d in active_drivers if str(d.get("id")) not in suspended_s]
         selected_driver_ids = [d['id'] for d in selected_drivers]
         if not selected_drivers:
             await query.message.reply_text("❌ No eligible drivers (all suspended). Please select a driver individually.")
             return STATE_SELECT_DRIVER
     elif callback_data.startswith("driver_suspended_"):
         driver_id = callback_data.replace("driver_suspended_", "")
-        driver = next((d for d in all_drivers if d["id"] == driver_id), None)
+        driver = next((d for d in all_drivers if str(d.get("id")) == str(driver_id)), None)
         name = driver.get("driver_name", "Driver") if driver else "Driver"
         pending = db.get_driver_pending_receipts(driver_id) if driver_id else []
         count = len(pending)
         await query.message.reply_text(
-            f"⚠️ **{name}** is temporarily suspended (PENALTY).\n\n"
-            f"They owe {count} receipt(s). No leads will be sent until all receipts are uploaded."
+            f"⚠️ **{_telegram_md1_escape(name)}** is temporarily suspended (PENALTY).\n\n"
+            f"They owe {count} receipt(s). No leads will be sent until all receipts are uploaded.",
+            parse_mode="Markdown",
         )
         # Notify driver that dispatcher tried to send lead
         tid = driver.get("driver_telegram_id") if driver else None
@@ -2175,14 +2278,14 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         # Send to selected driver
         driver_id = callback_data.replace("select_driver_", "")
         selected_driver_ids = [driver_id]
-        selected_drivers = [d for d in active_drivers if d['id'] == driver_id]
+        selected_drivers = [d for d in active_drivers if str(d.get("id")) == str(driver_id)]
         if not selected_drivers:
             await query.message.reply_text("❌ Error: Driver not found.")
             return ConversationHandler.END
-        if driver_id in suspended:
+        if any(str(x) == str(driver_id) for x in suspended):
             await query.message.reply_text("❌ This driver is suspended. Please select another.")
             return STATE_SELECT_DRIVER
-    
+
     # Create lead in database
     final_lead_data = {
         "user_id": user_id,
@@ -2223,6 +2326,13 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if won_group:
             selected_group = won_group
     skip_duplicate_full_group_post = bool(lead_data.get("follow_after_broadcast") and had_broadcast_offers)
+
+    selected_group = _resolve_selected_group(lead_data, lead)
+    if not selected_group:
+        await query.message.reply_text(
+            "❌ Error: could not resolve the group for this lead. Please start over with /start."
+        )
+        return ConversationHandler.END
 
     issuer_note_disp = (
         (lead_data.get("special_request_issuers") or lead.get("special_request_issuers")
@@ -2276,8 +2386,12 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             # Supervisor/group info (using group name as identifier)
             "supervisor_name": selected_group.get("group_name", ""),
         }
-        monday_result = monday.create_item(monday_lead_data, username)
-        
+        try:
+            monday_result = monday.create_item(monday_lead_data, username)
+        except Exception as e:
+            logger.error("Monday.com create_item failed: %s", e, exc_info=True)
+            monday_result = None
+
         if monday_result:
             # Update lead with Monday.com item ID and dates from Monday
             db.update_lead(lead["id"], {
@@ -2321,21 +2435,25 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         }
     
     # Prepare messages for distribution
-    # Full message with all details (for Supervisory) – phone only via encrypted link; include reference ID
-    full_message = (
-        f"📋 Reference ID: `{reference_id}`\n"
-        f"👤 User: @{username}\n"
-        f"🚗 Vehicle: {vehicle_safe}\n"
-        f"📍 Delivery: {delivery_safe}\n"
-        f"📞 Phone (one-time link): {encrypted_data.get('link')}\n"
-        f"💰 Price: {price}\n"
-        f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
-        f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
+    issue_s = (
+        monday_result["issue_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
     )
-    if issuer_note_disp:
-        full_message += f"\n\n📝 Special request (issuers / group):\n{_sanitize_phones_for_send(issuer_note_disp)}"
-    if driver_note_disp:
-        full_message += f"\n\n📝 Special request (drivers only):\n{_sanitize_phones_for_send(driver_note_disp)}"
+    exp_s = (
+        monday_result["expiration_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
+    )
+    supervisory_message = _format_supervisory_lead_html(
+        str(reference_id or "N/A"),
+        username,
+        vehicle_safe,
+        delivery_safe,
+        encrypted_data.get("link") or "",
+        price,
+        issue_s,
+        exp_s,
+        issuer_note_disp,
+        driver_note_disp,
+        str(selected_group.get("group_name", "N/A")),
+    )
 
     # Group message – HTML with <pre> copy block; no raw phone in body outside pre
     group_message = _format_group_lead_message_html(
@@ -2349,15 +2467,20 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
 
     # Driver assignment message (sent to selected drivers with accept/decline)
     # NOTE: Phone and price are only revealed after driver accepts.
+    d_csz_esc = _telegram_md1_escape(phase1_data.get("delivery_city_state_zip", "") or "")
+    extra_esc = _telegram_md1_escape(extra_safe)
     driver_request_message = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
-        f"📍 Delivery (City, State, Zip): {phase1_data.get('delivery_city_state_zip', '')}\n"
+        f"📍 Delivery (City, State, Zip): {d_csz_esc}\n"
         f"📋 Reference ID: `{reference_id}`\n"
-        f" Delivery Time 🏷️: {extra_safe}\n"
+        f" Delivery Time 🏷️: {extra_esc}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅"
     )
     if driver_note_disp:
-        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(driver_note_disp)}"
+        driver_request_message += (
+            "\n\n📝 Special request (driver): "
+            + _telegram_md1_escape(_sanitize_phones_for_send(driver_note_disp))
+        )
     
     # Create accept/decline keyboard for driver assignment
     accept_keyboard = InlineKeyboardMarkup([
@@ -2378,12 +2501,22 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 driver_chat_id = driver_telegram_id_raw
             try:
                 db.create_lead_assignment(lead['id'], driver['id'], group_id)
-                await context.bot.send_message(
-                    chat_id=driver_chat_id,
-                    text=driver_request_message,
-                    parse_mode="Markdown",
-                    reply_markup=accept_keyboard
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=driver_request_message,
+                        parse_mode="Markdown",
+                        reply_markup=accept_keyboard,
+                    )
+                except BadRequest as e:
+                    if "parse" in str(e).lower():
+                        await context.bot.send_message(
+                            chat_id=driver_chat_id,
+                            text=driver_request_message.replace("`", ""),
+                            reply_markup=accept_keyboard,
+                        )
+                    else:
+                        raise
                 assigned_count += 1
                 # Strike message: if driver has 1–2 pending receipts, remind them
                 pending = db.get_driver_pending_receipts(driver['id'])
@@ -2392,21 +2525,37 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                         [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
                         for p in pending
                     ]
-                    await context.bot.send_message(
-                        chat_id=driver_chat_id,
-                        text=(
-                            f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s):\n\n"
-                            + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending) +
-                            "\n\nTap below to view details and upload:"
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup(ref_buttons),
+                    strike_txt = (
+                        f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s):\n\n"
+                        + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending)
+                        + "\n\nTap below to view details and upload:"
                     )
+                    try:
+                        await context.bot.send_message(
+                            chat_id=driver_chat_id,
+                            text=strike_txt,
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(ref_buttons),
+                        )
+                    except BadRequest:
+                        await context.bot.send_message(
+                            chat_id=driver_chat_id,
+                            text=strike_txt.replace("`", "").replace("*", ""),
+                            reply_markup=InlineKeyboardMarkup(ref_buttons),
+                        )
             except Exception as e:
                 logger.error(f"Error sending to driver {driver.get('driver_name')} (chat_id={driver_chat_id}): {e!r}")
     
     logger.info(f"Sent lead request to {assigned_count} drivers")
-    
+    if assigned_count == 0:
+        ref_h = html.escape(str(reference_id or "N/A"), quote=False)
+        await query.message.reply_text(
+            "⚠️ No driver received the Telegram notification (check driver chat IDs in admin or logs). "
+            "The lead was still saved.\n\n"
+            f"📋 Reference ID: <code>{ref_h}</code>",
+            parse_mode="HTML",
+        )
+
     group_telegram_id_raw = selected_group.get("group_telegram_id")
     # Send to Group (detailed message without user, phone, and price).
     # Broadcast winner already received full HTML on group Accept — do not post again to another chat.
@@ -2436,13 +2585,17 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                         group_name,
                         html_err,
                     )
+                    ref_h = html.escape(str(reference_id or "N/A"), quote=False)
                     plain_fallback = (
-                        f"🏷NEW CLIENT❗️\n\n📋 Reference ID: {reference_id}\n🚗 Vehicle:\n{vehicle_safe}\n\n"
-                        f"🔗 Encrypted Link: {encrypted_data.get('link')}\n\n"
-                        f"📅 Issue Date: {monday_result['issue_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}\n"
-                        f"⏰ Expires: {monday_result['expiration_date'].strftime('%Y-%m-%d %H:%M:%S %Z') if monday_result else 'N/A'}"
+                        f"🏷NEW CLIENT❗️\n\n📋 Reference ID: <code>{ref_h}</code>\n"
+                        f"🚗 Vehicle:\n{html.escape(vehicle_safe, quote=False)}\n\n"
+                        f"🔗 Encrypted Link: {html.escape(str(encrypted_data.get('link') or ''), quote=False)}\n\n"
+                        f"📅 Issue Date: {html.escape(issue_s, quote=False)}\n"
+                        f"⏰ Expires: {html.escape(exp_s, quote=False)}"
                     )
-                    await context.bot.send_message(chat_id=group_chat_id, text=plain_fallback)
+                    await context.bot.send_message(
+                        chat_id=group_chat_id, text=plain_fallback, parse_mode="HTML"
+                    )
                 logger.info(f"Lead sent to group '{group_name}' successfully")
             except Exception as e:
                 logger.error(
@@ -2452,10 +2605,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     # Supervisory: full log with phone and price — per-group supervisory + SUPERVISORY_TELEGRAM_ID (deduped)
     supervisory_telegram_id = selected_group.get("supervisory_telegram_id")
-    supervisory_message = (
-        f"{full_message}\n\n"
-        f"👥 Group: {selected_group.get('group_name', 'N/A')}"
-    )
     supervisory_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
     ])
@@ -2463,6 +2612,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         context,
         supervisory_telegram_id,
         supervisory_message,
+        parse_mode="HTML",
         reply_markup=supervisory_keyboard,
     )
 
@@ -2497,8 +2647,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "Issuer accepted new lead",
         [
             f"Reference: `{reference_id}`",
-            f"Group: **{selected_group.get('group_name', 'N/A')}**",
-            f"Drivers notified: **{driver_names}**",
+            f"Group: **{_telegram_md1_escape(selected_group.get('group_name', 'N/A'))}**",
+            f"Drivers notified: **{_telegram_md1_escape(driver_names)}**",
         ],
     )
 
@@ -2526,7 +2676,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return STATE_SELECT_CONTACT_SOURCE
-    
+
     await _finish_lead_send(
         context, query.message, user_id, username, lead["id"], reference_id,
         driver_names, selected_group.get("group_name", "N/A"), contact_source_label=None,
@@ -2559,21 +2709,35 @@ async def _finish_lead_send(
     if st_telegram_id:
         try:
             st_chat_id = int(st_telegram_id.strip())
-            await context.bot.send_message(
-                chat_id=st_chat_id,
-                text=f"📬 New lead sent\n\nReference: {reference_id}\nGroup: {group_name}\nDriver(s): {driver_names}\nBy: @{username}",
+            st_txt = (
+                "📬 New lead sent\n\n"
+                f"Reference: `{reference_id}`\n"
+                f"Group: {_telegram_md1_escape(group_name)}\n"
+                f"Driver(s): {_telegram_md1_escape(driver_names)}\n"
+                f"By: @{_telegram_md1_escape(username)}"
             )
+            try:
+                await context.bot.send_message(
+                    chat_id=st_chat_id,
+                    text=st_txt,
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await context.bot.send_message(chat_id=st_chat_id, text=st_txt.replace("`", "").replace("*", ""))
         except Exception as e:
             logger.error(f"Error sending to ST (chat_id={st_telegram_id}): {e}")
     db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
     success_text = (
         f"✅ **Lead sent successfully**\n\n"
-        f"• Sent to driver(s): **{driver_names}**\n"
-        f"• Group: {group_name}\n"
+        f"• Sent to driver(s): **{_telegram_md1_escape(driver_names)}**\n"
+        f"• Group: {_telegram_md1_escape(group_name)}\n"
         f"• Reference ID: `{reference_id}`\n\n"
         "Use /start to create another lead."
     )
-    await message.reply_text(success_text, parse_mode="Markdown")
+    try:
+        await message.reply_text(success_text, parse_mode="Markdown")
+    except BadRequest:
+        await message.reply_text(success_text.replace("`", "").replace("*", ""))
     # CORE: motivation after client submission (Pro Mode)
     try:
         motivation_text = motivation.core_after_submission()
@@ -2833,6 +2997,11 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text(
             confirmation_message,
             reply_markup=receipt_keyboard,
+        )
+        ref_disp = (lead.get("reference_id") or "").strip() or "N/A"
+        await query.message.reply_text(
+            f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
+            parse_mode="HTML",
         )
         # Strike message: remind about pending receipts
         pending = db.get_driver_pending_receipts(driver["id"])
@@ -3898,6 +4067,14 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(confirmation, reply_markup=receipt_kb)
     except Exception as e:
         logger.warning("Could not send renewal confirmation to driver: %s", e)
+    try:
+        ref_disp = (lead_full.get("reference_id") or "").strip() or "N/A"
+        await query.message.reply_text(
+            f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Could not send renewal ref copy line: %s", e)
 
     # Notify the accepted group
     group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
