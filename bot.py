@@ -81,6 +81,9 @@ monday = MondayClient() if Config.is_monday_configured() else None
 
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 
+# ConversationHandler.name for receipt upload flow (used to reset state on /receipt, /receipts)
+RECEIPT_CONVERSATION_NAME = "driver_receipt"
+
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
@@ -139,17 +142,46 @@ def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str
 
 
 def _get_suspended_driver_ids() -> set:
-    """Driver IDs with 3+ pending receipts (suspended)."""
-    suspended = set()
+    """Driver IDs (as str) with 3+ pending receipts (temporarily suspended)."""
+    suspended: set[str] = set()
     try:
         drivers = db.get_all_drivers()
         for d in drivers:
             pending = db.get_driver_pending_receipts(d["id"])
             if len(pending) >= SUSPENSION_THRESHOLD:
-                suspended.add(d["id"])
+                suspended.add(str(d["id"]))
     except Exception as e:
         logger.warning("_get_suspended_driver_ids: %s", e)
     return suspended
+
+
+def _end_named_conversation(application: Application, update: Update, name: str) -> None:
+    """Drop active state for a named ConversationHandler (e.g. reset stuck receipt flow)."""
+    chat, user = update.effective_chat, update.effective_user
+    if not chat or not user:
+        return
+    key = (chat.id, user.id)
+    try:
+        for handlers in application.handlers.values():
+            for h in handlers:
+                if isinstance(h, ConversationHandler) and h.name == name:
+                    if key in h._conversations:
+                        del h._conversations[key]
+                    return
+    except Exception as e:
+        logger.warning("_end_named_conversation: %s", e)
+
+
+def _cid_norm_for_receipt_set(cid) -> int | str | None:
+    """Normalize chat id for dedupe sets (int vs str mismatch)."""
+    if cid is None:
+        return None
+    if isinstance(cid, int):
+        return cid
+    try:
+        return int(str(cid).strip().lstrip("=").split(".", 1)[0])
+    except (ValueError, TypeError):
+        return str(cid)
 
 
 def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, include_all: bool = True):
@@ -158,8 +190,9 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
     buttons = []
     for d in drivers:
         did = d.get("id")
+        did_s = str(did) if did is not None else ""
         name = d.get("driver_name", "Unknown")
-        if did in suspended:
+        if did_s in suspended:
             buttons.append([
                 InlineKeyboardButton(
                     f"🚫 {name} (PENALTY)",
@@ -171,10 +204,20 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
                 InlineKeyboardButton(f"🚗 {name}", callback_data=f"select_driver_{did}")
             ])
     if include_all:
-        elig = [d for d in drivers if d.get("id") not in suspended]
+        elig = [d for d in drivers if str(d.get("id")) not in suspended]
         if elig:
             buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
     return InlineKeyboardMarkup(buttons)
+
+
+def _driver_picker_penalty_hint() -> str:
+    """Extra line for issuer when at least one driver is receipt-suspended."""
+    if not _get_suspended_driver_ids():
+        return ""
+    return (
+        "\n\n🚫 (PENALTY) on a button = that driver owes 3+ receipts and cannot get new leads until they "
+        "upload. Tap (PENALTY) to see what they owe."
+    )
 
 
 def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeyboardMarkup:
@@ -413,7 +456,7 @@ async def _send_driver_requests_for_group(
     if not active_rows:
         return (0, "", "all_inactive", scope)
 
-    selected_drivers = [d for d in active_rows if d.get("id") not in suspended]
+    selected_drivers = [d for d in active_rows if str(d.get("id")) not in suspended]
     if not selected_drivers:
         return (0, "", "all_suspended", scope)
 
@@ -2000,7 +2043,8 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         "✅ Ready.\n\n"
         "**Select which driver(s) to notify:**\n\n"
         f"Available drivers:\n{driver_list}\n\n"
-        "Click a driver below or send to all:",
+        "Click a driver below or send to all:"
+        f"{_driver_picker_penalty_hint()}",
         parse_mode="Markdown",
         reply_markup=driver_keyboard,
     )
@@ -2157,6 +2201,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 "Select which driver(s) to notify:\n\n"
                 f"{html.escape(driver_list, quote=False)}"
                 f"{html.escape(summary, quote=False)}"
+                f"{html.escape(_driver_picker_penalty_hint(), quote=False)}"
             )
             await query.message.reply_text(
                 body,
@@ -2191,7 +2236,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         f"✅ Group selected: **{selected_group.get('group_name', 'N/A')}**\n\n"
         f"**Select which driver(s) to notify:**\n\n"
         f"Available drivers:\n{driver_list}\n\n"
-        f"Click a driver below or send to all:",
+        f"Click a driver below or send to all:"
+        f"{_driver_picker_penalty_hint()}",
         parse_mode="Markdown",
         reply_markup=driver_keyboard
     )
@@ -2919,7 +2965,8 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(
         f"🔄 **Pick new driver**\n\n"
         f"Reference ID: `{reference_id}`\n\n"
-        f"Select which driver(s) to notify:",
+        f"Select which driver(s) to notify:"
+        f"{_driver_picker_penalty_hint()}",
         parse_mode="Markdown",
         reply_markup=driver_keyboard,
     )
@@ -3327,6 +3374,20 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
 
 
 # Receipt submission handlers
+async def _receipt_slash_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run before other handlers (group -1): reset stuck receipt conversation, then show owed-receipts menu."""
+    _end_named_conversation(context.application, update, RECEIPT_CONVERSATION_NAME)
+    for k in ("receipt_lead_id", "receipt_reference_id", "receipt_monday_item_id"):
+        context.user_data.pop(k, None)
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is not None:
+        row = db.get_user_state(uid)
+        st = (row or {}).get("state") or ""
+        if st in ("waiting_receipt_confirm", "waiting_receipt_image", "waiting_reference_id"):
+            db.clear_user_state(uid)
+    await handle_driver_receipts_menu_command(update, context)
+
+
 async def handle_driver_receipts_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Drivers: show every owed receipt with inline upload buttons. Commands: /receipts, /receipt, /recipts."""
     user = update.effective_user
@@ -3349,9 +3410,10 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
         await update.message.reply_text("✅ You don't owe any receipts right now.")
         return ConversationHandler.END
     max_show = 90
-    if len(pending) > max_show:
+    n_pending = len(pending)
+    if n_pending > max_show:
         await update.message.reply_text(
-            f"You owe {len(pending)} receipts. Showing the first {max_show} — upload those, then send /receipts again."
+            f"You owe {n_pending} receipts. Showing the first {max_show} — upload those, then send /receipts again."
         )
         pending = pending[:max_show]
     rows = []
@@ -3367,9 +3429,26 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
             "⚠️ You have pending receipts but no valid reference IDs. Contact support."
         )
         return ConversationHandler.END
+    suspended = n_pending >= SUSPENSION_THRESHOLD
+    lines = [
+        f"🧾 <b>Receipts you owe:</b> {len(rows)}",
+        "",
+    ]
+    if suspended:
+        lines.extend([
+            "⛔ <b>Temporary suspension (penalty)</b>",
+            f"You have <b>{n_pending}</b> unpaid receipt(s). No new leads are sent until all are uploaded.",
+            "",
+        ])
+    elif n_pending >= 1:
+        lines.append(
+            f"⚠️ Submit every receipt promptly. At <b>{SUSPENSION_THRESHOLD}</b> unpaid, you are temporarily suspended from new leads.",
+        )
+        lines.append("")
+    lines.append("Tap a reference below to upload that receipt.")
     await update.message.reply_text(
-        f"🧾 Receipts you owe: **{len(rows)}**\n\nTap a reference to upload that receipt.",
-        parse_mode="Markdown",
+        "\n".join(lines),
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(rows),
     )
     return ConversationHandler.END
@@ -3492,19 +3571,30 @@ async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.
 
 
 async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle receipt image upload."""
+    """Handle receipt image upload (photo or image file)."""
     user_id = update.effective_user.id
-    
-    if not update.message.photo:
+
+    receipt_file_id: str | None = None
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        receipt_file_id = photo.file_id
+        file = await context.bot.get_file(photo.file_id)
+    elif update.message.document:
+        doc = update.message.document
+        mt = (doc.mime_type or "").lower()
+        if not mt.startswith("image/"):
+            await update.message.reply_text(
+                "❌ Please send a photo or an image file (JPG, PNG, etc.), not a document."
+            )
+            return STATE_WAITING_RECEIPT_IMAGE
+        receipt_file_id = doc.file_id
+        file = await context.bot.get_file(doc.file_id)
+    else:
         await update.message.reply_text(
             "❌ Please send a photo/image. Upload the receipt image."
         )
         return STATE_WAITING_RECEIPT_IMAGE
-    
-    # Get the highest resolution photo
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    
+
     # Telegram file URL (fallback if Supabase Storage upload fails)
     telegram_file_url = _telegram_download_url_from_path(file.file_path or "")
     
@@ -3536,10 +3626,13 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     assignment_status = db.get_lead_assignment_status(lead_id)
     driver_name = "Driver"
     if assignment_status:
-        driver_id = assignment_status.get('driver_id')
-        driver = next((d for d in db.get_all_drivers() if d['id'] == driver_id), None)
+        driver_id = assignment_status.get("driver_id")
+        driver = next(
+            (d for d in db.get_all_drivers() if str(d.get("id")) == str(driver_id)),
+            None,
+        )
         if driver:
-            driver_name = driver.get('driver_name', 'Driver')
+            driver_name = driver.get("driver_name", "Driver")
     
     storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
     stored_url = _normalize_receipt_image_url(
@@ -3584,53 +3677,63 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             lead,
             3,
             f"Receipt uploaded for lead ref# `{reference_id}`",
-            [f"Driver: **{driver_name}**"],
+            [f"Driver: **{_telegram_md1_escape(driver_name)}**"],
             photo_url=stored_url,
-            photo_file_id=photo.file_id,
+            photo_file_id=receipt_file_id,
         )
-        
-        # Notify group supervisory + ST — dedup against lifecycle targets
+
+        # Notify group supervisory + ST — dedup against lifecycle targets (normalize int/str keys)
         group_id = lead.get("group_id")
         group_name = "—"
         group = db.get_group_by_id(group_id) if group_id else None
         if group:
             group_name = group.get("group_name") or group_name
-        receipt_caption = (
-            f"🔔 **(3/3)** Receipt uploaded for lead ref# `{reference_id}`\n\n"
-            f"Driver: **{driver_name}**\n"
-            f"Group: **{group_name}**"
+        ref_h = html.escape(str(reference_id or "N/A"), quote=False)
+        dn_h = html.escape(str(driver_name), quote=False)
+        gn_h = html.escape(str(group_name), quote=False)
+        receipt_caption_html = (
+            "🔔 <b>(3/3) Receipt uploaded</b>\n"
+            f"Ref: <code>{ref_h}</code>\n\n"
+            f"Driver: {dn_h}\n"
+            f"Group: {gn_h}"
         )
-        receipt_link_fallback = (
-            receipt_caption + f"\n\n[Open receipt]({_normalize_receipt_image_url(stored_url)})"
+        safe_url = _normalize_receipt_image_url(stored_url)
+        receipt_link_html = (
+            receipt_caption_html
+            + (f'\n\n<a href="{html.escape(safe_url, quote=True)}">Open receipt</a>' if safe_url else "")
         )
-        _receipt_sent: set[int] = set()
+        _receipt_sent: set = set()
+
+        def _mark_sent(cid) -> None:
+            k = _cid_norm_for_receipt_set(cid)
+            if k is not None:
+                _receipt_sent.add(k)
+
         initiator_cid = _parse_chat_id(lead.get("user_id"))
-        if initiator_cid:
-            _receipt_sent.add(initiator_cid)
-        global_sup = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-        if global_sup:
-            _receipt_sent.add(global_sup)
+        _mark_sent(initiator_cid)
+        _mark_sent(_parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID))
 
         for sup_chat_id in _supervisory_delivery_chat_ids(
             group.get("supervisory_telegram_id") if group else None
         ):
-            if sup_chat_id in _receipt_sent:
+            sk = _cid_norm_for_receipt_set(sup_chat_id)
+            if sk is not None and sk in _receipt_sent:
                 continue
-            _receipt_sent.add(sup_chat_id)
+            _mark_sent(sup_chat_id)
             try:
                 await context.bot.send_photo(
                     chat_id=sup_chat_id,
-                    photo=photo.file_id,
-                    caption=receipt_caption,
-                    parse_mode="Markdown",
+                    photo=receipt_file_id,
+                    caption=receipt_caption_html,
+                    parse_mode="HTML",
                 )
             except Exception as e:
                 logger.warning("Could not send receipt photo to supervisory %s: %s", sup_chat_id, e)
                 try:
                     await context.bot.send_message(
                         chat_id=sup_chat_id,
-                        text=receipt_link_fallback,
-                        parse_mode="Markdown",
+                        text=receipt_link_html,
+                        parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
                 except Exception as e2:
@@ -3641,27 +3744,28 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                 st_chat_id = int(st_telegram_id.strip())
             except (ValueError, TypeError):
                 st_chat_id = None
-            if st_chat_id and st_chat_id not in _receipt_sent:
-                _receipt_sent.add(st_chat_id)
+            stk = _cid_norm_for_receipt_set(st_chat_id)
+            if st_chat_id and stk is not None and stk not in _receipt_sent:
+                _mark_sent(st_chat_id)
                 try:
                     await context.bot.send_photo(
                         chat_id=st_chat_id,
-                        photo=photo.file_id,
-                        caption=receipt_caption,
-                        parse_mode="Markdown",
+                        photo=receipt_file_id,
+                        caption=receipt_caption_html,
+                        parse_mode="HTML",
                     )
                 except Exception as e:
                     logger.warning("Could not send receipt photo to ST %s: %s", st_telegram_id, e)
                     try:
                         await context.bot.send_message(
                             chat_id=st_chat_id,
-                            text=receipt_link_fallback,
-                            parse_mode="Markdown",
+                            text=receipt_link_html,
+                            parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
                     except Exception as e2:
                         logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e2)
-        
+
         # Send completion message via @krabsenderbot to driver_name
         try:
             completion_message = (
@@ -3892,7 +3996,7 @@ async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_i
     for d in (drivers or []):
         if d.get("id") == original_did:
             continue
-        if d.get("id") in suspended:
+        if str(d.get("id")) in suspended:
             continue
         await _send_renewal_to_driver(context, refreshed, d)
 
@@ -4284,20 +4388,24 @@ def main():
         states={
             STATE_WAITING_REFERENCE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reference_id_input)],
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
-            STATE_WAITING_RECEIPT_IMAGE: [MessageHandler(filters.PHOTO, handle_receipt_image)],
+            STATE_WAITING_RECEIPT_IMAGE: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_receipt_image),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
-            CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
         ],
+        name=RECEIPT_CONVERSATION_NAME,
     )
 
+    # /receipt & /receipts: group -1 runs first — clears stuck receipt state, then shows menu
+    application.add_handler(
+        CommandHandler(["receipt", "receipts", "recipts"], _receipt_slash_commands),
+        group=-1,
+    )
     application.add_handler(receipt_handler)
     application.add_handler(conv_handler)
-    application.add_handler(
-        CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command)
-    )
     
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
