@@ -84,6 +84,40 @@ SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
+# One-tap receipt flow for drivers (handled by receipt ConversationHandler)
+_DRIVER_RECEIPT_BTN = InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")
+
+
+def _driver_receipt_keyboard_only() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_DRIVER_RECEIPT_BTN]])
+
+
+def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
+    """New-lead offer: Accept / Decline + quick receipt menu."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead_id}"),
+        ],
+        [_DRIVER_RECEIPT_BTN],
+    ])
+
+
+def _keyboard_renewal_driver(short_r: str, short_d: str) -> InlineKeyboardMarkup:
+    """Renewal driver offer + receipt shortcut."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}{short_d}"),
+            InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}{short_d}"),
+        ],
+        [_DRIVER_RECEIPT_BTN],
+    ])
+
+
+def _keyboard_receipt_plus_rows(extra_rows: list) -> InlineKeyboardMarkup:
+    """Receipt shortcut on top, then custom rows (e.g. per-ref upload buttons)."""
+    return InlineKeyboardMarkup([[_DRIVER_RECEIPT_BTN]] + list(extra_rows))
+
 _VIN_CONFLICT_INTRO = (
     "Pulling up 17 Digit Vin in DMV portal🧐\n\n"
     "Success ! Your Vehicle pulls up in the Motor Vehicle system!\n"
@@ -455,10 +489,7 @@ async def _send_driver_requests_for_group(
     )
     if spec:
         driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
-    accept_keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead['id']}"),
-        InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead['id']}"),
-    ]])
+    accept_keyboard = _keyboard_lead_accept_decline(str(lead["id"]))
     assigned_count = 0
     for driver in selected_drivers:
         cid = _parse_chat_id(driver.get("driver_telegram_id"))
@@ -980,7 +1011,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         lines.append("\nTo view all receipts type /receipts")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=_driver_receipt_keyboard_only(),
+        )
         return ConversationHandler.END
 
     # Clear any existing state and attached files from previous leads
@@ -2563,14 +2597,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             + _telegram_md1_escape(_sanitize_phones_for_send(driver_note_disp))
         )
     
-    # Create accept/decline keyboard for driver assignment
-    accept_keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead['id']}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead['id']}")
-        ]
-    ])
-    
+    accept_keyboard = _keyboard_lead_accept_decline(str(lead["id"]))
+
     # Send to selected drivers
     assigned_count = 0
     for driver in selected_drivers:
@@ -2616,13 +2644,13 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                             chat_id=driver_chat_id,
                             text=strike_txt,
                             parse_mode="Markdown",
-                            reply_markup=InlineKeyboardMarkup(ref_buttons),
+                            reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                         )
                     except BadRequest:
                         await context.bot.send_message(
                             chat_id=driver_chat_id,
                             text=strike_txt.replace("`", "").replace("*", ""),
-                            reply_markup=InlineKeyboardMarkup(ref_buttons),
+                            reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                         )
             except Exception as e:
                 logger.error(f"Error sending to driver {driver.get('driver_name')} (chat_id={driver_chat_id}): {e!r}")
@@ -2686,9 +2714,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     # Supervisory: full log with phone and price — per-group supervisory + SUPERVISORY_TELEGRAM_ID (deduped)
     supervisory_telegram_id = selected_group.get("supervisory_telegram_id")
-    supervisory_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
-    ])
+    supervisory_keyboard = _driver_receipt_keyboard_only()
     await _send_to_supervisory_chats(
         context,
         supervisory_telegram_id,
@@ -2902,12 +2928,7 @@ async def _handle_resend_to_drivers(
     )
     if spec:
         driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
-    accept_keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead_id}"),
-        ]
-    ])
+    accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
     assigned_count = 0
     for driver in selected_drivers:
         tid = driver.get("driver_telegram_id")
@@ -2940,7 +2961,7 @@ async def _handle_resend_to_drivers(
                         "To view all receipts type /receipts"
                     ),
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(ref_buttons),
+                    reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                 )
         except Exception as e:
             logger.error("Resend to driver %s: %s", driver.get("driver_name"), e)
@@ -3021,12 +3042,18 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     driver = _driver_row_for_telegram_user(query.from_user.id)
     if not driver:
-        await query.message.reply_text("❌ Error: Driver not found in system.")
+        await query.message.reply_text(
+            "❌ Error: Driver not found in system.",
+            reply_markup=_driver_receipt_keyboard_only(),
+        )
         return
 
     lead = db.get_lead_by_id(lead_id)
     if not lead:
-        await query.message.edit_text("❌ Error: Lead not found.")
+        await query.message.edit_text(
+            "❌ Error: Lead not found.",
+            reply_markup=_driver_receipt_keyboard_only(),
+        )
         return
     
     # Check if lead is already accepted
@@ -3040,7 +3067,8 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "3. Go the extra🛣️mile, post ads instead of doing nothing waiting ask us how.\n\n"
             "-Thank you 🙏\n"
             "🏁Automated🏎️Automotive",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=_driver_receipt_keyboard_only(),
         )
         return
     
@@ -3063,11 +3091,8 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Send confirmation to driver (plain text — long template with payment lines from Config)
         confirmation_message = _build_driver_lead_accepted_message(lead)
 
-        # Add receipt submission button
-        receipt_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
-        ])
-        
+        receipt_keyboard = _driver_receipt_keyboard_only()
+
         await query.message.edit_text(
             "✅ **You accepted this lead!**",
             parse_mode="Markdown"
@@ -3080,6 +3105,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text(
             f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
             parse_mode="HTML",
+            reply_markup=receipt_keyboard,
         )
         pending = db.get_driver_pending_receipts(driver["id"])
         if pending:
@@ -3119,7 +3145,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.message.reply_text(
                 txt,
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(ref_buttons),
+                reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
             )
         # Forward acceptance message to group and supervisory (global + per-group)
         extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
@@ -3177,10 +3203,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ],
         )
     else:
-        # Fallback error
         await query.message.edit_text(
             "❌ **Error accepting lead. Please try again.**",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=_driver_receipt_keyboard_only(),
         )
 
 
@@ -3194,7 +3220,10 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     driver = _driver_row_for_telegram_user(query.from_user.id)
     if not driver:
-        await query.message.reply_text("❌ Error: Driver not found in system.")
+        await query.message.reply_text(
+            "❌ Error: Driver not found in system.",
+            reply_markup=_driver_receipt_keyboard_only(),
+        )
         return
 
     db.decline_lead_assignment(lead_id, driver['id'])
@@ -3202,7 +3231,8 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.message.edit_text(
         "❌ **Lead Declined**\n\n"
         "You have declined this lead.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=_driver_receipt_keyboard_only(),
     )
 
 
@@ -3461,7 +3491,10 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
         return ConversationHandler.END
     pending = db.get_driver_pending_receipts(driver["id"])
     if not pending:
-        await update.message.reply_text("✅ You don't owe any receipts right now.")
+        await update.message.reply_text(
+            "✅ You don't owe any receipts right now.",
+            reply_markup=_driver_receipt_keyboard_only(),
+        )
         return ConversationHandler.END
     max_show = 90
     n_total = len(pending)
@@ -3497,16 +3530,17 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
         )
     parts.append(f"🧾 <b>Upload these ({len(rows)})</b> — tap a reference:")
     body = "\n\n".join(parts)
+    receipt_kb = _keyboard_receipt_plus_rows(rows)
     try:
         await update.message.reply_text(
             body,
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=receipt_kb,
         )
     except BadRequest:
         await update.message.reply_text(
             body.replace("<b>", "").replace("</b>", ""),
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=receipt_kb,
         )
     return ConversationHandler.END
 
@@ -3539,6 +3573,7 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Upload Receipt", callback_data="confirm_receipt")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_receipt")],
+        [_DRIVER_RECEIPT_BTN],
     ])
     db.set_user_state(query.from_user.id, "waiting_receipt_confirm", context.user_data)
     await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -3652,7 +3687,8 @@ async def handle_receipt_image_stray(update: Update, context: ContextTypes.DEFAU
     msg = update.effective_message
     if msg:
         await msg.reply_text(
-            "Please send a photo or an image file (JPG, PNG, or WebP) of the receipt."
+            "Please send a photo or an image file (JPG, PNG, or WebP) of the receipt.",
+            reply_markup=_driver_receipt_keyboard_only(),
         )
     return STATE_WAITING_RECEIPT_IMAGE
 
@@ -3768,6 +3804,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Receipt for Reference ID `{reference_id}` has been uploaded and processed.\n"
             "Status updated to 'PAID RECEIPT' in Monday.com.",
             parse_mode="Markdown",
+            reply_markup=_driver_receipt_keyboard_only(),
         )
 
         await _notify_lead_lifecycle(
@@ -3904,6 +3941,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                     "✅ **Suspension lifted!**\n\n"
                     "You have cleared enough receipts. You can now receive new leads again.",
                     parse_mode="Markdown",
+                    reply_markup=_driver_receipt_keyboard_only(),
                 )
                 dn_esc = _telegram_md1_escape(driver_name)
                 try:
@@ -4079,10 +4117,7 @@ async def _send_renewal_to_driver(context: ContextTypes.DEFAULT_TYPE, renewal: d
         return False
     short_r = _short_uuid(renewal["id"])
     short_d = _short_uuid(driver["id"])
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}{short_d}"),
-        InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}{short_d}"),
-    ]])
+    kb = _keyboard_renewal_driver(short_r, short_d)
     text = _build_renewal_driver_message(renewal)
     try:
         msg = await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
@@ -4306,9 +4341,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
     # Send the full accepted lead details to the driver
     lead_full = db.get_lead_by_id(renewal.get("lead_id")) or lead
     confirmation = _build_driver_lead_accepted_message(lead_full)
-    receipt_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")]
-    ])
+    receipt_kb = _driver_receipt_keyboard_only()
     try:
         await query.message.reply_text(confirmation, reply_markup=receipt_kb)
     except Exception as e:
@@ -4318,6 +4351,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(
             f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
             parse_mode="HTML",
+            reply_markup=receipt_kb,
         )
     except Exception as e:
         logger.warning("Could not send renewal ref copy line: %s", e)
@@ -4600,6 +4634,7 @@ def main():
                             chat_id=cid,
                             text=f"⏰ **Lead expired.**\n\nReference ID: `{reference_id}`\n\nNo one accepted in time.",
                             parse_mode="Markdown",
+                            reply_markup=_driver_receipt_keyboard_only(),
                         )
                     except Exception as e:
                         logger.warning("Driver timeout notify to %s: %s", tid, e)
@@ -4650,6 +4685,7 @@ def main():
                             "To view all receipts type /receipts"
                         ),
                         parse_mode="Markdown",
+                        reply_markup=_driver_receipt_keyboard_only(),
                     )
                     db.mark_receipt_reminder_sent(assignment_id)
                     logger.info("Receipt reminder sent to driver for ref %s", ref)
