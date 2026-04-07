@@ -90,7 +90,7 @@ _VIN_CONFLICT_INTRO = (
 )
 
 
-def _vin_conflict_body(stated_car: str, api_car: str) -> str:
+def _vin_conflict_body(_stated_car: str, api_car: str) -> str:
     return (
         f"{_VIN_CONFLICT_INTRO}"
         f"• VIN result in DMV : {api_car}\n\n"
@@ -154,6 +154,8 @@ def _get_suspended_driver_ids() -> set[str]:
 def _norm_chat_id(cid) -> int | str | None:
     """Normalize Telegram chat id for set deduplication (int when possible)."""
     if cid is None:
+        return None
+    if isinstance(cid, bool):
         return None
     if isinstance(cid, int):
         return cid
@@ -954,6 +956,8 @@ def _clean_vin_and_car(state_data: dict) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and initialize state."""
+    if not update.message:
+        return ConversationHandler.END
     user = update.effective_user
     user_id = user.id
     username = user.username or "Unknown"
@@ -1863,15 +1867,20 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle Phase 2: Phone number and price, then issuer note, then driver-only note, then encrypt."""
-    if not update.message or update.message.text is None:
-        return STATE_PHASE2
     user_id = update.effective_user.id
-    message_text = update.message.text
+    msg = update.effective_message
+    if not msg or not (getattr(msg, "text", None) or "").strip():
+        if msg:
+            await msg.reply_text(
+                "❌ Please send your phone number and price as text (e.g. +1 732 534 2659 $500)."
+            )
+        return STATE_PHASE2
+    message_text = msg.text
 
     # Get phase 1 data
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
-        await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
+        await msg.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
 
     phase1_data = state.get("data", {})
@@ -1888,7 +1897,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Example: "+1234567890" is already a valid 10-digit number (area code can start with 1),
     # and stripping would corrupt it and break encryption/unlock downstream.
     if len(digits_only) not in (9, 10) or not price:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Please provide both phone number and price.\n"
             "Phone in any format (e.g. +1 (732) 534-2659, 732-534-2659, 732 534 2659) and price with $ (e.g. $500)."
         )
@@ -1900,7 +1909,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     state_data["pending_phone_number"] = phone_number
     state_data["pending_price"] = price
     db.set_user_state(user_id, "special_request_issuers", state_data)
-    await update.message.reply_text(
+    await msg.reply_text(
         "✅ Phone and price received!\n\n"
         "📝 **Special request to issuers** (optional)\n\n"
         "This will be included in the **group** lead message. Send **-** if none:",
@@ -3011,12 +3020,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lead_id = query.data.replace("accept_lead_", "")
     
     driver = _driver_row_for_telegram_user(query.from_user.id)
-    
     if not driver:
         await query.message.reply_text("❌ Error: Driver not found in system.")
         return
-    
-    # Get lead details first to check if already accepted
+
     lead = db.get_lead_by_id(lead_id)
     if not lead:
         await query.message.edit_text("❌ Error: Lead not found.")
@@ -3186,12 +3193,10 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     lead_id = query.data.replace("decline_lead_", "")
     
     driver = _driver_row_for_telegram_user(query.from_user.id)
-    
     if not driver:
         await query.message.reply_text("❌ Error: Driver not found in system.")
         return
-    
-    # Decline the assignment
+
     db.decline_lead_assignment(lead_id, driver['id'])
     
     await query.message.edit_text(
@@ -3562,13 +3567,18 @@ async def handle_driver_receipt_callback(update: Update, context: ContextTypes.D
 async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle reference ID input."""
     user_id = update.effective_user.id
-    reference_id = update.message.text.strip().upper()
+    msg = update.effective_message
+    if not msg or not (getattr(msg, "text", None) or "").strip():
+        if msg:
+            await msg.reply_text("Please send the reference ID as text, or type /cancel.")
+        return STATE_WAITING_REFERENCE_ID
+    reference_id = msg.text.strip().upper()
     
     # Get lead by reference ID
     lead = db.get_lead_by_reference_id(reference_id)
     
     if not lead:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Reference ID not found. Please check and try again.\n"
             "Or type /cancel to cancel."
         )
@@ -3576,7 +3586,7 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
 
     drv = _driver_row_for_telegram_user(user_id)
     if not drv or not _driver_accepted_this_lead(drv["id"], lead["id"]):
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ You can only upload receipts for leads you accepted."
         )
         db.clear_user_state(user_id)
@@ -3602,7 +3612,7 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_receipt")]
     ])
     
-    await update.message.reply_text(
+    await msg.reply_text(
         confirmation_message,
         parse_mode="Markdown",
         reply_markup=confirm_keyboard
@@ -3630,9 +3640,20 @@ async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.
     
     await query.message.reply_text(
         "📸 **Upload Receipt**\n\n"
-        "Please upload the receipt image now🧾.\n\n"
+        "Please upload the receipt image now🧾.\n\n",
+        parse_mode="Markdown",
     )
     
+    return STATE_WAITING_RECEIPT_IMAGE
+
+
+async def handle_receipt_image_stray(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User sent text or non-image while waiting for receipt photo — nudge without leaving state."""
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            "Please send a photo or an image file (JPG, PNG, or WebP) of the receipt."
+        )
     return STATE_WAITING_RECEIPT_IMAGE
 
 
@@ -4516,7 +4537,13 @@ def main():
         states={
             STATE_WAITING_REFERENCE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reference_id_input)],
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
-            STATE_WAITING_RECEIPT_IMAGE: [MessageHandler(_receipt_image_filter, handle_receipt_image)],
+            STATE_WAITING_RECEIPT_IMAGE: [
+                MessageHandler(_receipt_image_filter, handle_receipt_image),
+                MessageHandler(
+                    (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND,
+                    handle_receipt_image_stray,
+                ),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
