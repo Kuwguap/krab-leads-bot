@@ -86,14 +86,13 @@ _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
 _VIN_CONFLICT_INTRO = (
     "Pulling up 17 Digit Vin in DMV portal🧐\n\n"
-    "Your Vehicle pulls up in the system!\n"
+    "Success ! Your Vehicle pulls up in the Motor Vehicle system!\n"
 )
 
 
 def _vin_conflict_body(stated_car: str, api_car: str) -> str:
     return (
         f"{_VIN_CONFLICT_INTRO}"
-        f"• VIN result you entered : {stated_car}\n"
         f"• VIN result in DMV : {api_car}\n\n"
         "Choose which to use:"
     )
@@ -958,7 +957,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     user_id = user.id
     username = user.username or "Unknown"
-    
+
+    driver = _driver_row_for_telegram_user(user_id)
+    if driver:
+        driver_nm = driver.get("driver_name", username)
+        pending = db.get_driver_pending_receipts(driver["id"])
+        n = len(pending)
+        lines = [f"Welcome back, {driver_nm}! 🚗"]
+        if n >= SUSPENSION_THRESHOLD:
+            lines.append(
+                f"\n⛔ You are currently suspended — you owe {n} receipt(s).\n"
+                "Upload all outstanding receipts to resume receiving leads."
+            )
+        elif n > 0:
+            lines.append(
+                f"\n⚠️ You owe {n} receipt(s). At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended."
+            )
+        lines.append("\nTo view all receipts type /receipts")
+        lines.append(f"\n{motivation.get_random_quote()}")
+        lines.append("\n🏁Automated🏎Automotive")
+        await update.message.reply_text("\n".join(lines))
+        return ConversationHandler.END
+
     # Clear any existing state and attached files from previous leads
     db.clear_user_state(user_id)
     if context.user_data:
@@ -2070,6 +2090,23 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         reference_id = lead.get("reference_id", "N/A")
+        _pg_name = primary_group.get("group_name", "N/A")
+        try:
+            _sup_cid = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+            if _sup_cid:
+                await context.bot.send_message(
+                    chat_id=_sup_cid,
+                    text=(
+                        f"🆕 <b>New lead created</b>\n\n"
+                        f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
+                        f"Group: {html.escape(_pg_name, quote=False)}\n"
+                        "Mode: Broadcast to all groups"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning("Could not send new-lead alert to supervisory: %s", e)
+
         un = query.from_user.username
         from_line = f"@{un}" if un else (query.from_user.first_name or "Unknown")
         group_offer_message = (
@@ -2331,6 +2368,21 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
+        _grp_name = selected_group.get("group_name", "N/A")
+        try:
+            _sup_cid = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+            if _sup_cid:
+                await context.bot.send_message(
+                    chat_id=_sup_cid,
+                    text=(
+                        f"🆕 <b>New lead created</b>\n\n"
+                        f"Reference: <code>{html.escape(str(lead.get('reference_id', 'N/A')), quote=False)}</code>\n"
+                        f"Group: {html.escape(_grp_name, quote=False)}"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
     had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
@@ -2532,17 +2584,17 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     else:
                         raise
                 assigned_count += 1
-                # Strike message: if driver has 1–2 pending receipts, remind them
                 pending = db.get_driver_pending_receipts(driver['id'])
-                if 1 <= len(pending) <= 2:
+                if pending and len(pending) < SUSPENSION_THRESHOLD:
                     ref_buttons = [
-                        [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                        [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
                         for p in pending
                     ]
                     strike_txt = (
-                        f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s):\n\n"
+                        f"⚠️ You owe **{len(pending)}** receipt(s):\n\n"
                         + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending)
-                        + "\n\nTap below to view details and upload:"
+                        + f"\n\nAt **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended** from new leads."
+                        + "\n\nTo view all receipts type /receipts"
                     )
                     try:
                         await context.bot.send_message(
@@ -2859,14 +2911,18 @@ async def _handle_resend_to_drivers(
             )
             assigned_count += 1
             pending = db.get_driver_pending_receipts(driver["id"])
-            if 1 <= len(pending) <= 2:
+            if pending and len(pending) < SUSPENSION_THRESHOLD:
                 ref_buttons = [
-                    [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                    [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
                     for p in pending
                 ]
                 await context.bot.send_message(
                     chat_id=cid,
-                    text=f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s). Tap to view and upload:",
+                    text=(
+                        f"⚠️ You owe **{len(pending)}** receipt(s). "
+                        f"At **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended**.\n\n"
+                        "To view all receipts type /receipts"
+                    ),
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(ref_buttons),
                 )
@@ -3017,20 +3073,41 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
             parse_mode="HTML",
         )
-        # Strike message: remind about pending receipts
         pending = db.get_driver_pending_receipts(driver["id"])
         if pending:
             ref_buttons = [
-                [InlineKeyboardButton(f"📋 {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
                 for p in pending[:10]
             ]
             if len(pending) >= SUSPENSION_THRESHOLD:
                 txt = (
-                    f"⛔ **Temporary suspension**\n\n"
-                    f"You owe **{len(pending)}** receipt(s). Upload all to resume receiving leads:"
+                    f"⛔ **You have been suspended**\n\n"
+                    f"Reason: You owe **{len(pending)}** receipt(s). "
+                    "You will not receive new leads until all outstanding receipts are uploaded.\n\n"
+                    "To view all receipts type /receipts"
                 )
+                driver_nm = driver.get("driver_name", "Unknown")
+                try:
+                    sup_txt = (
+                        f"⛔ **Driver Suspended**\n\n"
+                        f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
+                        f"Reason: {len(pending)} unpaid receipt(s)"
+                    )
+                    sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+                    if sup_id:
+                        try:
+                            await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
+                        except BadRequest:
+                            await context.bot.send_message(chat_id=sup_id, text=sup_txt.replace("*", ""))
+                except Exception as e:
+                    logger.warning("Could not send suspension alert to supervisory: %s", e)
             else:
-                txt = f"⚠️ You have not submitted receipt for **{len(pending)}** lead(s). Tap to view and upload:"
+                txt = (
+                    f"⚠️ You owe **{len(pending)}** receipt(s).\n\n"
+                    f"At **{SUSPENSION_THRESHOLD}** unpaid you will be "
+                    "**temporarily suspended** from new leads.\n\n"
+                    "To view all receipts type /receipts"
+                )
             await query.message.reply_text(
                 txt,
                 parse_mode="Markdown",
@@ -3408,14 +3485,14 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
     parts = []
     if n_total >= SUSPENSION_THRESHOLD:
         parts.append(
-            "⛔ <b>Temporary suspension</b>: you have "
-            f"{SUSPENSION_THRESHOLD}+ unpaid receipts. You will not receive new leads until every "
-            "outstanding receipt below is uploaded."
+            "⛔ <b>You are suspended</b>\n\n"
+            f"Reason: You owe <b>{n_total}</b> receipt(s). "
+            "You will not receive new leads until all outstanding receipts are uploaded."
         )
     elif n_total > 0:
         parts.append(
-            f"⚠️ You owe <b>{n_total}</b> receipt(s). At <b>{SUSPENSION_THRESHOLD}</b> unpaid, you are "
-            "<b>temporarily suspended</b> from new leads until all are uploaded."
+            f"⚠️ You owe <b>{n_total}</b> receipt(s). At <b>{SUSPENSION_THRESHOLD}</b> unpaid you will be "
+            "<b>temporarily suspended</b> from new leads."
         )
     parts.append(f"🧾 <b>Upload these ({len(rows)})</b> — tap a reference:")
     body = "\n\n".join(parts)
@@ -3622,7 +3699,6 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         db.clear_user_state(user_id)
         return ConversationHandler.END
 
-    # Get the driver who accepted this lead
     assignment_status = db.get_lead_assignment_status(lead_id)
     driver_name = "Driver"
     if assignment_status:
@@ -3633,7 +3709,10 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         if driver:
             driver_name = driver.get("driver_name", "Driver")
-    
+
+    pending_before = db.get_driver_pending_receipts(dr_check["id"]) if dr_check else []
+    was_suspended = len(pending_before) >= SUSPENSION_THRESHOLD
+
     storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
     stored_url = _normalize_receipt_image_url(
         ((storage_url or "").strip() or telegram_file_url).strip()
@@ -3798,12 +3877,41 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception as e:
             logger.error(f"Error sending completion message via @krabsenderbot: {e}")
+
+        if was_suspended and dr_check:
+            pending_after = db.get_driver_pending_receipts(dr_check["id"])
+            if len(pending_after) < SUSPENSION_THRESHOLD:
+                await update.message.reply_text(
+                    "✅ **Suspension lifted!**\n\n"
+                    "You have cleared enough receipts. You can now receive new leads again.",
+                    parse_mode="Markdown",
+                )
+                dn_esc = _telegram_md1_escape(driver_name)
+                try:
+                    sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+                    if sup_id:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=sup_id,
+                                text=(
+                                    f"✅ **Suspension removed**\n\n"
+                                    f"Driver: **{dn_esc}**\n"
+                                    f"Remaining receipts: {len(pending_after)}"
+                                ),
+                                parse_mode="Markdown",
+                            )
+                        except BadRequest:
+                            await context.bot.send_message(
+                                chat_id=sup_id,
+                                text=f"✅ Suspension removed\n\nDriver: {driver_name}\nRemaining receipts: {len(pending_after)}",
+                            )
+                except Exception as e:
+                    logger.warning("Could not send suspension-lifted alert to supervisory: %s", e)
     else:
         await update.message.reply_text(
             "❌ Error uploading receipt. Please try again or contact support."
         )
     
-    # Clear user state
     db.clear_user_state(user_id)
     
     return ConversationHandler.END
@@ -4511,7 +4619,11 @@ def main():
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id_int,
-                        text=f"🧾 **Receipt reminder**\n\nReference ID: `{ref}`\n\nPlease submit your receipt when you can.",
+                        text=(
+                            f"🧾 **Receipt reminder**\n\nReference ID: `{ref}`\n\n"
+                            "Please submit your receipt when you can.\n\n"
+                            "To view all receipts type /receipts"
+                        ),
                         parse_mode="Markdown",
                     )
                     db.mark_receipt_reminder_sent(assignment_id)
