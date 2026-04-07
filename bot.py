@@ -1505,6 +1505,7 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
             "**Phase 2:** Please provide phone number and price.\n"
             "After that: optional notes for issuers (group) and for drivers only.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')",
+            parse_mode="Markdown",
         )
         return STATE_PHASE2
     # add_files_yes
@@ -1619,6 +1620,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             "**Phase 2:** Please provide phone number and price.\n"
             "After that: optional notes for issuers (group) and for drivers only.\n"
             "Format: Phone number and price (e.g., '+1234567890 $500')",
+            parse_mode="Markdown",
         )
         return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
@@ -1683,7 +1685,8 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
     ek = context.user_data.get("phase1_pending_edit_key")
     if not ek:
         await update.message.reply_text(
-            "Use the buttons above (**Change another field** or **Done — continue lead**), or /start to begin again."
+            "Use the buttons above (**Change another field** or **Done — continue lead**), or /start to begin again.",
+            parse_mode="Markdown",
         )
         return STATE_AI_EDIT_INPUT
     text = (update.message.text or "").strip()
@@ -1860,6 +1863,8 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle Phase 2: Phone number and price, then issuer note, then driver-only note, then encrypt."""
+    if not update.message or update.message.text is None:
+        return STATE_PHASE2
     user_id = update.effective_user.id
     message_text = update.message.text
 
@@ -2368,7 +2373,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
-        _grp_name = selected_group.get("group_name", "N/A")
+        _grp_obj = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
+        _grp_name = (_grp_obj.get("group_name") if _grp_obj else None) or lead_data.get("selected_group", {}).get("group_name") or "N/A"
         try:
             _sup_cid = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
             if _sup_cid:
@@ -2867,11 +2873,12 @@ async def _handle_resend_to_drivers(
         return ConversationHandler.END
     all_drivers = db.get_all_drivers()
     active_drivers = [d for d in all_drivers if record_is_active(d)]
+    suspended = _get_suspended_driver_ids()
     if callback_data == "select_driver_all":
-        selected_drivers = active_drivers
+        selected_drivers = [d for d in active_drivers if str(d.get("id")) not in suspended]
     else:
         driver_id = callback_data.replace("select_driver_", "")
-        selected_drivers = [d for d in active_drivers if d["id"] == driver_id]
+        selected_drivers = [d for d in active_drivers if str(d.get("id")) == str(driver_id)]
         if not selected_drivers:
             await update.callback_query.message.reply_text("❌ Driver not found.")
             return STATE_SELECT_DRIVER
@@ -2961,15 +2968,15 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     lead = db.get_lead_by_id(lead_id)
     if not lead:
         await query.message.reply_text("❌ Lead not found. Use /start to create a new lead.")
-        return
+        return ConversationHandler.END
     group_id = lead.get("group_id")
     if not group_id:
         await query.message.reply_text("❌ Lead has no group. Use /start to create a new lead.")
-        return
+        return ConversationHandler.END
     selected_group = db.get_group_by_id(group_id)
     if not selected_group:
         await query.message.reply_text("❌ Group not found. Use /start to create a new lead.")
-        return
+        return ConversationHandler.END
     reference_id = lead.get("reference_id") or "N/A"
     resend_data = {
         "lead_id": lead_id,
@@ -2983,9 +2990,8 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await query.message.reply_text("❌ No active drivers found. Please contact admin.")
-        return
-    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
+        return ConversationHandler.END
+    driver_keyboard = _build_driver_keyboard(active_drivers, exclude_suspended=True, include_all=True)
     await query.message.reply_text(
         f"🔄 **Pick new driver**\n\n"
         f"Reference ID: `{reference_id}`\n\n"
@@ -3004,12 +3010,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Extract lead_id from callback_data (format: "accept_lead_{lead_id}")
     lead_id = query.data.replace("accept_lead_", "")
     
-    # Get driver info
-    driver_telegram_id = str(query.from_user.id)
-    
-    # Find driver by telegram ID
-    drivers = db.get_all_drivers()
-    driver = next((d for d in drivers if d.get('driver_telegram_id') == driver_telegram_id), None)
+    driver = _driver_row_for_telegram_user(query.from_user.id)
     
     if not driver:
         await query.message.reply_text("❌ Error: Driver not found in system.")
@@ -3184,12 +3185,7 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Extract lead_id from callback_data
     lead_id = query.data.replace("decline_lead_", "")
     
-    # Get driver info
-    driver_telegram_id = str(query.from_user.id)
-    
-    # Find driver by telegram ID
-    drivers = db.get_all_drivers()
-    driver = next((d for d in drivers if d.get('driver_telegram_id') == driver_telegram_id), None)
+    driver = _driver_row_for_telegram_user(query.from_user.id)
     
     if not driver:
         await query.message.reply_text("❌ Error: Driver not found in system.")
@@ -3556,7 +3552,8 @@ async def handle_driver_receipt_callback(update: Update, context: ContextTypes.D
     
     await query.message.reply_text(
         "📋 **Driver Receipt Submission**\n\n"
-        "Please enter the Reference ID for the lead you want to submit a receipt for."
+        "Please enter the Reference ID for the lead you want to submit a receipt for.",
+        parse_mode="Markdown",
     )
     
     return STATE_WAITING_REFERENCE_ID
@@ -3582,14 +3579,14 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(
             "❌ You can only upload receipts for leads you accepted."
         )
+        db.clear_user_state(user_id)
         return ConversationHandler.END
 
-    # Store lead ID in context for later use
     context.user_data['receipt_lead_id'] = lead['id']
     context.user_data['receipt_reference_id'] = reference_id
     context.user_data['receipt_monday_item_id'] = lead.get('monday_item_id')
-    
-    # Show lead details for confirmation – phone only via one-time link
+    db.set_user_state(user_id, "waiting_receipt_confirm", context.user_data)
+
     delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
     confirmation_message = (
         f"✅ **Lead Found**\n\n"
@@ -3748,7 +3745,8 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "✅ **Receipt Submitted Successfully!**\n\n"
             f"Receipt for Reference ID `{reference_id}` has been uploaded and processed.\n"
-            "Status updated to 'PAID RECEIPT' in Monday.com."
+            "Status updated to 'PAID RECEIPT' in Monday.com.",
+            parse_mode="Markdown",
         )
 
         await _notify_lead_lifecycle(
@@ -4087,7 +4085,7 @@ async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id
     logger.info("Renewal %s: group escalation triggered", renewal_id)
     db.update_renewal(renewal_id, {
         "group_status": "escalated",
-        "group_escalated_at": "now()",
+        "group_escalated_at": datetime.utcnow().isoformat(),
     })
     groups = db.get_all_groups()
     active = [g for g in groups if record_is_active(g)]
@@ -4109,7 +4107,7 @@ async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_i
     logger.info("Renewal %s: driver escalation triggered", renewal_id)
     db.update_renewal(renewal_id, {
         "driver_status": "escalated",
-        "driver_escalated_at": "now()",
+        "driver_escalated_at": datetime.utcnow().isoformat(),
     })
     group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
     drivers = db.get_active_drivers_for_group(group_id) if group_id else []
@@ -4117,7 +4115,7 @@ async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_i
     original_did = renewal.get("original_driver_id")
     refreshed = db.get_renewal_by_id(renewal_id) or renewal
     for d in (drivers or []):
-        if d.get("id") == original_did:
+        if str(d.get("id")) == str(original_did):
             continue
         if str(d.get("id")) in suspended:
             continue
@@ -4174,14 +4172,14 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     original_driver = None
     if original_did:
         all_drivers = db.get_all_drivers()
-        original_driver = next((d for d in all_drivers if d.get("id") == original_did), None)
+        original_driver = next((d for d in all_drivers if str(d.get("id")) == str(original_did)), None)
 
     # Phase 2: send to original driver first
     sent_to_driver = False
     if original_driver and record_is_active(original_driver):
         db.update_renewal(renewal_id, {
             "driver_status": "sent",
-            "driver_sent_at": "now()",
+            "driver_sent_at": datetime.utcnow().isoformat(),
         })
         sent_to_driver = await _send_renewal_to_driver(context, refreshed, original_driver)
 
@@ -4273,7 +4271,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
     ref = lead.get("reference_id", "N/A")
     driver = None
     all_drivers = db.get_all_drivers()
-    driver = next((d for d in all_drivers if d.get("id") == driver_id), None)
+    driver = next((d for d in all_drivers if str(d.get("id")) == str(driver_id)), None)
     dname = driver.get("driver_name", "Driver") if driver else "Driver"
 
     try:
@@ -4649,7 +4647,7 @@ def main():
                 db.update_renewal(renewal_id, {
                     "status": "group_phase",
                     "group_status": "sent",
-                    "group_sent_at": "now()",
+                    "group_sent_at": datetime.utcnow().isoformat(),
                 })
                 sent = False
                 if original_group and record_is_active(original_group):

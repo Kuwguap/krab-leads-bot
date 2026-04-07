@@ -239,11 +239,12 @@ class Database:
             return False
         
         try:
-            self.client.table("leads").update({
+            response = self.client.table("leads").update({
                 "receipt_image_url": receipt_image_url,
                 "monday_status": "Paid"
-            }).eq("id", lead_id).execute()
-            return True
+            }).eq("id", lead_id).select("id").execute()
+            rows = getattr(response, "data", None) or []
+            return bool(rows)
         except Exception as e:
             error_msg = str(e)
             if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
