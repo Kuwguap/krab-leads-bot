@@ -1079,15 +1079,24 @@ def _telegram_md1_escape(text: str) -> str:
 
 
 def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Optional[dict]:
-    """Ensure we have a group dict (DB row); JSON state may omit or flatten selected_group."""
-    sg = lead_data.get("selected_group")
-    if isinstance(sg, dict) and sg.get("id") is not None:
-        return sg
+    """Resolve the group row for this lead.
+
+    Always prefer the persisted ``leads.group_id`` when ``lead`` is provided: after a
+    broadcast offer, the winning group is written in the DB while user state may still
+    hold the primary ``selected_group`` from broadcast setup — using state first caused
+    wrong group names in notifications.
+    """
     gid = None
     if lead and lead.get("group_id") is not None:
         gid = lead.get("group_id")
-    if gid is None:
-        gid = lead_data.get("group_id")
+    if gid is not None:
+        g = db.get_group_by_id(gid)
+        if g:
+            return g
+    sg = lead_data.get("selected_group")
+    if isinstance(sg, dict) and sg.get("id") is not None:
+        return sg
+    gid = lead_data.get("group_id")
     if gid is not None:
         g = db.get_group_by_id(gid)
         if g:
@@ -1341,13 +1350,20 @@ def _delivery_block_plain(lead: dict) -> str:
     return raw.replace("\r\n", "\n")
 
 
-def _build_driver_lead_accepted_message(lead: dict) -> str:
-    """Full post-accept DM for drivers (plain text; avoids Markdown parse issues)."""
-    link = (lead.get("encrypted_link") or "").strip() or "N/A"
-    price = (lead.get("price") or "").strip() or "N/A"
-    ref = (lead.get("reference_id") or "").strip() or "N/A"
-    extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
-    delivery = _delivery_block_plain(lead)
+def _build_driver_lead_accepted_message_html(lead: dict) -> str:
+    """Full post-accept DM for drivers (HTML): tap-to-copy reference in <code>, safe escapes."""
+    def esc(s: str) -> str:
+        return html.escape(str(s or ""), quote=False)
+
+    link_raw = (lead.get("encrypted_link") or "").strip() or "N/A"
+    if link_raw.startswith("http://") or link_raw.startswith("https://"):
+        link_line = f'📞Phone <a href="{html.escape(link_raw, quote=True)}">open link</a>'
+    else:
+        link_line = f"📞Phone {esc(link_raw)}"
+    price = esc((lead.get("price") or "").strip() or "N/A")
+    ref = esc((lead.get("reference_id") or "").strip() or "N/A")
+    extra = esc(_sanitize_phones_for_send(lead.get("extra_info") or "") or "—")
+    delivery = esc(_delivery_block_plain(lead))
     spec_d = _lead_driver_note(lead)
     lines = [
         "✅ LEAD ACCEPTED — 🕊LET'S FLY 💸",
@@ -1357,23 +1373,23 @@ def _build_driver_lead_accepted_message(lead: dict) -> str:
         "",
         f"📝Extra info: {extra}",
         "📞 Call Client Now Confirm: 💰 Price • ⏱️ Time • 📍 Location • 🏷 Tag",
-        f"📞Phone {link}",
+        link_line,
         "📞 Click link 🔗 enter password to view",
         f"💰 Price: {price}",
-        f"🆔 Reference ID: {ref}",
+        f"🆔 Reference ID: <code>{ref}</code>",
     ]
     if spec_d:
-        lines.extend(["", f"📝 Special request (driver): {_sanitize_phones_for_send(spec_d)}"])
+        lines.extend(["", f"📝 Special request (driver): {esc(_sanitize_phones_for_send(spec_d))}"])
     lines.extend([
         "",
         "🚨Client must pay dealership directly🚨",
         "💳 We Accept all electronic payment methods:",
-        f"CashApp: {Config.DRIVER_PAYMENT_CASHAPP}",
-        f"Venmo: {Config.DRIVER_PAYMENT_VENMO}",
-        f"Zelle: {Config.DRIVER_PAYMENT_ZELLE}",
-        f"PayPal: {Config.DRIVER_PAYMENT_PAYPAL}",
+        f"CashApp: {esc(Config.DRIVER_PAYMENT_CASHAPP)}",
+        f"Venmo: {esc(Config.DRIVER_PAYMENT_VENMO)}",
+        f"Zelle: {esc(Config.DRIVER_PAYMENT_ZELLE)}",
+        f"PayPal: {esc(Config.DRIVER_PAYMENT_PAYPAL)}",
         "🌐 Payment Page",
-        Config.DRIVER_PAYMENT_PAGE_URL,
+        esc(Config.DRIVER_PAYMENT_PAGE_URL or ""),
         "🏦ask client to pay⚡️ electronically🏦",
         "",
         "⚠️ Important Message ‼️",
@@ -2435,14 +2451,13 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
 
     had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
-        won_gid = lead["group_id"]
-        group_id = won_gid
-        won_group = db.get_group_by_id(won_gid)
-        if won_group:
-            selected_group = won_group
+        group_id = lead["group_id"]
     skip_duplicate_full_group_post = bool(lead_data.get("follow_after_broadcast") and had_broadcast_offers)
 
     selected_group = _resolve_selected_group(lead_data, lead)
+    if lead_data.get("follow_after_broadcast") and selected_group:
+        lead_data["selected_group"] = selected_group
+        lead_data["group_id"] = selected_group.get("id")
     if not selected_group:
         await query.message.reply_text(
             "❌ Error: could not resolve the group for this lead. Please start over with /start."
@@ -3089,7 +3104,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logger.error(f"Error updating Monday.com driver column: {e}")
         
         # Send confirmation to driver (plain text — long template with payment lines from Config)
-        confirmation_message = _build_driver_lead_accepted_message(lead)
+        confirmation_message = _build_driver_lead_accepted_message_html(lead)
 
         receipt_keyboard = _driver_receipt_keyboard_only()
 
@@ -3097,16 +3112,16 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "✅ **You accepted this lead!**",
             parse_mode="Markdown"
         )
-        await query.message.reply_text(
-            confirmation_message,
-            reply_markup=receipt_keyboard,
-        )
-        ref_disp = (lead.get("reference_id") or "").strip() or "N/A"
-        await query.message.reply_text(
-            f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
-            parse_mode="HTML",
-            reply_markup=receipt_keyboard,
-        )
+        try:
+            await query.message.reply_text(
+                confirmation_message,
+                reply_markup=receipt_keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            plain = re.sub(r"<[^>]+>", "", confirmation_message)
+            await query.message.reply_text(plain, reply_markup=receipt_keyboard)
         pending = db.get_driver_pending_receipts(driver["id"])
         if pending:
             ref_buttons = [
@@ -3302,8 +3317,24 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 logger.warning("Could not refresh group offer message after late accept: %s", e)
         return
 
-    # Set lead.group_id to winning group
+    # Set lead.group_id to winning group (single accepted group per lead — enforced in DB)
     db.update_lead(lead_id, {"group_id": group_id})
+    lead = db.get_lead_by_id(lead_id) or lead
+    acc_row = db.get_accepted_group_for_lead(lead_id)
+    if not acc_row or str(acc_row.get("group_id")) != str(group_id):
+        logger.error(
+            "accept_group_offer: accepted offer row missing or mismatch (lead=%s group=%s row=%s)",
+            lead_id,
+            group_id,
+            acc_row,
+        )
+    if not lead or str(lead.get("group_id")) != str(group_id):
+        logger.error(
+            "accept_group_offer: leads.group_id not set to winner (lead=%s expected=%s got=%s)",
+            lead_id,
+            group_id,
+            (lead or {}).get("group_id"),
+        )
 
     reference_id = lead.get("reference_id", "N/A")
     winner_name = group.get("group_name", "Group")
@@ -3705,7 +3736,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         ph = update.message.photo[-1]
         receipt_file_id = ph.file_id
         file = await context.bot.get_file(receipt_file_id)
-        telegram_file_url = _telegram_download_url_from_path(file.file_path or "")
+        telegram_file_url = _telegram_download_url_from_file_path(file.file_path or "")
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         image_bytes = bio.getvalue()
@@ -3720,7 +3751,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             return STATE_WAITING_RECEIPT_IMAGE
         receipt_file_id = doc.file_id
         file = await context.bot.get_file(receipt_file_id)
-        telegram_file_url = _telegram_download_url_from_path(file.file_path or "")
+        telegram_file_url = _telegram_download_url_from_file_path(file.file_path or "")
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         image_bytes = bio.getvalue()
@@ -3771,9 +3802,17 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     stored_url = _normalize_receipt_image_url(
         ((storage_url or "").strip() or telegram_file_url).strip()
     )
+    if not (stored_url or "").strip():
+        logger.error("Receipt upload: no durable URL (lead_id=%s)", lead_id)
+        await update.message.reply_text(
+            "❌ Could not save the receipt file URL. Please try again or contact support."
+        )
+        return STATE_WAITING_RECEIPT_IMAGE
 
     # Update lead with receipt URL (prefer durable Supabase Storage public URL)
     success = db.update_lead_receipt(lead_id, stored_url)
+    if not success:
+        logger.error("update_lead_receipt failed lead_id=%s ref=%s", lead_id, reference_id)
     
     if success and monday and monday_item_id:
         # First, try to upload the actual image file to the Monday files4 column.
@@ -3799,23 +3838,40 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error(f"Error updating Monday.com status: {e}")
     
     if success:
-        await update.message.reply_text(
-            "✅ **Receipt Submitted Successfully!**\n\n"
-            f"Receipt for Reference ID `{reference_id}` has been uploaded and processed.\n"
-            "Status updated to 'PAID RECEIPT' in Monday.com.",
-            parse_mode="Markdown",
-            reply_markup=_driver_receipt_keyboard_only(),
+        ref_show = html.escape(str(reference_id or "N/A"), quote=False)
+        driver_confirm_html = (
+            "✅ <b>Receipt submitted successfully</b>\n\n"
+            f"Reference ID: <code>{ref_show}</code>\n"
+            "Your receipt is on file."
         )
+        try:
+            await update.message.reply_text(
+                driver_confirm_html,
+                parse_mode="HTML",
+                reply_markup=_driver_receipt_keyboard_only(),
+            )
+        except Exception as e:
+            logger.error("Driver receipt confirmation reply failed: %s", e)
+            try:
+                await update.message.reply_text(
+                    f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}",
+                    reply_markup=_driver_receipt_keyboard_only(),
+                )
+            except Exception as e2:
+                logger.error("Fallback driver receipt confirm failed: %s", e2)
 
-        await _notify_lead_lifecycle(
-            context,
-            lead,
-            3,
-            f"Receipt uploaded for lead ref# `{reference_id}`",
-            [f"Driver: **{_telegram_md1_escape(driver_name)}**"],
-            photo_url=stored_url,
-            photo_file_id=receipt_file_id,
-        )
+        try:
+            await _notify_lead_lifecycle(
+                context,
+                lead,
+                3,
+                f"Receipt uploaded for lead ref# `{reference_id}`",
+                [f"Driver: **{_telegram_md1_escape(driver_name)}**"],
+                photo_url=stored_url,
+                photo_file_id=receipt_file_id,
+            )
+        except Exception as e:
+            logger.warning("Lifecycle notify after receipt failed: %s", e)
 
         group_id = lead.get("group_id")
         group_name = "—"
@@ -3915,24 +3971,6 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                         )
                     except Exception as e2:
                         logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e2)
-        
-        # Send completion message via @krabsenderbot to driver_name
-        try:
-            completion_message = (
-                f"✅ **Delivery Completed**\n\n"
-                f"Receipt has been submitted for Reference ID: `{reference_id}`\n"
-                f"Thank you for completing this delivery!"
-            )
-            
-            # Use @krabsenderbot to send message to driver_name
-            # Format: @krabsenderbot send to driver_name
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"@krabsenderbot send to {driver_name}\n\n{completion_message}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Error sending completion message via @krabsenderbot: {e}")
 
         if was_suspended and dr_check:
             pending_after = db.get_driver_pending_receipts(dr_check["id"])
@@ -4340,21 +4378,23 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
 
     # Send the full accepted lead details to the driver
     lead_full = db.get_lead_by_id(renewal.get("lead_id")) or lead
-    confirmation = _build_driver_lead_accepted_message(lead_full)
+    confirmation = _build_driver_lead_accepted_message_html(lead_full)
     receipt_kb = _driver_receipt_keyboard_only()
     try:
-        await query.message.reply_text(confirmation, reply_markup=receipt_kb)
+        await query.message.reply_text(
+            confirmation,
+            reply_markup=receipt_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        plain = re.sub(r"<[^>]+>", "", confirmation)
+        try:
+            await query.message.reply_text(plain, reply_markup=receipt_kb)
+        except Exception as e:
+            logger.warning("Could not send renewal confirmation to driver: %s", e)
     except Exception as e:
         logger.warning("Could not send renewal confirmation to driver: %s", e)
-    try:
-        ref_disp = (lead_full.get("reference_id") or "").strip() or "N/A"
-        await query.message.reply_text(
-            f"📋 Reference ID: <code>{html.escape(ref_disp, quote=False)}</code>",
-            parse_mode="HTML",
-            reply_markup=receipt_kb,
-        )
-    except Exception as e:
-        logger.warning("Could not send renewal ref copy line: %s", e)
 
     # Notify the accepted group
     group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")

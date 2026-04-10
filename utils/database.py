@@ -244,11 +244,23 @@ class Database:
                 "monday_status": "Paid"
             }).eq("id", lead_id).select("id").execute()
             rows = getattr(response, "data", None) or []
-            return bool(rows)
+            if rows:
+                return True
         except Exception as e:
             error_msg = str(e)
             if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
                 logger.error(f"Error updating lead receipt: {e}")
+        # Fallback: receipt URL only if combined update failed (schema / RLS / column)
+        try:
+            response = self.client.table("leads").update({
+                "receipt_image_url": receipt_image_url,
+            }).eq("id", lead_id).select("id").execute()
+            rows = getattr(response, "data", None) or []
+            return bool(rows)
+        except Exception as e:
+            error_msg = str(e)
+            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+                logger.error(f"Error updating lead receipt (fallback): {e}")
             return False
     
     # Group management methods
