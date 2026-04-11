@@ -1403,6 +1403,44 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
     return "\n".join(lines)
 
 
+async def _phase1_finish_vision_extraction(
+    update: Update,
+    user_id: int,
+    raw_text: Optional[str],
+    *,
+    source_label: str = "image",
+) -> int:
+    """Normalize AI vision output, validate, then AI review — shared by photo and PDF."""
+    if not raw_text or not raw_text.strip():
+        await update.message.reply_text(
+            f"❌ Could not extract details from the {source_label}. "
+            "Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+    normalized = _normalize_ai_phase1_text(raw_text)
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
+    state_data = parse_phase1_structured(normalized_11)
+    _apply_single_address_as_both(state_data)
+    valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
+    if not valid:
+        err_blurb = "\n• ".join(validation_errors)
+        preview = (
+            f"Name: {state_data.get('name') or '-'}\n"
+            f"VIN: {state_data.get('vin') or '-'}\n"
+            f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
+        )
+        await update.message.reply_text(
+            "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
+            "Extracted preview:\n" + preview + "\n\n"
+            "Please send the details as text in the required 11-line structure, or try another photo or PDF."
+        )
+        return STATE_PHASE1
+    db.set_user_state(user_id, "phase1", state_data)
+    await _send_phase1_ai_review(update.message, state_data)
+    return STATE_AI_REVIEW
+
+
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle Phase 1 image upload: OCR + AI extract structured fields, then same flow as text."""
     user_id = update.effective_user.id
@@ -1431,35 +1469,58 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Please send the details as text in the required structure."
         )
         return STATE_PHASE1
-    if not raw_text or not raw_text.strip():
+    return await _phase1_finish_vision_extraction(update, user_id, raw_text, source_label="photo")
+
+
+async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Phase 1 PDF: render first page and run the same AI extraction + review as photos."""
+    user_id = update.effective_user.id
+    if not Config.is_ai_vision_configured():
         await update.message.reply_text(
-            "❌ Could not extract details from the image. Please send the details as text in the required structure."
+            "❌ Document extraction is not configured. Please send the details as text in the required structure."
         )
         return STATE_PHASE1
-    normalized = _normalize_ai_phase1_text(raw_text)
-    # Use first 11 lines only so field mapping is consistent (extra lines from AI are ignored)
-    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
-    normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
-    state_data = parse_phase1_structured(normalized_11)
-    _apply_single_address_as_both(state_data)
-    # Built-in checks: at least 11 lines, required fields (name + delivery); VIN format not enforced
-    valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
-    if not valid:
-        err_blurb = "\n• ".join(validation_errors)
-        preview = (
-            f"Name: {state_data.get('name') or '-'}\n"
-            f"VIN: {state_data.get('vin') or '-'}\n"
-            f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
-        )
+    msg = update.message
+    doc = msg.document if msg else None
+    if not doc:
+        await update.message.reply_text("❌ No document received.")
+        return STATE_PHASE1
+    mime = (doc.mime_type or "").lower()
+    fname = (doc.file_name or "").lower()
+    pdf_mimes = ("application/pdf", "application/x-pdf")
+    if mime not in pdf_mimes and not fname.endswith(".pdf"):
         await update.message.reply_text(
-            "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
-            "Extracted preview:\n" + preview + "\n\n"
-            "Please send the details as text in the required 11-line structure, or try another image."
+            "📄 In Phase 1, send **text**, a **photo/screenshot**, or a **PDF** with vehicle and delivery details.\n\n"
+            "Other file types are not supported for auto-extraction — use a PDF or type the details.",
+            parse_mode="Markdown",
         )
         return STATE_PHASE1
-    db.set_user_state(user_id, "phase1", state_data)
-    await _send_phase1_ai_review(update.message, state_data)
-    return STATE_AI_REVIEW
+    sz = doc.file_size
+    if sz is not None and sz > 20 * 1024 * 1024:
+        await update.message.reply_text(
+            "❌ This PDF is too large (max ~20 MB). Please send a smaller file or a screenshot."
+        )
+        return STATE_PHASE1
+    await update.message.reply_text("⏳ Processing PDF…")
+    file = await context.bot.get_file(doc.file_id)
+    bio = io.BytesIO()
+    await file.download_to_memory(out=bio)
+    pdf_bytes = bio.getvalue()
+    try:
+        raw_text = ai_vision.extract_structured_from_pdf(pdf_bytes)
+    except ai_vision.AIVisionQuotaError:
+        await update.message.reply_text(
+            "❌ Extraction is temporarily unavailable (API quota exceeded). "
+            "Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+    if not raw_text:
+        await update.message.reply_text(
+            "❌ Could not read this PDF (empty, invalid, or install failed). "
+            "Try another PDF, send a photo/screenshot, or type the details."
+        )
+        return STATE_PHASE1
+    return await _phase1_finish_vision_extraction(update, user_id, raw_text, source_label="PDF")
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1467,7 +1528,9 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_id = update.effective_user.id
     message_text = (update.message.text or "").strip()
     if not message_text:
-        await update.message.reply_text("Please send the client/vehicle and delivery details (text or a screenshot).")
+        await update.message.reply_text(
+            "Please send the client/vehicle and delivery details (text, screenshot, or PDF)."
+        )
         return STATE_PHASE1
 
     if Config.is_ai_vision_configured():
@@ -1605,16 +1668,6 @@ async def handle_add_files_stray_message(update: Update, context: ContextTypes.D
         parse_mode="Markdown",
     )
     return STATE_ADD_FILES
-
-
-async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Step 1 only parses text/photos; documents were ignored with no reply."""
-    await update.message.reply_text(
-        "📄 This step only accepts **text** or a **photo** (screenshot), not PDF/files.\n\n"
-        "Send your lead details that way first. On the next screen you can tap **Yes** to attach a PDF.",
-        parse_mode="Markdown",
-    )
-    return STATE_PHASE1
 
 
 async def handle_waiting_file_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

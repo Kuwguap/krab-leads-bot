@@ -18,7 +18,7 @@ class AIVisionQuotaError(Exception):
     pass
 
 # Expected output: exactly 11 lines in this order (used by parse_phase1_structured)
-STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details from an image (screenshot or form).
+STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details from an image or PDF page (screenshot, scan, or form).
 
 STRICT RULES:
 - Output ONLY a plain text block with exactly 11 lines. One line per field—nothing else on that line.
@@ -175,6 +175,47 @@ def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jp
         return None
 
 
+def pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> Optional[bytes]:
+    """
+    Render the first page of a PDF to PNG bytes for vision extraction.
+    Returns None if PyMuPDF is missing, the PDF is invalid, or has no pages.
+    """
+    if not pdf_bytes:
+        return None
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning("PyMuPDF (pymupdf) not installed; cannot render PDF for Phase 1.")
+        return None
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) < 1:
+            return None
+        page = doc[0]
+        # ~150 DPI for readable text without huge payloads
+        mat = fitz.Matrix(150 / 72, 150 / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
+    except Exception as e:
+        logger.warning("pdf_first_page_to_png_bytes failed: %s", e)
+        return None
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
+    """
+    Render the first PDF page to an image and run the same vision extraction as screenshots.
+    Multi-page PDFs: only page 1 is used (send text or split if info is on later pages).
+    """
+    png = pdf_first_page_to_png_bytes(pdf_bytes)
+    if not png:
+        return None
+    return extract_structured_from_image(png, mime_type="image/png")
+
+
 def _has_value(val: str) -> bool:
     """True if field has a non-empty value (not blank or single dash)."""
     return bool(val and str(val).strip() and str(val).strip() != "-")
@@ -192,8 +233,8 @@ def validate_phase1_extraction(normalized_text: str, state_data: dict) -> tuple[
     lines = [ln.strip() for ln in normalized_text.splitlines() if ln.strip()]
     if len(lines) < PHASE1_LINE_COUNT:
         errors.append(
-            f"Expected at least 11 lines from the image, got {len(lines)}. "
-            "Please send as text or try another image."
+            f"Expected at least 11 lines from the extraction, got {len(lines)}. "
+            "Please send as text or try another image or PDF."
         )
 
     # 2) Required fields (name and at least one delivery field)
