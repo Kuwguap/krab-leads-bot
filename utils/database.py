@@ -237,31 +237,15 @@ class Database:
         """Update lead with receipt image URL and set status to Paid."""
         if not self._check_tables_exist():
             return False
-        
-        try:
-            response = self.client.table("leads").update({
-                "receipt_image_url": receipt_image_url,
-                "monday_status": "Paid"
-            }).eq("id", lead_id).select("id").execute()
-            rows = getattr(response, "data", None) or []
-            if rows:
-                return True
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
-                logger.error(f"Error updating lead receipt: {e}")
-        # Fallback: receipt URL only if combined update failed (schema / RLS / column)
-        try:
-            response = self.client.table("leads").update({
-                "receipt_image_url": receipt_image_url,
-            }).eq("id", lead_id).select("id").execute()
-            rows = getattr(response, "data", None) or []
-            return bool(rows)
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
-                logger.error(f"Error updating lead receipt (fallback): {e}")
-            return False
+        # Use the same execute path as update_lead — do not rely on RETURNING rows (PostgREST
+        # may return an empty data array depending on API version / RLS, causing false failures).
+        if self.update_lead(lead_id, {
+            "receipt_image_url": receipt_image_url,
+            "monday_status": "Paid",
+        }):
+            return True
+        # Fallback if monday_status or combined update is rejected (constraint / column)
+        return self.update_lead(lead_id, {"receipt_image_url": receipt_image_url})
     
     # Group management methods
     def create_group(self, group_name: str, group_telegram_id: str, supervisory_telegram_id: str) -> bool:

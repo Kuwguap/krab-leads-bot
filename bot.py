@@ -3301,14 +3301,13 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 )
     
     # Supervisory: full log with phone and price — per-group supervisory + SUPERVISORY_TELEGRAM_ID (deduped)
+    # Do not attach driver receipt buttons here (supervisory chats are not driver accounts).
     supervisory_telegram_id = selected_group.get("supervisory_telegram_id")
-    supervisory_keyboard = _driver_receipt_keyboard_only()
     await _send_to_supervisory_chats(
         context,
         supervisory_telegram_id,
         supervisory_message,
         parse_mode="HTML",
-        reply_markup=supervisory_keyboard,
     )
 
     # Forward attached files (unless already sent with team approval — still before group Accept)
