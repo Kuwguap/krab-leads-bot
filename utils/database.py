@@ -704,6 +704,117 @@ class Database:
             logger.error(f"Error declining group lead offer: {e}")
             return False
 
+    def delete_group_lead_offers_for_lead(self, lead_id: str) -> bool:
+        """Remove all group offer rows for a lead (e.g. before re-routing to another group)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("group_lead_offers").delete().eq("lead_id", lead_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"delete_group_lead_offers_for_lead: {e}")
+            return False
+
+    def get_leads_pending_group_accept_timeout(self, minutes: int = 5) -> list:
+        """Leads still awaiting a group Accept, no driver assignments, pending offer older than ``minutes``."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+            now_utc = datetime.now(pytz.UTC)
+            cutoff = now_utc - timedelta(minutes=minutes)
+            r = self.client.table("leads").select(
+                "id, user_id, reference_id, awaiting_group_accept, group_accept_timeout_notified_at"
+            ).eq("awaiting_group_accept", True).execute()
+            out = []
+            for lead in r.data or []:
+                lid = lead.get("id")
+                if not lid or lead.get("group_accept_timeout_notified_at"):
+                    continue
+                if self.lead_has_assignments(lid):
+                    continue
+                if self.get_accepted_group_for_lead(lid):
+                    continue
+                offers = [
+                    o for o in self.get_group_lead_offers(lid)
+                    if (o.get("status") or "").lower() == "pending"
+                ]
+                if not offers:
+                    continue
+                oldest = None
+                for o in offers:
+                    c = o.get("created_at")
+                    if not c:
+                        continue
+                    try:
+                        # ISO8601 from Postgres
+                        ts = datetime.fromisoformat(str(c).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = pytz.UTC.localize(ts)
+                        if oldest is None or ts < oldest:
+                            oldest = ts
+                    except (ValueError, TypeError):
+                        continue
+                if oldest is None:
+                    continue
+                if oldest > cutoff:
+                    continue
+                out.append({
+                    "lead_id": lid,
+                    "user_id": lead.get("user_id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                })
+            return out
+        except Exception as e:
+            err = str(e)
+            if "awaiting_group_accept" in err or "42703" in err or "column" in err.lower():
+                logger.warning(
+                    "get_leads_pending_group_accept_timeout: migration_group_accept_gate.sql may be missing — %s",
+                    err[:200],
+                )
+            else:
+                logger.error("get_leads_pending_group_accept_timeout: %s", e)
+            return []
+
+    def mark_group_accept_timeout_notified(self, lead_id: str) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime
+            import pytz
+            now_utc = datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            self.client.table("leads").update({
+                "group_accept_timeout_notified_at": now_utc,
+            }).eq("id", lead_id).execute()
+            return True
+        except Exception as e:
+            logger.error("mark_group_accept_timeout_notified: %s", e)
+            return False
+
+    def get_driver_ids_with_pending_receipt_count_at_least(self, threshold: int) -> set:
+        """Single-query alternative to N× get_driver_pending_receipts for suspension checks."""
+        if not self._check_tables_exist() or threshold <= 0:
+            return set()
+        try:
+            r = self.client.table("lead_assignments").select(
+                "driver_id, lead:leads(receipt_image_url)"
+            ).eq("status", "accepted").execute()
+            counts: dict[str, int] = {}
+            for row in r.data or []:
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+                did = row.get("driver_id")
+                if not did:
+                    continue
+                ds = str(did)
+                counts[ds] = counts.get(ds, 0) + 1
+            return {did for did, c in counts.items() if c >= threshold}
+        except Exception as e:
+            logger.error("get_driver_ids_with_pending_receipt_count_at_least: %s", e)
+            return set()
+
     def accept_lead_assignment(self, lead_id: str, driver_id: str) -> Optional[Dict[str, Any]]:
         """Accept a lead assignment (first driver to accept).
 

@@ -9,11 +9,12 @@ import sys
 import secrets
 import string
 import uuid as _uuid_mod
+import asyncio
 from datetime import datetime, time as dt_time
 import pytz
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, Conflict
+from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,6 +48,7 @@ logging.getLogger('telegram.ext.Application').setLevel(logging.WARNING)
 STATE_PHASE1 = 1  # Waiting for vehicle and delivery details
 STATE_PHASE2 = 2  # Waiting for phone number and price
 STATE_SELECT_GROUP = 8   # Waiting for user to select which group (when assistants_choose_group is on)
+STATE_WAITING_GROUP_ACCEPT = 22  # Single-group flow: offer posted; wait for group Accept before drivers
 STATE_SELECT_DRIVER = 3  # Waiting for user to select which driver(s) to notify
 STATE_SELECT_CONTACT_SOURCE = 9  # After sending to drivers: select contact info source for this client
 STATE_AI_REVIEW = 16  # AI parsed Phase 1: user confirms or edits fields
@@ -64,6 +66,7 @@ STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encryp
 _PHASE1_STATE_EXCLUDE = frozenset({
     "phone_number", "price", "encrypted_data", "reference_id", "group_id", "selected_group",
     "resend", "lead_id", "follow_after_broadcast", "broadcast",
+    "group_reroute_existing_lead_id",
     "pending_phone_number", "pending_price",
     "special_request_note", "special_request_issuers", "special_request_drivers", "username",
 })
@@ -95,24 +98,22 @@ def _driver_receipt_keyboard_only() -> InlineKeyboardMarkup:
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
-    """New-lead offer: Accept / Decline + quick receipt menu."""
+    """New-lead offer: Accept / Decline only (receipt upload is separate)."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
             InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead_id}"),
         ],
-        [_DRIVER_RECEIPT_BTN],
     ])
 
 
 def _keyboard_renewal_driver(short_r: str, short_d: str) -> InlineKeyboardMarkup:
-    """Renewal driver offer + receipt shortcut."""
+    """Renewal driver offer."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"rda_{short_r}{short_d}"),
             InlineKeyboardButton("🔄 Reassign", callback_data=f"rdr_{short_r}{short_d}"),
         ],
-        [_DRIVER_RECEIPT_BTN],
     ])
 
 
@@ -175,16 +176,11 @@ def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str
 
 def _get_suspended_driver_ids() -> set[str]:
     """Driver IDs (as str) with 3+ pending receipts — suspended from receiving new leads."""
-    suspended: set[str] = set()
     try:
-        drivers = db.get_all_drivers()
-        for d in drivers:
-            pending = db.get_driver_pending_receipts(d["id"])
-            if len(pending) >= SUSPENSION_THRESHOLD:
-                suspended.add(str(d["id"]))
+        return db.get_driver_ids_with_pending_receipt_count_at_least(SUSPENSION_THRESHOLD)
     except Exception as e:
         logger.warning("_get_suspended_driver_ids: %s", e)
-    return suspended
+        return set()
 
 
 def _norm_chat_id(cid) -> int | str | None:
@@ -890,7 +886,7 @@ def _preview_value_after_phase1_edit(state_data: dict, edit_key: str) -> str:
 
 def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> str:
     """After Done — show full field list, then confirm."""
-    blocks = ["📋 Final review before continuing the lead.\n"]
+    blocks = ["📋 Final review.\n"]
     blocks.append(
         "📄 All fields (same list as when you pick a field to edit):\n"
         + _format_phase1_field_lines(state_data)
@@ -931,7 +927,7 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"Color:{_truncate_btn_val(state_data.get('color'))}", callback_data="ph1edit_col")],
         [InlineKeyboardButton(f"Insurance:{_truncate_btn_val(state_data.get('insurance_company'))}", callback_data="ph1edit_ins")],
         [InlineKeyboardButton(f"Policy #:{_truncate_btn_val(state_data.get('insurance_policy_number'))}", callback_data="ph1edit_pol")],
-        [InlineKeyboardButton(f"Date/notes:{_truncate_btn_val(state_data.get('extra_info'))}", callback_data="ph1edit_xtra")],
+        [InlineKeyboardButton(f"Delivery Date/Time & Notes:{_truncate_btn_val(state_data.get('extra_info'))}", callback_data="ph1edit_xtra")],
         [InlineKeyboardButton("⬅️ Back to summary", callback_data=PH1_EDIT_BACK)],
     ]
     return InlineKeyboardMarkup(rows)
@@ -949,7 +945,7 @@ def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
 def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Done with Edits", callback_data=PH1_FINAL_CONFIRM)],
-        [InlineKeyboardButton("✏️ Need another Edit ?", callback_data=PH1_EDIT_MORE)],
+        [InlineKeyboardButton("✏️ Need another Edit", callback_data=PH1_EDIT_MORE)],
     ])
 
 
@@ -1393,6 +1389,223 @@ def _phase1_from_stored_lead(lead: dict) -> dict:
     if extra:
         phase1["extra_info"] = extra
     return phase1
+
+
+def _issuer_state_data_from_lead(lead: dict) -> dict:
+    """Rebuild issuer conversation payload from a persisted lead row (re-pick group after timeout)."""
+    phase1 = _phase1_from_stored_lead(lead)
+    phase1["vehicle_details"] = (lead.get("vehicle_details") or "").strip()
+    phase1["delivery_details"] = (lead.get("delivery_details") or "").strip()
+    return {
+        **phase1,
+        "phone_number": lead.get("phone_number"),
+        "price": lead.get("price"),
+        "encrypted_data": {
+            "secret_key": lead.get("onetimesecret_token"),
+            "metadata_key": lead.get("onetimesecret_secret_key"),
+            "link": lead.get("encrypted_link"),
+        },
+        "reference_id": lead.get("reference_id"),
+        "extra_info": lead.get("extra_info") or "",
+        "special_request_issuers": lead.get("special_request_issuers") or "",
+        "special_request_drivers": lead.get("special_request_drivers") or "",
+        "special_request_note": lead.get("special_request_issuers") or "",
+        "username": lead.get("telegram_username") or "Unknown",
+    }
+
+
+def _validate_lead_data_ready_for_send(lead_data: dict) -> tuple[bool, str]:
+    if not lead_data.get("phone_number"):
+        return False, "Missing phone number."
+    enc = lead_data.get("encrypted_data") or {}
+    if not enc.get("link"):
+        return False, "Missing encrypted link."
+    if not lead_data.get("reference_id"):
+        return False, "Missing reference ID."
+    return True, ""
+
+
+async def _issuer_single_group_accept_gate(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    from_user,
+    lead_data: dict,
+    selected_group: dict,
+    reply_message,
+    existing_lead_id: str | None = None,
+) -> int:
+    """Create lead (or reuse on re-route), post Accept/Decline to one group, wait before driver pick."""
+    ok, err = _validate_lead_data_ready_for_send(lead_data)
+    if not ok:
+        await reply_message.reply_text(f"❌ {err} Use /start to begin again.")
+        return ConversationHandler.END
+
+    gid = selected_group.get("id")
+    if not gid:
+        await reply_message.reply_text("❌ Invalid group.")
+        return ConversationHandler.END
+
+    phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
+
+    if existing_lead_id:
+        lead = db.get_lead_by_id(existing_lead_id)
+        if not lead or int(lead.get("user_id") or 0) != int(user_id):
+            await reply_message.reply_text("❌ Lead not found or access denied.")
+            return ConversationHandler.END
+        db.delete_group_lead_offers_for_lead(existing_lead_id)
+        db.update_lead(
+            existing_lead_id,
+            {
+                "group_id": gid,
+                "awaiting_group_accept": True,
+                "group_accept_timeout_notified_at": None,
+            },
+        )
+        lead = db.get_lead_by_id(existing_lead_id) or lead
+        reference_id = lead.get("reference_id", "N/A")
+    else:
+        final_lead_data = {
+            "user_id": user_id,
+            "telegram_username": (from_user.username or "Unknown"),
+            "vehicle_details": phase1_data.get("vehicle_details", ""),
+            "delivery_details": phase1_data.get("delivery_details", ""),
+            "phone_number": lead_data.get("phone_number"),
+            "price": lead_data.get("price"),
+            "onetimesecret_token": (lead_data.get("encrypted_data") or {}).get("secret_key"),
+            "onetimesecret_secret_key": (lead_data.get("encrypted_data") or {}).get("metadata_key"),
+            "encrypted_link": (lead_data.get("encrypted_data") or {}).get("link"),
+            "reference_id": lead_data.get("reference_id"),
+            "group_id": gid,
+            "extra_info": lead_data.get("extra_info", ""),
+            "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
+            "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
+            "special_request_note": lead_data.get("special_request_issuers", "") or "",
+            "awaiting_group_accept": True,
+        }
+        lead = db.create_lead(final_lead_data)
+        if not lead:
+            await reply_message.reply_text("❌ Error saving lead to database.")
+            return ConversationHandler.END
+        reference_id = lead.get("reference_id", "N/A")
+        try:
+            _alert = _prefix_supervisory_html(
+                f"🆕 <b>New lead created</b>\n\n"
+                f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
+                "Mode: Single group — awaiting Accept in group chat"
+            )
+            for _sup_cid in _global_supervisory_chat_ids():
+                try:
+                    await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
+        except Exception as e:
+            logger.warning("Could not send new-lead alert to supervisory: %s", e)
+
+    un = from_user.username
+    from_line = f"@{un}" if un else (from_user.first_name or "Unknown")
+    group_offer_message = (
+        "🏷 NEW CLIENT\n"
+        f"📋 Ref ID: `{reference_id}`\n"
+        f"👤 From: `{from_line}`\n\n"
+        "✅ Double-check the tag for mistakes\n"
+        "📲 Send tag to driver with @krabsender\n"
+        "📋 Copy/paste client phone, address, and delivery time\n\n"
+        "Tap Accept or Decline.\n"
+        "If another group accepts first, it will show as taken."
+    )
+    short_lead = _short_uuid(lead["id"])
+    short_gid = _short_uuid(gid)
+    offer_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}{short_gid}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"dg_{short_lead}{short_gid}"),
+    ]])
+    chat_id = _parse_chat_id(selected_group.get("group_telegram_id"))
+    if not chat_id:
+        await reply_message.reply_text(
+            "❌ This group has no Telegram chat ID in admin. Contact admin or use /start."
+        )
+        return ConversationHandler.END
+
+    db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=group_offer_message,
+            parse_mode="Markdown",
+            reply_markup=offer_kb,
+        )
+        db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+    except RetryAfter as e:
+        wait_s = int(getattr(e, "retry_after", 1) or 1)
+        await asyncio.sleep(wait_s)
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=group_offer_message,
+            parse_mode="Markdown",
+            reply_markup=offer_kb,
+        )
+        db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+    except Exception as e:
+        logger.error("Single-group offer send failed: %s", e)
+        await reply_message.reply_text("❌ Could not post to the group chat. Check logs and admin group ID.")
+        return ConversationHandler.END
+
+    wait_data = lead_data.copy()
+    wait_data["lead_id"] = lead["id"]
+    wait_data["group_id"] = gid
+    wait_data["selected_group"] = selected_group
+    wait_data["follow_after_broadcast"] = True
+    wait_data.pop("group_reroute_existing_lead_id", None)
+    db.set_user_state(user_id, "waiting_group_accept", wait_data)
+
+    gname = selected_group.get("group_name", "Group")
+    ref_h = html.escape(str(reference_id), quote=False)
+    await reply_message.reply_text(
+        f"⏳ <b>Offer sent</b> to <b>{html.escape(gname, quote=False)}</b>.\n\n"
+        f"📋 Reference ID: <code>{ref_h}</code>\n\n"
+        "They must tap <b>Accept (Group)</b> in their group chat before you can notify drivers.\n\n"
+        "If no one accepts within <b>5 minutes</b>, you'll get a button to pick another group.",
+        parse_mode="HTML",
+    )
+    return STATE_WAITING_GROUP_ACCEPT
+
+
+async def _notify_issuer_pick_drivers_after_group_accepted(context: ContextTypes.DEFAULT_TYPE, lead_id: str) -> None:
+    """DM issuer: group accepted — pick drivers (conversation stays ``waiting_group_accept`` until pick)."""
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        return
+    uid = lead.get("user_id")
+    if uid is None:
+        return
+    try:
+        chat_uid = int(uid)
+    except (ValueError, TypeError):
+        chat_uid = uid
+    drivers = db.get_all_drivers()
+    kb = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
+    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
+    ref = lead.get("reference_id") or "N/A"
+    text = (
+        "✅ **Group accepted**\n\n"
+        f"📋 Reference ID: `{ref}`\n\n"
+        "**Select which driver(s) to notify:**\n\n"
+        f"{driver_list}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=chat_uid,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    except BadRequest:
+        await context.bot.send_message(
+            chat_id=chat_uid,
+            text=text.replace("`", "").replace("*", ""),
+            reply_markup=kb,
+        )
 
 
 async def _send_full_group_lead_to_chat(
@@ -2156,7 +2369,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     state_data["special_request_issuers"] = issuers_note
     db.set_user_state(user_id, "special_request_drivers", state_data)
     await update.message.reply_text(
-        "📝 Would you like to say any Special Requests to the delivery drivers?"
+        "📝 Would you like to say any Special Requests to the delivery drivers? (optional)"
     )
     return STATE_SPECIAL_REQUEST_DRIVERS
 
@@ -2252,25 +2465,15 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
 
     state_data["group_id"] = group_id
     state_data["selected_group"] = selected_group
-    db.set_user_state(user_id, "select_driver", state_data)
-
-    drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if record_is_active(d)]
-    if not active_drivers:
-        await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
-        return ConversationHandler.END
-
-    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
-    await update.message.reply_text(
-        "✅ Ready.\n\n"
-        "**Select which driver(s) to notify:**\n\n"
-        f"Available drivers:\n{driver_list}\n\n"
-        "Click a driver below or send to all:",
-        parse_mode="Markdown",
-        reply_markup=driver_keyboard,
+    return await _issuer_single_group_accept_gate(
+        context,
+        user_id=user_id,
+        from_user=update.effective_user,
+        lead_data=state_data,
+        selected_group=selected_group,
+        reply_message=update.message,
+        existing_lead_id=None,
     )
-    return STATE_SELECT_DRIVER
 
 
 async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2285,9 +2488,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     lead_data = state.get("data", {}).copy()
     if query.data == "select_group_all":
         # Broadcast: notify groups, then immediately continue to driver selection (no waiting).
-        import asyncio
-        from telegram.error import RetryAfter
-
         phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
         groups = db.get_all_groups()
         active_groups = [g for g in groups if record_is_active(g)]
@@ -2457,25 +2657,33 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     if not selected_group or not record_is_active(selected_group):
         await query.message.reply_text("❌ Group not found or inactive. Please start over with /start")
         return ConversationHandler.END
-    lead_data["group_id"] = group_id
-    lead_data["selected_group"] = selected_group
-    db.set_user_state(user_id, "select_driver", lead_data)
-    drivers = db.get_all_drivers()
-    active_drivers = [d for d in drivers if record_is_active(d)]
-    if not active_drivers:
-        await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
+
+    reroute_lid = (lead_data.get("group_reroute_existing_lead_id") or "").strip() or None
+    if reroute_lid:
+        return await _issuer_single_group_accept_gate(
+            context,
+            user_id=user_id,
+            from_user=query.from_user,
+            lead_data=lead_data,
+            selected_group=selected_group,
+            reply_message=query.message,
+            existing_lead_id=reroute_lid,
+        )
+
+    ok, err = _validate_lead_data_ready_for_send(lead_data)
+    if not ok:
+        await query.message.reply_text(f"❌ {err} Use /start to begin again.")
         return ConversationHandler.END
-    driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
-    await query.message.reply_text(
-        f"✅ Group selected: **{selected_group.get('group_name', 'N/A')}**\n\n"
-        f"**Select which driver(s) to notify:**\n\n"
-        f"Available drivers:\n{driver_list}\n\n"
-        f"Click a driver below or send to all:",
-        parse_mode="Markdown",
-        reply_markup=driver_keyboard
+
+    return await _issuer_single_group_accept_gate(
+        context,
+        user_id=user_id,
+        from_user=query.from_user,
+        lead_data=lead_data,
+        selected_group=selected_group,
+        reply_message=query.message,
+        existing_lead_id=None,
     )
-    return STATE_SELECT_DRIVER
 
 
 async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2492,7 +2700,18 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     
     lead_data = state.get("data", {})
-    
+    st_name = (state.get("state") or "").strip()
+    _pick_state = STATE_WAITING_GROUP_ACCEPT if st_name == "waiting_group_accept" else STATE_SELECT_DRIVER
+
+    if st_name == "waiting_group_accept":
+        wlid = lead_data.get("lead_id")
+        if wlid and not db.get_accepted_group_for_lead(wlid):
+            await query.message.reply_text(
+                "⏳ The group has not accepted yet. Wait for them to tap **Accept (Group)** in their chat.",
+                parse_mode="Markdown",
+            )
+            return STATE_WAITING_GROUP_ACCEPT
+
     # Resend flow: lead exists, just send to new drivers (not used after broadcast-all; that uses follow_after_broadcast)
     if lead_data.get("resend") and lead_data.get("lead_id") and not lead_data.get("follow_after_broadcast"):
         return await _handle_resend_to_drivers(
@@ -2519,7 +2738,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         selected_driver_ids = [d['id'] for d in selected_drivers]
         if not selected_drivers:
             await query.message.reply_text("❌ No eligible drivers (all suspended). Please select a driver individually.")
-            return STATE_SELECT_DRIVER
+            return _pick_state
     elif callback_data.startswith("driver_suspended_"):
         driver_id = callback_data.replace("driver_suspended_", "")
         driver = next((d for d in all_drivers if str(d.get("id")) == str(driver_id)), None)
@@ -2552,7 +2771,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 )
             except Exception as e:
                 logger.warning("Could not notify suspended driver: %s", e)
-        return STATE_SELECT_DRIVER
+        return _pick_state
     else:
         # Send to selected driver
         driver_id = callback_data.replace("select_driver_", "")
@@ -2563,7 +2782,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         if str(driver_id) in suspended:
             await query.message.reply_text("❌ This driver is suspended. Please select another.")
-            return STATE_SELECT_DRIVER
+            return _pick_state
 
     # Create lead in database
     final_lead_data = {
@@ -2591,6 +2810,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_text("❌ Error: lead not found. Use /start to begin again.")
             return ConversationHandler.END
         reference_id = lead.get("reference_id") or reference_id
+        if st_name == "waiting_group_accept":
+            db.set_user_state(user_id, "select_driver", lead_data)
     else:
         lead = db.create_lead(final_lead_data)
         if not lead:
@@ -2664,10 +2885,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # Create item in Monday.com (if configured)
     monday_result = None
     if monday:
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="📊 Syncing with Monday.com..."
-        )
         monday_lead_data = {
             "name": phase1_data.get("name", ""),
             "phone_number": phone_number,
@@ -2984,7 +3201,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             for s in contact_sources
         ]
         await query.message.reply_text(
-            "📋 **Select the Contact info source for this client:**",
+            "📊 **Where did this lead come from?**\n"
+            "Select Lead Source:**",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -3238,6 +3456,54 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     return STATE_SELECT_DRIVER
 
 
+async def handle_resend_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pick another group after timeout or decline (same lead, new group offer)."""
+    query = update.callback_query
+    await query.answer()
+    lead_id = query.data.replace("resend_group_", "").strip()
+    user_id = query.from_user.id
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("❌ Lead not found. Use /start.")
+        return ConversationHandler.END
+    if int(lead.get("user_id") or 0) != int(user_id):
+        await query.message.reply_text("❌ Not your lead.")
+        return ConversationHandler.END
+    if db.lead_has_assignments(lead_id):
+        await query.message.reply_text("❌ Drivers were already notified for this lead.")
+        return ConversationHandler.END
+    if db.get_accepted_group_for_lead(lead_id):
+        await query.message.reply_text("❌ A group already accepted. Use the driver buttons from your chat.")
+        return ConversationHandler.END
+    data = _issuer_state_data_from_lead(lead)
+    data["group_reroute_existing_lead_id"] = lead_id
+    groups = db.get_all_groups()
+    active_groups = [g for g in groups if record_is_active(g)]
+    if not active_groups:
+        await query.message.reply_text("❌ No active groups.")
+        return ConversationHandler.END
+    db.set_user_state(user_id, "select_group", data)
+    ref = lead.get("reference_id") or "N/A"
+    await query.message.reply_text(
+        "🔄 **Pick another group**\n\n"
+        f"Reference ID: `{ref}`\n\n"
+        "Select a group — a new offer will be sent to that group's chat.",
+        parse_mode="Markdown",
+        reply_markup=_build_group_keyboard(active_groups, include_all=False),
+    )
+    return STATE_SELECT_GROUP
+
+
+async def handle_waiting_group_accept_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Stray text while waiting for group Accept in chat."""
+    await update.message.reply_text(
+        "⏳ Still waiting for the group to tap **Accept (Group)** in their chat.\n\n"
+        "You'll pick drivers here after they accept.",
+        parse_mode="Markdown",
+    )
+    return STATE_WAITING_GROUP_ACCEPT
+
+
 async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle driver accepting a lead."""
     query = update.callback_query
@@ -3487,6 +3753,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             pass
         return
 
+    was_waiting_gate = lead.get("awaiting_group_accept") is True
+
     accepted = db.accept_group_lead_offer(lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
     if not accepted:
         # Someone else already accepted — refresh every group's message so Accept is gone everywhere.
@@ -3526,7 +3794,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Set lead.group_id to winning group (single accepted group per lead — enforced in DB)
-    db.update_lead(lead_id, {"group_id": group_id})
+    _upd = {"group_id": group_id}
+    if was_waiting_gate:
+        _upd["awaiting_group_accept"] = False
+    db.update_lead(lead_id, _upd)
     lead = db.get_lead_by_id(lead_id) or lead
     acc_row = db.get_accepted_group_for_lead(lead_id)
     if not acc_row or str(acc_row.get("group_id")) != str(group_id):
@@ -3588,6 +3859,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             f"Accepted in group chat by {accepter}",
         ],
     )
+
+    if not db.lead_has_assignments(lead_id) and was_waiting_gate:
+        try:
+            await _notify_issuer_pick_drivers_after_group_accepted(context, lead_id)
+        except Exception as e:
+            logger.warning("Could not notify issuer after group accept: %s", e)
 
     # If the sender already went through driver selection, do not DM drivers again.
     if db.lead_has_assignments(lead_id):
@@ -3685,6 +3962,36 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
         )
     except Exception:
         pass
+
+    lead_row = db.get_lead_by_id(lead_id)
+    if lead_row and lead_row.get("awaiting_group_accept"):
+        pending = [
+            o for o in db.get_group_lead_offers(lead_id)
+            if (o.get("status") or "").lower() == "pending"
+        ]
+        if not pending:
+            uid = lead_row.get("user_id")
+            ref = lead_row.get("reference_id") or "N/A"
+            if uid is not None:
+                try:
+                    chat_uid = int(uid)
+                except (ValueError, TypeError):
+                    chat_uid = uid
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_uid,
+                        text=(
+                            "❌ **No pending group accept** (declined or expired).\n\n"
+                            f"Reference ID: `{ref}`\n\n"
+                            "Pick another group:"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Pick another group", callback_data=f"resend_group_{lead_id}")],
+                        ]),
+                    )
+                except Exception as e:
+                    logger.warning("decline_group_offer issuer notify: %s", e)
 
 
 # Receipt submission handlers
@@ -4751,6 +5058,7 @@ def main():
             CommandHandler(["lead", "client"], begin_lead_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
+            CallbackQueryHandler(handle_resend_group, pattern="^resend_group_"),
         ],
         states={
             STATE_PHASE1: [
@@ -4794,6 +5102,11 @@ def main():
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
             STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
+            STATE_WAITING_GROUP_ACCEPT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_group_accept_message),
+                CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+                CallbackQueryHandler(handle_resend_group, pattern="^resend_group_"),
+            ],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
         },
@@ -4913,6 +5226,48 @@ def main():
     if application.job_queue:
         application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
         logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
+
+    async def check_group_accept_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            overdue = db.get_leads_pending_group_accept_timeout(minutes=5)
+            for item in overdue:
+                lead_id = item.get("lead_id")
+                user_id = item.get("user_id")
+                reference_id = item.get("reference_id", "N/A")
+                if not db.mark_group_accept_timeout_notified(lead_id):
+                    logger.warning(
+                        "Group accept timeout: could not mark lead %s (run migration_group_accept_gate.sql).",
+                        lead_id,
+                    )
+                    continue
+                try:
+                    user_chat = int(user_id) if isinstance(user_id, (int, str)) else user_id
+                except (ValueError, TypeError):
+                    user_chat = user_id
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Pick another group", callback_data=f"resend_group_{lead_id}")],
+                ])
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_chat,
+                        text=(
+                            "⏰ **Group did not accept in time**\n\n"
+                            f"Reference ID: `{reference_id}`\n\n"
+                            "No one tapped **Accept (Group)** within 5 minutes.\n\n"
+                            "Pick another group:"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                    )
+                except Exception as e:
+                    logger.warning("Group accept timeout notify to issuer: %s", e)
+                logger.info("Group accept timeout notified for lead %s ref %s", lead_id, reference_id)
+        except Exception as e:
+            logger.error("Group accept timeout job failed: %s", e)
+
+    if application.job_queue:
+        application.job_queue.run_repeating(check_group_accept_timeout, interval=60, first=90)
+        logger.info("Group accept timeout job scheduled (every 60s, first in 90s)")
 
     # Receipt reminder: every hour, send a reminder to drivers who accepted 24+ hours ago and haven't submitted receipt
     async def send_receipt_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
