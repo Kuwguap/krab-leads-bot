@@ -25,7 +25,7 @@ STRICT RULES:
 - Each line must contain ONLY the value for that field. No phone numbers in any line (phone is collected separately later). No URLs, no extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
-- Line 8 (Color): ONLY the vehicle color (e.g. Silver, Black). If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
+- Line 8 (Color): ONLY the vehicle color. DMV/registration forms often show exactly THREE letters (e.g. GRY=gray, BLK=black, WHT=white, SIL=silver). Copy those three letters exactly in UPPERCASE—never drop a letter (wrong: GY; correct: GRY). Full words like Silver or Black are fine. If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
 - If a value is missing or unreadable, put a single dash "-" for that line.
 
 Order (one value per line, no labels):
@@ -64,7 +64,7 @@ STRICT RULES:
 - Each line must contain ONLY the value for that field. Do NOT put phone numbers in any of these 11 lines (phone is collected separately). No URLs. No extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else on that line.
-- Line 8 (Color): ONLY the vehicle color (e.g. Silver, Black, White). If the user did NOT state a color, use "-". Never put city names (e.g. Brick, Jersey), addresses, or insurance names in the color field.
+- Line 8 (Color): ONLY the vehicle color. Forms often use three-letter codes (GRY, BLK, WHT, SIL, etc.)—output exactly three letters when shown, never truncate to two. Full color names like Silver or Black are fine. If the user did NOT state a color, use "-". Never put city names (e.g. Brick, Jersey), addresses, or insurance names in the color field.
 - If something is missing, put a single dash "-" for that line.
 
 Order of the 11 lines (one value per line, no labels):
@@ -216,6 +216,35 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     return extract_structured_from_image(png, mime_type="image/png")
 
 
+# OCR/models sometimes drop one letter from standard 3-letter DMV color codes → repair before storage.
+_TWO_LETTER_DMV_TO_THREE = {
+    "gy": "GRY",   # gray
+    "bk": "BLK",   # black
+    "wh": "WHT",   # white
+    "si": "SIL",   # silver
+}
+
+
+def normalize_phase1_color(val: str) -> str:
+    """Normalize extracted color: preserve 3-letter DMV codes (uppercase), repair common 2-letter truncations."""
+    s = (val or "").strip()
+    if not s or s == "-":
+        return s
+    compact = "".join(s.split())
+    if not compact:
+        return s
+    if len(compact) == 2 and compact.isalpha():
+        fixed = _TWO_LETTER_DMV_TO_THREE.get(compact.lower())
+        if fixed:
+            return fixed
+        return compact.upper()
+    if len(compact) == 3 and compact.isalpha():
+        return compact.upper()
+    if len(compact) <= 24 and " " not in s and compact.isalpha():
+        return compact.title() if len(compact) > 3 else compact.upper()
+    return s
+
+
 def _has_value(val: str) -> bool:
     """True if field has a non-empty value (not blank or single dash)."""
     return bool(val and str(val).strip() and str(val).strip() != "-")
@@ -284,10 +313,12 @@ def _ai_check_color_in_raw(extracted_color: str, raw_input: str) -> bool:
     except Exception:
         return False
     prompt = (
-        "In the raw message below, was the VEHICLE COLOR (e.g. Silver, Black, White, Red, Blue) explicitly stated?\n\n"
+        "In the raw message below, was the VEHICLE COLOR explicitly stated?\n\n"
         "STRICT: Reply 'missing' if the user did NOT clearly provide a vehicle color. "
         "Reply 'missing' if the extracted value is a city name (e.g. Brick, Jersey), address word (road, avenue, island), "
-        "insurance name (Safeco), or any placeholder. Only reply 'ok' if a REAL vehicle color like Silver/Black/White/Red is clearly given.\n\n"
+        "insurance name (Safeco), or any placeholder. "
+        "Reply 'ok' for full color names (Silver, Black, White, Red, Blue) OR standard 3-letter DMV/registration codes "
+        "(e.g. GRY=gray, BLK=black, WHT=white, SIL=silver, RED, BLU)—these count as valid colors.\n\n"
         f"Extracted color: '{extracted_color}'\n\n"
         f"Raw message:\n{raw_input[:600]}\n\n"
         "Reply with exactly: missing  OR  ok"

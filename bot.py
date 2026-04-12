@@ -603,7 +603,7 @@ def parse_phase1_structured(message_text: str) -> dict:
     delivery_city_state_zip = get_line(4)
     vin = get_line(5)
     car = get_line(6)
-    color = get_line(7)
+    color = ai_vision.normalize_phase1_color(get_line(7))
     insurance_company = get_line(8)
     insurance_policy_number = get_line(9)
     extra_info = get_line(10)
@@ -965,6 +965,9 @@ def _clean_vin_and_car(state_data: dict) -> None:
         car_cleaned = car_cleaned.replace(vin_17, " ", 1)
     car_cleaned = " ".join(car_cleaned.split()).strip()
     state_data["car"] = car_cleaned or "-"
+    co = state_data.get("color")
+    if co is not None and str(co).strip() and str(co).strip() != "-":
+        state_data["color"] = ai_vision.normalize_phase1_color(str(co))
     # Rebuild derived fields
     vehicle_lines = [
         state_data.get("name"),
