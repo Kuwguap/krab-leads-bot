@@ -1425,6 +1425,50 @@ def _validate_lead_data_ready_for_send(lead_data: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _validate_lead_row_for_resend(lead: dict | None, *, issuer_user_id: int | None = None) -> tuple[bool, str]:
+    """Forward-step check: persisted lead row is complete before Pick new driver / Pick another group."""
+    if not lead:
+        return False, "Lead not found."
+    if issuer_user_id is not None and int(lead.get("user_id") or 0) != int(issuer_user_id):
+        return False, "Not your lead."
+    if not (lead.get("reference_id") or "").strip():
+        return False, "Missing reference ID."
+    if not (lead.get("phone_number") or "").strip():
+        return False, "Missing phone number."
+    if not (lead.get("encrypted_link") or "").strip():
+        return False, "Missing encrypted link."
+    if not lead.get("group_id"):
+        return False, "Missing group assignment."
+    vd = (lead.get("vehicle_details") or "").strip()
+    dd = (lead.get("delivery_details") or "").strip()
+    if not vd and not dd:
+        return False, "Missing vehicle/delivery details."
+    return True, ""
+
+
+def _build_driver_resend_request_message(lead: dict) -> str:
+    """Same driver DM shape as the main send (city/state/zip line + ref + extra + special request)."""
+    reference_id = lead.get("reference_id", "N/A")
+    phase1 = _phase1_from_stored_lead(lead)
+    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    spec = _lead_driver_note(lead)
+    d_csz_esc = _telegram_md1_escape(phase1.get("delivery_city_state_zip", "") or "")
+    extra_esc = _telegram_md1_escape(extra_safe)
+    driver_request_message = (
+        f"👋Hi! New client 💸 available📈❗️\n\n"
+        f"📍 Delivery (City, State, Zip): {d_csz_esc}\n"
+        f"📋 Reference ID: `{reference_id}`\n"
+        f" Delivery Time 🏷️: {extra_esc}\n"
+        f"Please have Car, Driver License, and Laser Printer Ready✅"
+    )
+    if spec:
+        driver_request_message += (
+            "\n\n📝 Special request (driver): "
+            + _telegram_md1_escape(_sanitize_phones_for_send(spec))
+        )
+    return driver_request_message
+
+
 async def _issuer_single_group_accept_gate(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1450,8 +1494,9 @@ async def _issuer_single_group_accept_gate(
 
     if existing_lead_id:
         lead = db.get_lead_by_id(existing_lead_id)
-        if not lead or int(lead.get("user_id") or 0) != int(user_id):
-            await reply_message.reply_text("❌ Lead not found or access denied.")
+        ok_row, err_row = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
+        if not ok_row:
+            await reply_message.reply_text(f"❌ {err_row} Use /start to begin again.")
             return ConversationHandler.END
         db.delete_group_lead_offers_for_lead(existing_lead_id)
         db.update_lead(
@@ -3322,14 +3367,21 @@ async def _handle_resend_to_drivers(
 ) -> int:
     """Resend lead to newly selected drivers after timeout."""
     lead_id = lead_data.get("lead_id")
-    reference_id = lead_data.get("reference_id", "N/A")
-    group_id = lead_data.get("group_id")
-    selected_group = lead_data.get("selected_group")
-    lead = db.get_lead_by_id(lead_id)
-    if not lead:
-        await update.callback_query.message.reply_text("❌ Lead not found.")
+    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    ok, err = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
+    if not ok:
+        await update.callback_query.message.reply_text(f"❌ {err} Use /start if this persists.")
         db.clear_user_state(user_id)
         return ConversationHandler.END
+
+    reference_id = lead.get("reference_id") or lead_data.get("reference_id", "N/A")
+    group_id = lead.get("group_id")
+    selected_group = db.get_group_by_id(group_id) if group_id else None
+    if not selected_group:
+        await update.callback_query.message.reply_text("❌ Group not found for this lead. Contact admin.")
+        db.clear_user_state(user_id)
+        return ConversationHandler.END
+
     all_drivers = db.get_all_drivers()
     active_drivers = [d for d in all_drivers if record_is_active(d)]
     suspended = _get_suspended_driver_ids()
@@ -3341,17 +3393,8 @@ async def _handle_resend_to_drivers(
         if not selected_drivers:
             await update.callback_query.message.reply_text("❌ Driver not found.")
             return STATE_SELECT_DRIVER
-    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
-    spec = _lead_driver_note(lead)
-    driver_request_message = (
-        f"👋Hi! New client 💸 available📈❗️\n\n"
-        f"📍 Delivery: {lead.get('delivery_details', '')}\n"
-        f"📋 Reference ID: `{reference_id}`\n"
-        f" Delivery Time 🏷️: {extra_safe}\n"
-        f"Please have Car, Driver License, and Laser Printer Ready✅"
-    )
-    if spec:
-        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
+
+    driver_request_message = _build_driver_resend_request_message(lead)
     accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
     assigned_count = 0
     for driver in selected_drivers:
@@ -3359,17 +3402,27 @@ async def _handle_resend_to_drivers(
         if not tid:
             continue
         try:
-            cid = int(str(tid).strip())
+            driver_chat_id = int(str(tid).strip())
         except (ValueError, TypeError):
-            cid = tid
+            driver_chat_id = tid
         try:
             db.create_lead_assignment(lead_id, driver["id"], group_id)
-            await context.bot.send_message(
-                chat_id=cid,
-                text=driver_request_message,
-                parse_mode="Markdown",
-                reply_markup=accept_keyboard,
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=driver_chat_id,
+                    text=driver_request_message,
+                    parse_mode="Markdown",
+                    reply_markup=accept_keyboard,
+                )
+            except BadRequest as e:
+                if "parse" in str(e).lower():
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=driver_request_message.replace("`", ""),
+                        reply_markup=accept_keyboard,
+                    )
+                else:
+                    raise
             assigned_count += 1
             pending = db.get_driver_pending_receipts(driver["id"])
             if pending and len(pending) < SUSPENSION_THRESHOLD:
@@ -3377,20 +3430,32 @@ async def _handle_resend_to_drivers(
                     [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
                     for p in pending
                 ]
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text=(
-                        f"⚠️ You owe **{len(pending)}** receipt(s). "
-                        f"At **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended**.\n\n"
-                        "To view all receipts type /receipts"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=(
+                            f"⚠️ You owe **{len(pending)}** receipt(s). "
+                            f"At **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended**.\n\n"
+                            "To view all receipts type /receipts"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
+                    )
+                except BadRequest:
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=(
+                            f"⚠️ You owe {len(pending)} receipt(s). "
+                            f"At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended.\n\n"
+                            "To view all receipts type /receipts"
+                        ),
+                        reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
+                    )
         except Exception as e:
             logger.error("Resend to driver %s: %s", driver.get("driver_name"), e)
+
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
-    group_telegram_id = selected_group.get("group_telegram_id") if selected_group else None
+    group_telegram_id = selected_group.get("group_telegram_id")
     if group_telegram_id and assigned_count > 0:
         try:
             gcid = _parse_chat_id(group_telegram_id)
@@ -3401,6 +3466,18 @@ async def _handle_resend_to_drivers(
             )
         except Exception as e:
             logger.warning("Group reassign notify: %s", e)
+
+    if assigned_count == 0:
+        ref_h = html.escape(str(reference_id or "N/A"), quote=False)
+        await update.callback_query.message.reply_text(
+            "⚠️ **No driver received** the Telegram message (missing chat ID or blocked). "
+            "Drivers must open a private chat with the bot and tap **Start**.\n\n"
+            f"📋 Reference ID: <code>{ref_h}</code>\n\n"
+            "Try **Pick new driver** again or contact admin.",
+            parse_mode="HTML",
+        )
+        return STATE_SELECT_DRIVER
+
     await update.callback_query.message.reply_text(
         f"✅ **Lead resent successfully**\n\n"
         f"Reference ID: `{reference_id}`\n"
@@ -3420,13 +3497,11 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     lead_id = query.data.replace("resend_driver_", "").strip()
     user_id = query.from_user.id
     lead = db.get_lead_by_id(lead_id)
-    if not lead:
-        await query.message.reply_text("❌ Lead not found. Use /start to create a new lead.")
+    ok, err = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
+    if not ok:
+        await query.message.reply_text(f"❌ {err} Use /start to create a new lead.")
         return ConversationHandler.END
     group_id = lead.get("group_id")
-    if not group_id:
-        await query.message.reply_text("❌ Lead has no group. Use /start to create a new lead.")
-        return ConversationHandler.END
     selected_group = db.get_group_by_id(group_id)
     if not selected_group:
         await query.message.reply_text("❌ Group not found. Use /start to create a new lead.")
@@ -3463,11 +3538,9 @@ async def handle_resend_group(update: Update, context: ContextTypes.DEFAULT_TYPE
     lead_id = query.data.replace("resend_group_", "").strip()
     user_id = query.from_user.id
     lead = db.get_lead_by_id(lead_id)
-    if not lead:
-        await query.message.reply_text("❌ Lead not found. Use /start.")
-        return ConversationHandler.END
-    if int(lead.get("user_id") or 0) != int(user_id):
-        await query.message.reply_text("❌ Not your lead.")
+    ok, err = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
+    if not ok:
+        await query.message.reply_text(f"❌ {err} Use /start.")
         return ConversationHandler.END
     if db.lead_has_assignments(lead_id):
         await query.message.reply_text("❌ Drivers were already notified for this lead.")
@@ -3476,6 +3549,10 @@ async def handle_resend_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("❌ A group already accepted. Use the driver buttons from your chat.")
         return ConversationHandler.END
     data = _issuer_state_data_from_lead(lead)
+    ok2, err2 = _validate_lead_data_ready_for_send(data)
+    if not ok2:
+        await query.message.reply_text(f"❌ Lead data incomplete: {err2} Contact admin.")
+        return ConversationHandler.END
     data["group_reroute_existing_lead_id"] = lead_id
     groups = db.get_all_groups()
     active_groups = [g for g in groups if record_is_active(g)]
