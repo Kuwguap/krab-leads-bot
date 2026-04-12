@@ -1053,6 +1053,44 @@ def _clean_vin_and_car(state_data: dict) -> None:
     state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
 
 
+async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the issuer lead flow (Phase 1). Used by /lead and /client; drivers use these because /start shows the driver menu."""
+    if not update.message:
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+
+    db.clear_user_state(user_id)
+    if context.user_data:
+        context.user_data.pop("phase1_attached_files", None)
+        context.user_data.pop("phase1_pending_edit_key", None)
+        context.user_data.pop("phase1_recent_edits", None)
+        for _k in ("receipt_lead_id", "receipt_reference_id", "receipt_monday_item_id"):
+            context.user_data.pop(_k, None)
+
+    db.set_user_state(user_id, "phase1", {})
+
+    phase1_instruction = (
+        "Congratulations 🎊\n\n"
+        "**Step 1:**\n"
+        "📤 Send me\n"
+        "👤 Name\n"
+        "🏠 Reg Addr\n"
+        "📍 Delivery Addr\n"
+        "🔢 VIN #\n"
+        "🚘 Car (Y/M/M)\n"
+        "🎨 Color\n"
+        "🛡 Insurance #\n"
+        "🕒 Date & Time\n\n"
+        "Send ✍️ Text or 📸 Screenshot\n\n"
+        f"{motivation.get_random_quote()}\n\n"
+        "🏁Automated🏎Automotive"
+    )
+    await update.message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
+
+    return STATE_PHASE1
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and initialize state."""
     if not update.message:
@@ -1076,6 +1114,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             lines.append(
                 f"\n⚠️ You owe {n} receipt(s). At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended."
             )
+        lines.append(
+            "\nTo add a lead, use /lead or /client (both do the same). "
+            "You will go through the same steps as other users to upload a lead."
+        )
         lines.append("\nTo view all receipts type /receipts")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
@@ -1085,35 +1127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # Clear any existing state and attached files from previous leads
-    db.clear_user_state(user_id)
-    if context.user_data:
-        context.user_data.pop("phase1_attached_files", None)
-        context.user_data.pop("phase1_pending_edit_key", None)
-        context.user_data.pop("phase1_recent_edits", None)
-    
-    # Initialize new state
-    db.set_user_state(user_id, "phase1", {})
-    
-    phase1_instruction = (
-        "Congratulations 🎊\n\n"
-        "**Step 1:**\n"
-        "📤 Send me\n"
-        "👤 Name\n"
-        "🏠 Reg Addr\n"
-        "📍 Delivery Addr\n"
-        "🔢 VIN #\n"
-        "🚘 Car (Y/M/M)\n"
-        "🎨 Color\n"
-        "🛡 Insurance #\n"
-        "🕒 Date & Time\n\n"
-        "Send ✍️ Text or 📸 Screenshot\n\n"
-        f"{motivation.get_random_quote()}\n\n"
-        "🏁Automated🏎Automotive"
-    )
-    await update.message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
-    
-    return STATE_PHASE1
+    return await begin_lead_command(update, context)
 
 
 def _normalize_ai_phase1_text(text: str) -> str:
@@ -4722,6 +4736,7 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler(["lead", "client"], begin_lead_command),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
         ],
         states={
@@ -4769,7 +4784,11 @@ def main():
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CommandHandler(["lead", "client"], begin_lead_command),
+        ],
     )
 
     # Receipt handler is registered before conv_handler: /receipt and /receipts are entry_points
