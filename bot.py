@@ -860,7 +860,7 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"Color: {state_data.get('color') or '-'}",
         f"Insurance company: {state_data.get('insurance_company') or '-'}",
         f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
-        f"Date/time & notes: {state_data.get('extra_info') or '-'}",
+        f"Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
     ]
     return "\n".join(lines)
 
@@ -1209,6 +1209,26 @@ def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Opt
     return None
 
 
+def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str) -> str:
+    """HTML <pre> block for the copy-paste section (shared with group notification + fallbacks)."""
+    d_street = (phase1_data.get("delivery_address") or "").strip()
+    d_csz = (phase1_data.get("delivery_city_state_zip") or "").strip()
+    delivery_combined = ", ".join(p for p in [d_street, d_csz] if p)
+    if not delivery_combined:
+        delivery_combined = _sanitize_phones_for_send(phase1_data.get("delivery_details") or "") or ""
+    delivery_combined = (delivery_combined or "").strip() or "—"
+    extra_time = (_sanitize_phones_for_send(phase1_data.get("extra_info") or "") or "").strip() or "—"
+    link = (encrypted_link or "").strip()
+    copy_plain = "\n".join([
+        "- - - - - - copy & paste - - - - - -",
+        f"⏰ {extra_time}",
+        f"📍Delivery address: {delivery_combined}",
+        f"📞 Phone 🔗 Encrypted Link: {link}",
+        "- - - - - - copy & paste - - - - - -",
+    ])
+    return f"<pre>{html.escape(copy_plain)}</pre>"
+
+
 def _format_group_lead_message_html(
     reference_id: str,
     phase1_data: dict,
@@ -1240,35 +1260,26 @@ def _format_group_lead_message_html(
     note_i = (special_request_issuers or "").strip()
     if note_i:
         tail_lines.append(_h("📝 " + _safe_raw(note_i)))
+    else:
+        tail_lines.append(_h("📝 No"))
     vehicle_block = f"🚗 Vehicle: {name_line}\n" + "\n".join(tail_lines)
 
-    d_street = (phase1_data.get("delivery_address") or "").strip()
-    d_csz = (phase1_data.get("delivery_city_state_zip") or "").strip()
-    delivery_combined = ", ".join(p for p in [d_street, d_csz] if p)
-    if not delivery_combined:
-        delivery_combined = _sanitize_phones_for_send(phase1_data.get("delivery_details") or "") or ""
-    delivery_combined = (delivery_combined or "").strip() or "—"
-    extra_time = (_sanitize_phones_for_send(phase1_data.get("extra_info") or "") or "").strip() or "—"
-    link = (encrypted_link or "").strip()
     issue_s = issue_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if issue_dt else "N/A"
     expiry_s = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry_dt else "N/A"
 
-    copy_plain = "\n".join([
-        "- - - - - - copy & paste - - - - - -",
-        f"⏰ {extra_time}",
-        f"📍Delivery address: {delivery_combined}",
-        f"📞 Phone 🔗 Encrypted Link: {link}",
-        "- - - - - - copy & paste - - - - - -",
-    ])
-    pre_wrapped = f"<pre>{html.escape(copy_plain)}</pre>"
+    pre_wrapped = _group_lead_copy_pre_html(phase1_data, encrypted_link)
     return (
         "🏷NEW CLIENT❗️\n\n"
         f"📋 Reference ID: <code>{_h(reference_id)}</code>\n"
         f"{vehicle_block}\n\n"
         "Please use @Krabsenderbot 📧🚘\n"
-        "-Tag 🏷\n"
-        "-delivery address 📍\n"
-        "-phone 📞\n\n"
+        "Enter:\n"
+        "• Tag 🏷\n"
+        "• Phone 📞\n"
+        "• Delivery time ⏰\n"
+        "• Delivery address 📍\n"
+        "⸻\n"
+        "📋 Copy & paste below into the bot 🤖\n"
         f"{pre_wrapped}\n\n"
         f"📅 Issue Date: {_h(issue_s)}\n"
         f"⏰ Expires: {_h(expiry_s)}"
@@ -1410,36 +1421,6 @@ async def _send_full_group_lead_to_chat(
         else []
     )
 
-    def _plain_fallback() -> str:
-        def _sr(s: str) -> str:
-            return (_sanitize_phones_for_send(s or "") or "").strip() or "-"
-
-        vehicle_safe = "\n".join([
-            _sr(phase1.get("name")),
-            _sr(phase1.get("address")),
-            _sr(phase1.get("city_state_zip")),
-            (phase1.get("vin") or "").strip() or "-",
-            (phase1.get("car") or "").strip() or "-",
-            _sr(phase1.get("color")),
-            _sr(phase1.get("insurance_company")),
-            _sr(phase1.get("insurance_policy_number")),
-            _sr(phase1.get("extra_info")),
-        ])
-        if issuer_note:
-            vehicle_safe += "\n" + _sr("📝 " + issuer_note)
-        iss = issue_dt.strftime("%Y-%m-%d %H:%M") if issue_dt else "N/A"
-        exs = exp_dt.strftime("%Y-%m-%d %H:%M") if exp_dt else "N/A"
-        ref_h = html.escape(str(reference_id or "N/A"), quote=False)
-        return (
-            "✅ Your group claimed this client\n\n"
-            "🏷NEW CLIENT❗️\n\n"
-            f"📋 Reference ID: <code>{ref_h}</code>\n"
-            f"🚗 Vehicle:\n{html.escape(vehicle_safe, quote=False)}\n\n"
-            f"🔗 Encrypted Link: {html.escape(link, quote=False)}\n\n"
-            f"📅 Issue Date: {html.escape(iss, quote=False)}\n"
-            f"⏰ Expires: {html.escape(exs, quote=False)}"
-        )
-
     targets: list[tuple] = []
     if chat_id:
         targets.append((chat_id, group_name or "group"))
@@ -1458,9 +1439,10 @@ async def _send_full_group_lead_to_chat(
                 await context.bot.send_message(chat_id=target_cid, text=full_html, parse_mode="HTML")
             except Exception as html_err:
                 logger.warning("Full lead HTML failed for %s: %s", label, html_err)
-                await context.bot.send_message(
-                    chat_id=target_cid, text=_plain_fallback(), parse_mode="HTML"
-                )
+                try:
+                    await context.bot.send_message(chat_id=target_cid, text=body, parse_mode="HTML")
+                except Exception as e2:
+                    logger.error("Could not send full lead to %s (retry body fallback): %s", label, e2)
         except Exception as e:
             logger.error("Could not send full lead to %s: %s", label, e)
 
@@ -1756,8 +1738,8 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
             db.set_user_state(user_id, "phase1", d)
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide phone number and price.\n"
-            "In this format: Phone number then price (e.g., '+1234567890 $150')",
+            "**Phase 2:** Please provide Phone number and Price.\n"
+            "In this format: Phone number then price (example: '+1234567890 $150')",
             parse_mode="Markdown",
         )
         return STATE_PHASE2
@@ -1860,9 +1842,9 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             db.set_user_state(user_id, "phase1", d)
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide phone number and price.\n"
+            "**Phase 2:** Please provide Phone number and Price.\n"
             "After that: optional notes for issuers (group) and for drivers only.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')",
+            "Format: Phone number and price (example: '+1234567890 $500')",
             parse_mode="Markdown",
         )
         return STATE_PHASE2
@@ -2149,9 +2131,8 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     state_data["pending_price"] = price
     db.set_user_state(user_id, "special_request_issuers", state_data)
     await msg.reply_text(
-        "✅ Phone and price received!\n\n"
-        "📝 **Special request to issuers** (optional)\n\n"
-        "This will be included in the **group** lead message. Send **-** if none:",
+        "✅ Phone and Price received!\n\n"
+        "📝 **Would you like to say any Special Requests to the temp tag issuers ?** (optional)\n\n",
         parse_mode="Markdown",
     )
     return STATE_SPECIAL_REQUEST_ISSUERS
@@ -2176,9 +2157,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     state_data["special_request_issuers"] = issuers_note
     db.set_user_state(user_id, "special_request_drivers", state_data)
     await update.message.reply_text(
-        "📝 **Special request to drivers** (optional)\n\n"
-        "Only **drivers** see this (not the group). Send **-** if none:",
-        parse_mode="Markdown",
+        "📝 Would you like to say any Special Requests to the delivery drivers?"
     )
     return STATE_SPECIAL_REQUEST_DRIVERS
 
@@ -2219,13 +2198,13 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
                 "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
                 "(SUPABASE_URL/SUPABASE_KEY and ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY) on Vercel "
                 "or the bot has wrong credentials.\n\n"
-                "Send **Special request to drivers** again when ready (or **-** for none).",
+                "Send your reply again when ready (or **-** for none).",
                 parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(
                 "❌ Error encrypting phone number. Please try again.\n\n"
-                "Send **Special request to drivers** again (or **-** for none).",
+                "Send your reply again (or **-** for none).",
                 parse_mode="Markdown",
             )
         return STATE_SPECIAL_REQUEST_DRIVERS
@@ -2664,8 +2643,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         return _sanitize_phones_for_send(s or "") or "-"
     vin_only = (phase1_data.get("vin") or "").strip() or "-"
     car_only = (phase1_data.get("car") or "").strip() or "-"
+    name_line_safe = _safe(phase1_data.get("name"))
     vehicle_lines_display = [
-        _safe(phase1_data.get("name")),
         _safe(phase1_data.get("address")),
         _safe(phase1_data.get("city_state_zip")),
         vin_only,
@@ -2677,7 +2656,9 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     ]
     if issuer_note_disp:
         vehicle_lines_display.append(_safe("📝 " + issuer_note_disp))
-    vehicle_safe = "\n".join(vehicle_lines_display)
+    else:
+        vehicle_lines_display.append("📝 No")
+    vehicle_safe = f"🚗 Vehicle: {name_line_safe}\n" + "\n".join(vehicle_lines_display)
     delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
     extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
     
@@ -2697,9 +2678,9 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "group_message": (
                 "🏷NEW CLIENT❗️\n\n"
                 f"📋 Reference ID: {reference_id}\n"
-                f"🚗 Vehicle:\n{vehicle_safe}\n\n"
+                f"{vehicle_safe}\n\n"
+                "Please use @Krabsenderbot 📧🚘 — Enter: Tag, Phone, Delivery time, Delivery address.\n"
                 f"🔗 Encrypted Link: {encrypted_data.get('link')}"
-                + (f"\n\n📝 Issuers note:\n{issuer_note_disp}" if issuer_note_disp else "")
                 + (f"\n\n📝 Driver-only note:\n{driver_note_disp}" if driver_note_disp else "")
             ),
             # Supervisor/group info (using group name as identifier)
@@ -2911,10 +2892,20 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                         html_err,
                     )
                     ref_h = html.escape(str(reference_id or "N/A"), quote=False)
+                    vehicle_pre = f"<pre>{html.escape(vehicle_safe)}</pre>"
                     plain_fallback = (
-                        f"🏷NEW CLIENT❗️\n\n📋 Reference ID: <code>{ref_h}</code>\n"
-                        f"🚗 Vehicle:\n{html.escape(vehicle_safe, quote=False)}\n\n"
-                        f"🔗 Encrypted Link: {html.escape(str(encrypted_data.get('link') or ''), quote=False)}\n\n"
+                        "🏷NEW CLIENT❗️\n\n"
+                        f"📋 Reference ID: <code>{ref_h}</code>\n"
+                        f"{vehicle_pre}\n\n"
+                        "Please use @Krabsenderbot 📧🚘\n"
+                        "Enter:\n"
+                        "• Tag 🏷\n"
+                        "• Phone 📞\n"
+                        "• Delivery time ⏰\n"
+                        "• Delivery address 📍\n"
+                        "⸻\n"
+                        "📋 Copy & paste below into the bot 🤖\n"
+                        f"{_group_lead_copy_pre_html(phase1_data, encrypted_data.get('link') or '')}\n\n"
                         f"📅 Issue Date: {html.escape(issue_s, quote=False)}\n"
                         f"⏰ Expires: {html.escape(exp_s, quote=False)}"
                     )
