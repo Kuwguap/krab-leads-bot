@@ -62,6 +62,14 @@ STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
 STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issuers
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 
+# Phase 2 (phone + price) — shared by file-flow callbacks and must stay in sync
+PHASE2_INTRO_MESSAGE = (
+    "✅ Phase 1 received!\n\n"
+    "📞💲Phase 2: Please type Phone Number then Price.\n"
+    "In this format:\n"
+    "(example: '+1234567890 $150')"
+)
+
 # Keys in user state data that are not Phase 1 vehicle/delivery fields
 _PHASE1_STATE_EXCLUDE = frozenset({
     "phone_number", "price", "encrypted_data", "reference_id", "group_id", "selected_group",
@@ -1994,12 +2002,7 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
             d = state["data"].copy()
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
-        await query.message.reply_text(
-            "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide Phone number and Price.\n"
-            "In this format: Phone number then price (example: '+1234567890 $150')",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(PHASE2_INTRO_MESSAGE)
         return STATE_PHASE2
     # add_files_yes
     await query.message.reply_text("📎 Send the file (photo or document).")
@@ -2098,12 +2101,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             d = state["data"].copy()
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
-        await query.message.reply_text(
-            "✅ Phase 1 received!\n\n"
-            "**Phase 2:** Please provide Phone number and Price.\n"
-            "Format: Phone number and price (example: '+1234567890 $150')",
-            parse_mode="Markdown",
-        )
+        await query.message.reply_text(PHASE2_INTRO_MESSAGE)
         return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
@@ -2347,13 +2345,22 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     """Handle Phase 2: Phone number and price, then issuer note, then driver-only note, then encrypt."""
     user_id = update.effective_user.id
     msg = update.effective_message
-    if not msg or not (getattr(msg, "text", None) or "").strip():
-        if msg:
+    if not msg:
+        return STATE_PHASE2
+    # Text message OR caption on photo/document (avoids silent no-op when user sends media + caption)
+    message_text = ((msg.text or msg.caption) or "").strip()
+    if not message_text:
+        if msg.photo or msg.document or getattr(msg, "video", None) or getattr(msg, "voice", None):
             await msg.reply_text(
-                "❌ Please send your phone number and price as text (e.g. +1 732 534 2659 $500)."
+                "⚠️ Add phone and price in the **caption**, or send a **plain text** message.\n\n"
+                + PHASE2_INTRO_MESSAGE,
+                parse_mode="Markdown",
+            )
+        else:
+            await msg.reply_text(
+                "❌ Please send your phone number and price as text.\n\n" + PHASE2_INTRO_MESSAGE
             )
         return STATE_PHASE2
-    message_text = msg.text
 
     # Get phase 1 data
     state = db.get_user_state(user_id)
@@ -2441,7 +2448,6 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     state_data["special_request_drivers"] = drivers_note
     issuers_note = (state_data.get("special_request_issuers") or "").strip()
 
-    await update.message.reply_text("🔐 Encrypting phone number...")
     encrypted_data = ots.encrypt_phone(phone_number)
     if not encrypted_data:
         state_data["pending_phone_number"] = phone_number
@@ -5169,7 +5175,21 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_file_text),
                 CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
             ],
-            STATE_PHASE2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase2)],
+            STATE_PHASE2: [
+                MessageHandler(
+                    (
+                        filters.TEXT
+                        | filters.PHOTO
+                        | filters.Document.ALL
+                        | filters.VIDEO
+                        | filters.VOICE
+                        | filters.Sticker.ALL
+                        | filters.ANIMATION
+                    )
+                    & ~filters.COMMAND,
+                    handle_phase2,
+                ),
+            ],
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
             ],
