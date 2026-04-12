@@ -80,7 +80,7 @@ _PHASE1_STATE_EXCLUDE = frozenset({
     "resend", "lead_id", "follow_after_broadcast", "broadcast",
     "pending_phone_number", "pending_price",
     "special_request_note", "special_request_issuers", "special_request_drivers", "username",
-    "reassign_lead_id",
+    "reassign_lead_id", "approval_files_forwarded",
 })
 
 # Receipt submission states
@@ -110,11 +110,11 @@ def _driver_receipt_keyboard_only() -> InlineKeyboardMarkup:
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
-    """New-lead offer: Accept / Decline only (receipt upload is separate)."""
+    """New-lead offer: Accept / Different driver (same callback as decline)."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead_id}"),
+            InlineKeyboardButton("🔄 Different Driver", callback_data=f"decline_lead_{lead_id}"),
         ],
     ])
 
@@ -245,11 +245,39 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     return InlineKeyboardMarkup(buttons)
 
 
+async def _forward_phase1_attached_files_to_targets(
+    context: ContextTypes.DEFAULT_TYPE,
+    attached_files: list,
+    group_chat_id: int | str | None,
+    sup_chat_ids: list,
+) -> None:
+    """Forward Phase 1 photos/documents to group and/or supervisory chats (Telegram ``file_id``)."""
+    if not attached_files:
+        return
+    _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
+    for f in attached_files:
+        ftype = f.get("type")
+        fid = f.get("file_id")
+        if not fid:
+            continue
+        try:
+            if ftype == "photo" and _group_cid:
+                await context.bot.send_photo(chat_id=_group_cid, photo=fid)
+            elif ftype == "document" and _group_cid:
+                await context.bot.send_document(chat_id=_group_cid, document=fid)
+            for _sup_cid in sup_chat_ids:
+                if ftype == "photo":
+                    await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
+                elif ftype == "document":
+                    await context.bot.send_document(chat_id=_sup_cid, document=fid)
+        except Exception as e:
+            logger.warning("Could not forward attached file to group/supervisory: %s", e)
+
+
 async def _post_single_group_approval(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
     group: dict,
-    from_user,
 ) -> tuple[int, list[tuple[str, str]]]:
     """Send a short approval request (not full lead HTML) to one group chat; create group_lead_offer row."""
     gid = group.get("id")
@@ -262,24 +290,19 @@ async def _post_single_group_approval(
         return 0, [(group.get("group_name") or str(gid) or "Unknown group", "missing group_telegram_id")]
 
     reference_id = lead.get("reference_id", "N/A")
-    un = getattr(from_user, "username", None)
-    from_line = f"@{un}" if un else (getattr(from_user, "first_name", None) or "Unknown")
     group_offer_message = (
         "🏷 NEW CLIENT — Team approval\n"
-        f"📋 Ref ID: `{reference_id}`\n"
-        f"👤 From: `{from_line}`\n\n"
+        f"📋 Ref ID: `{reference_id}`\n\n"
         "✅ Double-check the tag for mistakes\n"
         "📲 Send tag to driver with @krabsender\n"
         "📋 Copy/paste client phone, address, and delivery time\n\n"
-        "Tap *Accept (Group)* if your team will handle this.\n"
-        "Tap *Different team* if another team should take it (the lead creator will pick).\n\n"
         "The lead creator can assign drivers right away — no need to wait here."
     )
     short_lead = _short_uuid(lead["id"])
     short_gid = _short_uuid(gid)
     offer_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}{short_gid}"),
-        InlineKeyboardButton("🔄 Different team", callback_data=f"dt_{short_lead}{short_gid}"),
+        InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
+        InlineKeyboardButton("🔄 Different Team", callback_data=f"dt_{short_lead}{short_gid}"),
     ]])
 
     db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
@@ -2439,13 +2462,23 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     except Exception as e:
         logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
-    await _post_single_group_approval(context, lead, selected_group, update.effective_user)
+    sent_n, _fail = await _post_single_group_approval(context, lead, selected_group)
+    _attached = state_data.get("attached_files") or []
+    if sent_n > 0 and _attached:
+        await _forward_phase1_attached_files_to_targets(
+            context,
+            _attached,
+            selected_group.get("group_telegram_id"),
+            _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
+        )
 
     continue_data = state_data.copy()
     continue_data["lead_id"] = lead["id"]
     continue_data["group_id"] = group_id
     continue_data["selected_group"] = selected_group
     continue_data["follow_after_broadcast"] = True
+    if sent_n > 0 and _attached:
+        continue_data["approval_files_forwarded"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
 
     drivers = db.get_all_drivers()
@@ -2530,16 +2563,13 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
-        un = query.from_user.username
-        from_line = f"@{un}" if un else (query.from_user.first_name or "Unknown")
         group_offer_message = (
             "🏷 NEW CLIENT\n"
-            f"📋 Ref ID: `{reference_id}`\n"
-            f"👤 From: `{from_line}`\n\n"
+            f"📋 Ref ID: `{reference_id}`\n\n"
             "✅ Double-check the tag for mistakes\n"
             "📲 Send tag to driver with @krabsender\n"
             "📋 Copy/paste client phone, address, and delivery time\n\n"
-            "Tap Accept or Decline.\n"
+            "Tap Accept or Different Team.\n"
             "If another group accepts first, it will show as taken."
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
@@ -2550,8 +2580,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 continue
             short_gid = _short_uuid(gid)
             offer_kb_by_group[gid] = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Accept (Group)", callback_data=f"ag_{short_lead}{short_gid}"),
-                InlineKeyboardButton("❌ Decline", callback_data=f"dg_{short_lead}{short_gid}"),
+                InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
+                InlineKeyboardButton("🔄 Different Team", callback_data=f"dg_{short_lead}{short_gid}"),
             ]])
         sent_count = 0
         failures: list[tuple[str, str]] = []
@@ -2577,6 +2607,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
+                _att = lead_data.get("attached_files") or []
+                if _att:
+                    await _forward_phase1_attached_files_to_targets(context, _att, chat_id, [])
             except RetryAfter as e:
                 # Telegram is rate limiting. Wait the requested time and retry once.
                 wait_s = int(getattr(e, "retry_after", 1) or 1)
@@ -2591,12 +2624,24 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     )
                     db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                     sent_count += 1
+                    _att = lead_data.get("attached_files") or []
+                    if _att:
+                        await _forward_phase1_attached_files_to_targets(context, _att, chat_id, [])
                 except Exception as e2:
                     logger.error("Error sending group offer to %s after retry: %s", g.get("group_name"), e2)
                     failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e2).__name__}: {e2}"))
             except Exception as e:
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
                 failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e).__name__}: {e}"))
+
+        _att_all = lead_data.get("attached_files") or []
+        if _att_all:
+            await _forward_phase1_attached_files_to_targets(
+                context,
+                _att_all,
+                None,
+                _supervisory_delivery_chat_ids(primary_group.get("supervisory_telegram_id")),
+            )
 
         # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
         continue_data = lead_data.copy()
@@ -2605,6 +2650,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data["selected_group"] = primary_group
         continue_data["follow_after_broadcast"] = True
         continue_data.pop("resend", None)
+        if _att_all:
+            continue_data["approval_files_forwarded"] = True
         db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
         active_drivers = [d for d in drivers if record_is_active(d)]
@@ -2663,12 +2710,22 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         db.delete_group_lead_offers_for_lead(rid)
         db.update_lead(rid, {"group_id": group_id})
         lead = db.get_lead_by_id(rid) or lead
-        await _post_single_group_approval(context, lead, selected_group, query.from_user)
+        _sn, _ = await _post_single_group_approval(context, lead, selected_group)
+        _att_r = lead_data.get("attached_files") or []
+        if _sn > 0 and _att_r:
+            await _forward_phase1_attached_files_to_targets(
+                context,
+                _att_r,
+                selected_group.get("group_telegram_id"),
+                _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
+            )
         continue_data = _issuer_state_data_from_lead(lead)
         continue_data["lead_id"] = rid
         continue_data["group_id"] = group_id
         continue_data["selected_group"] = selected_group
         continue_data["follow_after_broadcast"] = True
+        if _sn > 0 and _att_r:
+            continue_data["approval_files_forwarded"] = True
         db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
         active_drivers = [d for d in drivers if record_is_active(d)]
@@ -2735,13 +2792,23 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
-    await _post_single_group_approval(context, lead, selected_group, query.from_user)
+    _sn2, _ = await _post_single_group_approval(context, lead, selected_group)
+    _att_s = lead_data.get("attached_files") or []
+    if _sn2 > 0 and _att_s:
+        await _forward_phase1_attached_files_to_targets(
+            context,
+            _att_s,
+            selected_group.get("group_telegram_id"),
+            _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
+        )
 
     continue_data = lead_data.copy()
     continue_data["lead_id"] = lead["id"]
     continue_data["group_id"] = group_id
     continue_data["selected_group"] = selected_group
     continue_data["follow_after_broadcast"] = True
+    if _sn2 > 0 and _att_s:
+        continue_data["approval_files_forwarded"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
     drivers = db.get_all_drivers()
     active_drivers = [d for d in drivers if record_is_active(d)]
@@ -3244,27 +3311,15 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=supervisory_keyboard,
     )
 
-    # Forward attached files to group and every supervisory chat
-    attached_files = phase1_data.get("attached_files") or []
-    _group_cid = _parse_chat_id(group_telegram_id_raw)
-    _sup_cids = _supervisory_delivery_chat_ids(supervisory_telegram_id)
-    for f in attached_files:
-        ftype = f.get("type")
-        fid = f.get("file_id")
-        if not fid:
-            continue
-        try:
-            if ftype == "photo" and _group_cid:
-                await context.bot.send_photo(chat_id=_group_cid, photo=fid)
-            elif ftype == "document" and _group_cid:
-                await context.bot.send_document(chat_id=_group_cid, document=fid)
-            for _sup_cid in _sup_cids:
-                if ftype == "photo":
-                    await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
-                elif ftype == "document":
-                    await context.bot.send_document(chat_id=_sup_cid, document=fid)
-        except Exception as e:
-            logger.warning("Could not forward attached file to group/supervisory: %s", e)
+    # Forward attached files (unless already sent with team approval — still before group Accept)
+    if not lead_data.get("approval_files_forwarded"):
+        attached_files = phase1_data.get("attached_files") or []
+        await _forward_phase1_attached_files_to_targets(
+            context,
+            attached_files,
+            group_telegram_id_raw,
+            _supervisory_delivery_chat_ids(supervisory_telegram_id),
+        )
     
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
     lead_for_notify = db.get_lead_by_id(lead["id"]) or lead
@@ -3780,7 +3835,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle driver declining a lead."""
+    """Driver chose *Different Driver* (same as pass/decline on assignment)."""
     query = update.callback_query
     await query.answer()
     
@@ -3798,8 +3853,8 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.decline_lead_assignment(lead_id, driver['id'])
     
     await query.message.edit_text(
-        "❌ **Lead Declined**\n\n"
-        "You have declined this lead.",
+        "🔄 **Different driver**\n\n"
+        "You passed on this lead.",
         parse_mode="Markdown",
         reply_markup=_driver_receipt_keyboard_only(),
     )
