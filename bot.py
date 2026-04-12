@@ -1843,8 +1843,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide Phone number and Price.\n"
-            "After that: optional notes for issuers (group) and for drivers only.\n"
-            "Format: Phone number and price (example: '+1234567890 $500')",
+            "Format: Phone number and price (example: '+1234567890 $150')",
             parse_mode="Markdown",
         )
         return STATE_PHASE2
