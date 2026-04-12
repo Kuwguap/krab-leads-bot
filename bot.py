@@ -85,11 +85,13 @@ SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
 # One-tap receipt flow for drivers (handled by receipt ConversationHandler)
-_DRIVER_RECEIPT_BTN = InlineKeyboardButton("📸 Driver Receipt", callback_data="driver_receipt")
+_DRIVER_RECEIPT_BTN = InlineKeyboardButton("📸 Upload driver receipt", callback_data="driver_receipt")
+_DRIVER_ADD_LEAD_BTN = InlineKeyboardButton("➕ Add new lead", callback_data="driver_add_lead")
 
 
 def _driver_receipt_keyboard_only() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[_DRIVER_RECEIPT_BTN]])
+    """Driver /start home: upload receipt, then add lead (same as /lead or /client)."""
+    return InlineKeyboardMarkup([[_DRIVER_RECEIPT_BTN], [_DRIVER_ADD_LEAD_BTN]])
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
@@ -1053,13 +1055,13 @@ def _clean_vin_and_car(state_data: dict) -> None:
     state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
 
 
-async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the issuer lead flow (Phase 1). Used by /lead and /client; drivers use these because /start shows the driver menu."""
-    if not update.message:
-        return ConversationHandler.END
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
-
+async def _begin_lead_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    username: str,
+    reply_message,
+) -> None:
+    """Shared Phase 1 reset + welcome (used by /lead, /client, and Add new lead callback)."""
     db.clear_user_state(user_id)
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
@@ -1086,8 +1088,32 @@ async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"{motivation.get_random_quote()}\n\n"
         "🏁Automated🏎Automotive"
     )
-    await update.message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
+    await reply_message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
 
+
+async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the issuer lead flow (Phase 1). Used by /lead and /client; drivers use these because /start shows the driver menu."""
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    await _begin_lead_flow(context, user_id, username, msg)
+    return STATE_PHASE1
+
+
+async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inline: same as /lead or /client (lead ConversationHandler entry)."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
+    user_id = query.from_user.id
+    username = query.from_user.username or "Unknown"
+    await _begin_lead_flow(context, user_id, username, msg)
     return STATE_PHASE1
 
 
@@ -4734,6 +4760,7 @@ def main():
         entry_points=[
             CommandHandler("start", start),
             CommandHandler(["lead", "client"], begin_lead_command),
+            CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
         ],
         states={
@@ -4785,6 +4812,7 @@ def main():
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
             CommandHandler(["lead", "client"], begin_lead_command),
+            CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
         ],
     )
 
