@@ -1757,8 +1757,7 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text(
             "✅ Phase 1 received!\n\n"
             "**Phase 2:** Please provide phone number and price.\n"
-            "After that: optional notes for issuers (group) and for drivers only.\n"
-            "Format: Phone number and price (e.g., '+1234567890 $500')",
+            "In this format: Phone number then price (e.g., '+1234567890 $150')",
             parse_mode="Markdown",
         )
         return STATE_PHASE2
