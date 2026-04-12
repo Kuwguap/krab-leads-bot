@@ -896,7 +896,7 @@ def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> st
         + _format_phase1_field_lines(state_data)
     )
     blocks.append(
-        "\nTap Done with Edits to continue the lead (VIN check / files), or Need another Edit to change a field."
+        "\nDone with Edits, or Need another Edit?"
     )
     return "\n".join(blocks)
 
