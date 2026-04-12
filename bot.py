@@ -259,12 +259,70 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
         return s
 
 
+SUPERVISORY_MESSAGE_HEADER = "SUPERVISORY MESSAGE"
+
+
+def _raw_supervisory_tokens(*sources: object) -> list[str]:
+    """Split comma-separated supervisory ID strings (env, per-group DB field) into tokens."""
+    out: list[str] = []
+    for src in sources:
+        if src is None:
+            continue
+        s = str(src).strip()
+        if not s:
+            continue
+        for part in s.split(","):
+            p = part.strip()
+            if p:
+                out.append(p)
+    return out
+
+
+def _prefix_supervisory_message(text: str) -> str:
+    """Prefix plaintext / Markdown supervisory DMs."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    if t.upper().startswith(SUPERVISORY_MESSAGE_HEADER.upper()):
+        return t
+    return f"{SUPERVISORY_MESSAGE_HEADER}\n\n{t}"
+
+
+def _prefix_supervisory_html(text: str) -> str:
+    """Prefix HTML supervisory messages (bold header)."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    head = SUPERVISORY_MESSAGE_HEADER.upper()
+    tu = t.upper()
+    if tu.startswith(head) or tu.startswith("<B>SUPERVISORY MESSAGE"):
+        return t
+    return f"<b>{SUPERVISORY_MESSAGE_HEADER}</b>\n\n{t}"
+
+
+def _global_supervisory_chat_ids() -> list:
+    """Chat IDs from SUPERVISORY_TELEGRAM_ID (comma-separated in env)."""
+    out: list = []
+    seen: set = set()
+    for tok in _raw_supervisory_tokens(Config.SUPERVISORY_TELEGRAM_ID):
+        cid = _parse_chat_id(tok)
+        if cid is None:
+            continue
+        key = _norm_chat_id(cid)
+        if key is not None and key in seen:
+            continue
+        if key is not None:
+            seen.add(key)
+        out.append(cid)
+    return out
+
+
 def _supervisory_delivery_chat_ids(group_supervisory_raw: object) -> list:
-    """Chats for full supervisory copies: per-group supervisory + SUPERVISORY_TELEGRAM_ID, deduped."""
+    """Per-group supervisory token(s) + global SUPERVISORY_TELEGRAM_ID token(s), deduped."""
     seen: set = set()
     out: list = []
-    for raw in (group_supervisory_raw, Config.SUPERVISORY_TELEGRAM_ID):
-        cid = _parse_chat_id(raw if raw is not None else None)
+    for raw in _raw_supervisory_tokens(group_supervisory_raw, Config.SUPERVISORY_TELEGRAM_ID):
+        cid = _parse_chat_id(raw)
         if cid is None:
             continue
         if isinstance(cid, int):
@@ -289,6 +347,10 @@ async def _send_to_supervisory_chats(
     parse_mode: str | None = "Markdown",
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
+    if parse_mode == "HTML":
+        text = _prefix_supervisory_html(text)
+    else:
+        text = _prefix_supervisory_message(text)
     for cid in _supervisory_delivery_chat_ids(group_supervisory_raw):
         try:
             await context.bot.send_message(
@@ -337,19 +399,21 @@ def _telegram_download_url_from_file_path(file_path: str) -> str:
 
 
 async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, lead: dict, text: str) -> None:
-    """Send a notification to the lead initiator and global supervisor (if configured)."""
+    """Send a notification to the lead initiator and global supervisor(s) (if configured)."""
     initiator_id = lead.get("user_id")
-    if initiator_id is not None:
+    sup_norms = {_norm_chat_id(x) for x in _global_supervisory_chat_ids()}
+    init_norm = _norm_chat_id(initiator_id) if initiator_id is not None else None
+    if initiator_id is not None and init_norm not in sup_norms:
         try:
             await context.bot.send_message(chat_id=int(initiator_id), text=text, parse_mode="Markdown")
         except Exception as e:
             logger.warning("Could not notify initiator %s: %s", initiator_id, e)
-    sup = (Config.SUPERVISORY_TELEGRAM_ID or "").strip()
-    if sup:
+    sup_text = _prefix_supervisory_message(text)
+    for sup_cid in _global_supervisory_chat_ids():
         try:
-            await context.bot.send_message(chat_id=_parse_chat_id(sup), text=text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=sup_cid, text=sup_text, parse_mode="Markdown")
         except Exception as e:
-            logger.warning("Could not notify supervisor %s: %s", sup, e)
+            logger.warning("Could not notify supervisor %s: %s", sup_cid, e)
 
 
 async def _notify_lead_lifecycle(
@@ -362,34 +426,35 @@ async def _notify_lead_lifecycle(
     photo_file_id: Optional[str] = None,
 ) -> None:
     """
-    Standard 3-step alerts to lead initiator + SUPERVISORY_TELEGRAM_ID.
+    Standard 3-step alerts to lead initiator + global supervisory ID(s).
     step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
     Deduplicates so the same chat_id never receives the same message twice.
+    Supervisory chats get the SUPERVISORY MESSAGE prefix; initiator-only does not.
     Prefer ``photo_file_id`` (same bot) over URLs so links are not broken or doubled.
     """
     lines = [f"🔔 **({step}/3)** {title_line}", ""]
     lines.extend(extra_lines or [])
     text = "\n".join(lines)
     initiator_id = lead.get("user_id")
-    sup = (Config.SUPERVISORY_TELEGRAM_ID or "").strip()
-    seen: set[int] = set()
-    targets: list[int] = []
+    # (chat_id, use_supervisory_prefix) — if same person is initiator + supervisory, one prefixed send
+    delivery: list[tuple] = []
+    by_norm: dict = {}
     if initiator_id is not None:
         try:
-            cid = int(initiator_id)
-            if cid not in seen:
-                targets.append(cid)
-                seen.add(cid)
+            ic = int(initiator_id)
+            by_norm[_norm_chat_id(ic)] = (ic, False)
         except (TypeError, ValueError):
             logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
-    if sup:
-        cid = _parse_chat_id(sup)
-        if cid is not None and cid not in seen:
-            targets.append(cid)
-            seen.add(cid)
-    for cid in targets:
+    for sup_cid in _global_supervisory_chat_ids():
+        k = _norm_chat_id(sup_cid)
+        if k is not None:
+            by_norm[k] = (sup_cid, True)
+    for cid, use_sup_prefix in by_norm.values():
+        delivery.append((cid, use_sup_prefix))
+    for cid, use_sup_prefix in delivery:
         if cid is None:
             continue
+        out_text = _prefix_supervisory_message(text) if use_sup_prefix else text
         try:
             if step == 3 and (photo_file_id or photo_url):
                 safe_url = _normalize_receipt_image_url(photo_url) if photo_url else None
@@ -397,7 +462,7 @@ async def _notify_lead_lifecycle(
                 if photo_file_id:
                     try:
                         await context.bot.send_photo(
-                            chat_id=cid, photo=photo_file_id, caption=text, parse_mode="Markdown"
+                            chat_id=cid, photo=photo_file_id, caption=out_text, parse_mode="Markdown"
                         )
                         sent = True
                     except Exception as e:
@@ -405,7 +470,7 @@ async def _notify_lead_lifecycle(
                 if not sent and safe_url:
                     try:
                         await context.bot.send_photo(
-                            chat_id=cid, photo=safe_url, caption=text, parse_mode="Markdown"
+                            chat_id=cid, photo=safe_url, caption=out_text, parse_mode="Markdown"
                         )
                         sent = True
                     except Exception:
@@ -414,15 +479,15 @@ async def _notify_lead_lifecycle(
                     link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
                     try:
                         await context.bot.send_message(
-                            chat_id=cid, text=text + link, parse_mode="Markdown"
+                            chat_id=cid, text=out_text + link, parse_mode="Markdown"
                         )
                     except BadRequest:
-                        await context.bot.send_message(chat_id=cid, text=text + (f"\n{safe_url}" if safe_url else ""))
+                        await context.bot.send_message(chat_id=cid, text=out_text + (f"\n{safe_url}" if safe_url else ""))
             else:
                 try:
-                    await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=cid, text=out_text, parse_mode="Markdown")
                 except BadRequest:
-                    await context.bot.send_message(chat_id=cid, text=text.replace("*", "").replace("`", ""))
+                    await context.bot.send_message(chat_id=cid, text=out_text.replace("*", "").replace("`", ""))
         except Exception as e:
             logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
 
@@ -1228,7 +1293,40 @@ def _dt_from_lead_field(val) -> datetime | None:
             s = s[:-1] + "+00:00"
         return datetime.fromisoformat(s)
     except ValueError:
-        return None
+        pass
+    for candidate in (s, s.replace(" ", "T", 1)):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+    return None
+
+
+def _issue_and_expiration_for_group_display(lead: dict) -> tuple[datetime | None, datetime | None]:
+    """Issue/expiration for group HTML — use DB; if missing (race), NY now + 30 days."""
+    from datetime import datetime, timedelta
+    import pytz
+
+    issue_dt = _dt_from_lead_field(lead.get("issue_date"))
+    exp_dt = _dt_from_lead_field(lead.get("expiration_date"))
+    if issue_dt and not exp_dt:
+        exp_dt = issue_dt + timedelta(days=30)
+    if issue_dt and exp_dt:
+        return issue_dt, exp_dt
+    if lead.get("id"):
+        ny = pytz.timezone("America/New_York")
+        issue_dt = datetime.now(ny)
+        exp_dt = issue_dt + timedelta(days=30)
+        return issue_dt, exp_dt
+    return issue_dt, exp_dt
 
 
 def _phase1_from_stored_lead(lead: dict) -> dict:
@@ -1262,8 +1360,7 @@ async def _send_full_group_lead_to_chat(
     phase1 = _phase1_from_stored_lead(lead)
     link = (lead.get("encrypted_link") or "").strip()
     issuer_note = _lead_issuer_note(lead)
-    issue_dt = _dt_from_lead_field(lead.get("issue_date"))
-    exp_dt = _dt_from_lead_field(lead.get("expiration_date"))
+    issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
     body = _format_group_lead_message_html(
         reference_id, phase1, link, issue_dt, exp_dt, issuer_note,
     )
@@ -2212,18 +2309,17 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         reference_id = lead.get("reference_id", "N/A")
         _pg_name = primary_group.get("group_name", "N/A")
         try:
-            _sup_cid = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-            if _sup_cid:
-                await context.bot.send_message(
-                    chat_id=_sup_cid,
-                    text=(
-                        f"🆕 <b>New lead created</b>\n\n"
-                        f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
-                        f"Group: {html.escape(_pg_name, quote=False)}\n"
-                        "Mode: Broadcast to all groups"
-                    ),
-                    parse_mode="HTML",
-                )
+            _alert = _prefix_supervisory_html(
+                f"🆕 <b>New lead created</b>\n\n"
+                f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
+                f"Group: {html.escape(_pg_name, quote=False)}\n"
+                "Mode: Broadcast to all groups"
+            )
+            for _sup_cid in _global_supervisory_chat_ids():
+                try:
+                    await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
         except Exception as e:
             logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
@@ -2491,17 +2587,16 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         _grp_obj = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
         _grp_name = (_grp_obj.get("group_name") if _grp_obj else None) or lead_data.get("selected_group", {}).get("group_name") or "N/A"
         try:
-            _sup_cid = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-            if _sup_cid:
-                await context.bot.send_message(
-                    chat_id=_sup_cid,
-                    text=(
-                        f"🆕 <b>New lead created</b>\n\n"
-                        f"Reference: <code>{html.escape(str(lead.get('reference_id', 'N/A')), quote=False)}</code>\n"
-                        f"Group: {html.escape(_grp_name, quote=False)}"
-                    ),
-                    parse_mode="HTML",
-                )
+            _alert = _prefix_supervisory_html(
+                f"🆕 <b>New lead created</b>\n\n"
+                f"Reference: <code>{html.escape(str(lead.get('reference_id', 'N/A')), quote=False)}</code>\n"
+                f"Group: {html.escape(_grp_name, quote=False)}"
+            )
+            for _sup_cid in _global_supervisory_chat_ids():
+                try:
+                    await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
         except Exception as e:
             logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
@@ -2510,6 +2605,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         group_id = lead["group_id"]
     skip_duplicate_full_group_post = bool(lead_data.get("follow_after_broadcast") and had_broadcast_offers)
 
+    # Fresh DB row so winning group (broadcast accept) is visible before Monday + messaging
+    lead = db.get_lead_by_id(lead["id"]) or lead
     selected_group = _resolve_selected_group(lead_data, lead)
     if lead_data.get("follow_after_broadcast") and selected_group:
         lead_data["selected_group"] = selected_group
@@ -2519,6 +2616,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "❌ Error: could not resolve the group for this lead. Please start over with /start."
         )
         return ConversationHandler.END
+
+    group_id = selected_group.get("id")
 
     issuer_note_disp = (
         (lead_data.get("special_request_issuers") or lead.get("special_request_issuers")
@@ -2619,6 +2718,18 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "issue_date": issue_date,
             "expiration_date": expiration_date
         }
+
+    # Reload lead + winning group from DB (broadcast sets leads.group_id; state may still hold primary group)
+    lead = db.get_lead_by_id(lead["id"]) or lead
+    selected_group = _resolve_selected_group(lead_data, lead)
+    if selected_group:
+        lead_data["selected_group"] = selected_group
+        lead_data["group_id"] = selected_group.get("id")
+    group_name_supervisory = (selected_group or {}).get("group_name", "N/A")
+    if lead.get("group_id"):
+        _gname_row = db.get_group_by_id(lead["group_id"])
+        if _gname_row and (_gname_row.get("group_name") or "").strip():
+            group_name_supervisory = (_gname_row.get("group_name") or "").strip()
     
     # Prepare messages for distribution
     issue_s = (
@@ -2638,7 +2749,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         exp_s,
         issuer_note_disp,
         driver_note_disp,
-        str(selected_group.get("group_name", "N/A")),
+        str(group_name_supervisory),
     )
 
     # Group message – HTML with <pre> copy block; no raw phone in body outside pre
@@ -2825,7 +2936,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "Issuer accepted new lead",
         [
             f"Reference: `{reference_id}`",
-            f"Group: **{_telegram_md1_escape(selected_group.get('group_name', 'N/A'))}**",
+            f"Group: **{_telegram_md1_escape(group_name_supervisory)}**",
             f"Drivers notified: **{_telegram_md1_escape(driver_names)}**",
         ],
     )
@@ -3217,13 +3328,12 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             driver_nm = driver.get("driver_name", "Unknown")
             try:
-                sup_txt = (
+                sup_txt = _prefix_supervisory_message(
                     f"⛔ **Driver Suspended**\n\n"
                     f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
                     f"Reason: {len(pending)} unpaid receipt(s)"
                 )
-                sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-                if sup_id:
+                for sup_id in _global_supervisory_chat_ids():
                     try:
                         await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
                     except BadRequest:
@@ -3963,10 +4073,9 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             cap_html += f'\n<a href="{html.escape(safe_url, quote=True)}">Open receipt</a>'
 
         _receipt_sent: set = set()
-        for raw_cid in (
-            _parse_chat_id(lead.get("user_id")),
-            _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID),
-        ):
+        for raw_cid in [_parse_chat_id(lead.get("user_id"))] + _global_supervisory_chat_ids():
+            if raw_cid is None:
+                continue
             k = _norm_chat_id(raw_cid)
             if k is not None:
                 _receipt_sent.add(k)
@@ -3974,6 +4083,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         sup_targets = _supervisory_delivery_chat_ids(
             group.get("supervisory_telegram_id") if group else None
         )
+        cap_sup = _prefix_supervisory_html(cap_html)
         for sup_chat_id in sup_targets:
             nk = _norm_chat_id(sup_chat_id)
             if nk is not None and nk in _receipt_sent:
@@ -3985,13 +4095,13 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_photo(
                         chat_id=sup_chat_id,
                         photo=receipt_file_id,
-                        caption=cap_html,
+                        caption=cap_sup,
                         parse_mode="HTML",
                     )
                 else:
                     await context.bot.send_message(
                         chat_id=sup_chat_id,
-                        text=cap_html,
+                        text=cap_sup,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -4000,7 +4110,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     await context.bot.send_message(
                         chat_id=sup_chat_id,
-                        text=cap_html,
+                        text=cap_sup,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
@@ -4054,16 +4164,16 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 dn_esc = _telegram_md1_escape(driver_name)
                 try:
-                    sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-                    if sup_id:
+                    _lift = _prefix_supervisory_message(
+                        f"✅ **Suspension removed**\n\n"
+                        f"Driver: **{dn_esc}**\n"
+                        f"Remaining receipts: {len(pending_after)}"
+                    )
+                    for sup_id in _global_supervisory_chat_ids():
                         try:
                             await context.bot.send_message(
                                 chat_id=sup_id,
-                                text=(
-                                    f"✅ **Suspension removed**\n\n"
-                                    f"Driver: **{dn_esc}**\n"
-                                    f"Remaining receipts: {len(pending_after)}"
-                                ),
+                                text=_lift,
                                 parse_mode="Markdown",
                             )
                         except BadRequest:

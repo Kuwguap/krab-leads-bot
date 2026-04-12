@@ -15,6 +15,7 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     DRIVER_TELEGRAM_ID = os.getenv("DRIVER_TELEGRAM_ID")
     GROUP_TELEGRAM_ID = os.getenv("GROUP_TELEGRAM_ID")
+    # Comma-separated Telegram chat IDs — all receive supervisory copies (same bot must be able to DM each)
     SUPERVISORY_TELEGRAM_ID = os.getenv("SUPERVISORY_TELEGRAM_ID")
     
     # Monday.com
