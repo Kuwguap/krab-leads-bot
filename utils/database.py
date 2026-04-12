@@ -753,6 +753,76 @@ class Database:
             logger.error(f"Error getting lead assignment status: {e}")
             return None
 
+    def _norm_paper_driver_id(self, driver_id: str) -> str:
+        return str(driver_id).strip()
+
+    def _paper_ensure_inventory_row(self, driver_id: str) -> None:
+        did = self._norm_paper_driver_id(driver_id)
+        try:
+            existing = self.client.table("paper_inventory").select("id").eq("driver_id", did).limit(1).execute()
+            if not existing.data:
+                self.client.table("paper_inventory").insert({"driver_id": did, "current_count": 0}).execute()
+        except Exception as e:
+            logger.error("_paper_ensure_inventory_row: %s", e)
+
+    def paper_was_low_alert_sent(self, driver_id: str) -> bool:
+        did = self._norm_paper_driver_id(driver_id)
+        try:
+            r = self.client.table("paper_inventory").select("low_alert_sent").eq("driver_id", did).limit(1).execute()
+            return bool(r.data and r.data[0].get("low_alert_sent"))
+        except Exception:
+            return False
+
+    def paper_mark_low_alert_sent(self, driver_id: str) -> None:
+        did = self._norm_paper_driver_id(driver_id)
+        try:
+            self.client.table("paper_inventory").update({"low_alert_sent": True}).eq("driver_id", did).execute()
+        except Exception:
+            pass
+
+    def apply_paper_on_lead_accept(self, driver_id: str, assignment_id: str, reference_id: str) -> Optional[int]:
+        """Subtract one paper when a driver accepts a lead (Paper Investigator shared tables).
+
+        Idempotent: skips if ``paper_processed_assignments`` already has this assignment.
+
+        Returns the new paper balance, or ``None`` if skipped (already counted) or paper tables unavailable.
+        """
+        did = self._norm_paper_driver_id(driver_id)
+        aid = str(assignment_id).strip()
+        if not aid:
+            return None
+        try:
+            pr = self.client.table("paper_processed_assignments").select("assignment_id").eq("assignment_id", aid).limit(1).execute()
+            if pr.data:
+                return None
+            self._paper_ensure_inventory_row(did)
+            r = self.client.table("paper_inventory").select("current_count").eq("driver_id", did).limit(1).execute()
+            current = int(r.data[0]["current_count"] or 0) if r.data else 0
+            new_balance = max(0, current - 1)
+            self.client.table("paper_inventory").update({"current_count": new_balance}).eq("driver_id", did).execute()
+            ref = (reference_id or "").strip() or None
+            self.client.table("paper_transactions").insert({
+                "driver_id": did,
+                "type": "subtract_order",
+                "amount": -1,
+                "balance_after": new_balance,
+                "reference_id": ref,
+                "note": "Order accepted in krableads",
+                "created_by": None,
+            }).execute()
+            self.client.table("paper_processed_assignments").insert({
+                "assignment_id": aid,
+                "driver_id": did,
+            }).execute()
+            return new_balance
+        except Exception as e:
+            err = str(e)
+            if "Could not find the table" in err or "PGRST205" in err:
+                logger.warning("Paper tables missing — skipping paper subtract: %s", e)
+            else:
+                logger.error("apply_paper_on_lead_accept: %s", e)
+            return None
+
     def get_accepted_leads_without_receipt_over_24h(self) -> list:
         """Accepted assignments where lead has no receipt and accepted_at is 24+ hours ago; reminder not yet sent."""
         if not self._check_tables_exist():

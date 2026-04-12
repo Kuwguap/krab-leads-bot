@@ -1,4 +1,5 @@
 """Paper Investigator — Telegram bot for tracking paper distribution to drivers."""
+import html
 import io
 import logging
 import os
@@ -113,23 +114,27 @@ async def handle_menu_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("No active drivers found.")
         return
 
-    lines = ["📋 **Driver Paper Inventory**\n"]
+    lines = ["📋 <b>Driver Paper Inventory</b>\n"]
     buttons = []
     for d in inventory:
         name = d["driver_name"]
-        count = d["current_count"]
+        count = int(d.get("current_count") or 0)
+        safe_name = html.escape(name)
         addr = d.get("address")
         addr_str = "✅" if addr else "⚠️"
         emoji = "🟢" if count >= Config.LOW_PAPER_THRESHOLD else "🔴"
-        lines.append(f"{emoji} **{name}** — {count} papers {addr_str}")
+        lines.append(f"{emoji} <b>{safe_name}</b> — <b>{count}</b> papers {addr_str}")
+        btn_add = f"➕ Add ({count})"
+        if len(btn_add) > 64:
+            btn_add = f"➕ + papers ({count})"[:64]
         buttons.append([
-            InlineKeyboardButton(f"➕ Add to {name}", callback_data=f"qadd_{d['driver_id']}"),
-            InlineKeyboardButton(f"📜 History", callback_data=f"qhist_{d['driver_id']}"),
+            InlineKeyboardButton(btn_add, callback_data=f"qadd_{d['driver_id']}"),
+            InlineKeyboardButton("📜 History", callback_data=f"qhist_{d['driver_id']}"),
         ])
     buttons.append([InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")])
     await query.message.reply_text(
         "\n".join(lines),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -566,9 +571,11 @@ async def job_auto_track_orders(context: ContextTypes.DEFAULT_TYPE) -> None:
             if not driver_id or not assignment_id:
                 continue
             new_balance = db.subtract_paper(driver_id, 1, ref, "Order accepted in krableads")
+            if new_balance < 0:
+                continue
             db.mark_assignment_processed(assignment_id, driver_id)
 
-            if new_balance >= 0 and new_balance < Config.LOW_PAPER_THRESHOLD:
+            if new_balance < Config.LOW_PAPER_THRESHOLD:
                 if not db.was_low_alert_sent(driver_id):
                     db.mark_low_alert_sent(driver_id)
                     driver = db.get_driver_by_id(driver_id)

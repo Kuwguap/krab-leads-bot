@@ -24,7 +24,8 @@ class PaperDB:
 
     def get_driver_by_id(self, driver_id: str) -> Optional[dict]:
         try:
-            r = self.client.table("drivers").select("*").eq("id", driver_id).limit(1).execute()
+            did = str(driver_id).strip()
+            r = self.client.table("drivers").select("*").eq("id", did).limit(1).execute()
             return r.data[0] if r.data else None
         except Exception as e:
             logger.error("get_driver_by_id: %s", e)
@@ -34,7 +35,8 @@ class PaperDB:
 
     def get_driver_address(self, driver_id: str) -> Optional[dict]:
         try:
-            r = self.client.table("driver_addresses").select("*").eq("driver_id", driver_id).limit(1).execute()
+            did = str(driver_id).strip()
+            r = self.client.table("driver_addresses").select("*").eq("driver_id", did).limit(1).execute()
             return r.data[0] if r.data else None
         except Exception as e:
             logger.error("get_driver_address: %s", e)
@@ -65,20 +67,25 @@ class PaperDB:
     # ── Paper inventory ──────────────────────────────────────────────────
 
     def get_paper_count(self, driver_id: str) -> int:
+        did = str(driver_id).strip()
         try:
-            r = self.client.table("paper_inventory").select("current_count").eq("driver_id", driver_id).limit(1).execute()
-            return r.data[0]["current_count"] if r.data else 0
+            r = self.client.table("paper_inventory").select("current_count").eq("driver_id", did).limit(1).execute()
+            if not r.data:
+                return 0
+            return int(r.data[0].get("current_count") or 0)
         except Exception:
             return 0
 
     def _ensure_inventory(self, driver_id: str) -> None:
-        existing = self.client.table("paper_inventory").select("id").eq("driver_id", driver_id).limit(1).execute()
+        did = str(driver_id).strip()
+        existing = self.client.table("paper_inventory").select("id").eq("driver_id", did).limit(1).execute()
         if not existing.data:
-            self.client.table("paper_inventory").insert({"driver_id": driver_id, "current_count": 0}).execute()
+            self.client.table("paper_inventory").insert({"driver_id": did, "current_count": 0}).execute()
 
     def add_paper(self, driver_id: str, amount: int, created_by: int, note: str = "") -> int:
         """Add papers to a driver. Returns new balance."""
         try:
+            driver_id = str(driver_id).strip()
             self._ensure_inventory(driver_id)
             current = self.get_paper_count(driver_id)
             new_balance = current + amount
@@ -102,6 +109,7 @@ class PaperDB:
     def subtract_paper(self, driver_id: str, amount: int, reference_id: str = "", note: str = "", created_by: int = 0) -> int:
         """Subtract papers from a driver (order accepted). Returns new balance, or -1 on error."""
         try:
+            driver_id = str(driver_id).strip()
             self._ensure_inventory(driver_id)
             current = self.get_paper_count(driver_id)
             new_balance = max(0, current - amount)
@@ -126,12 +134,21 @@ class PaperDB:
         """All drivers with their paper counts. Returns list of dicts."""
         try:
             drivers = self.get_all_drivers()
+            counts_by_driver: dict[str, int] = {}
+            try:
+                inv = self.client.table("paper_inventory").select("driver_id, current_count").execute()
+                for row in (inv.data or []):
+                    rid = str(row.get("driver_id", "")).strip()
+                    if rid:
+                        counts_by_driver[rid] = int(row.get("current_count") or 0)
+            except Exception as e:
+                logger.error("get_all_inventory paper_inventory batch: %s", e)
             out = []
             for d in drivers:
                 if not d.get("is_active", True):
                     continue
-                did = d["id"]
-                count = self.get_paper_count(did)
+                did = str(d["id"]).strip()
+                count = counts_by_driver.get(did, 0)
                 addr = self.get_driver_address(did)
                 out.append({
                     "driver_id": did,
@@ -291,7 +308,7 @@ class PaperDB:
         """Find lead_assignments with status='accepted' not yet counted for paper."""
         try:
             r = (self.client.table("lead_assignments")
-                 .select("id, driver_id, lead_id, accepted_at, lead:leads(reference_id)")
+                 .select("id, driver_id, lead_id, accepted_at")
                  .eq("status", "accepted")
                  .execute())
             if not r.data:
@@ -299,10 +316,27 @@ class PaperDB:
             processed = set()
             try:
                 pr = self.client.table("paper_processed_assignments").select("assignment_id").execute()
-                processed = {row["assignment_id"] for row in (pr.data or [])}
+                processed = {str(row["assignment_id"]) for row in (pr.data or [])}
             except Exception:
                 pass
-            return [a for a in r.data if a.get("id") not in processed]
+            out = []
+            for a in r.data:
+                aid = str(a.get("id") or "")
+                if not aid or aid in processed:
+                    continue
+                ref = ""
+                lid = a.get("lead_id")
+                if lid:
+                    try:
+                        lr = self.client.table("leads").select("reference_id").eq("id", lid).limit(1).execute()
+                        if lr.data:
+                            ref = (lr.data[0].get("reference_id") or "") or ""
+                    except Exception:
+                        pass
+                row = dict(a)
+                row["lead"] = {"reference_id": ref}
+                out.append(row)
+            return out
         except Exception as e:
             logger.error("get_unprocessed_accepted_assignments: %s", e)
             return []
@@ -310,8 +344,8 @@ class PaperDB:
     def mark_assignment_processed(self, assignment_id: str, driver_id: str) -> None:
         try:
             self.client.table("paper_processed_assignments").insert({
-                "assignment_id": assignment_id,
-                "driver_id": driver_id,
+                "assignment_id": str(assignment_id).strip(),
+                "driver_id": str(driver_id).strip(),
             }).execute()
         except Exception:
             pass

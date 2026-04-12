@@ -33,6 +33,10 @@ class Config:
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+    # Paper Investigator (shared Supabase tables; optional — used by main bot when drivers accept leads)
+    LOW_PAPER_THRESHOLD = int(os.getenv("LOW_PAPER_THRESHOLD", "5"))
+    PAPER_SUPERVISOR_TELEGRAM_ID = (os.getenv("PAPER_SUPERVISOR_TELEGRAM_ID") or "").strip() or None
+
     # AI / Vision (optional – for image → structured Phase 1)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or None
     OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o").strip() or "gpt-4o"

@@ -3144,6 +3144,29 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     success = db.accept_lead_assignment(lead_id, driver['id'])
     
     if success:
+        # Paper inventory (shared Paper Investigator tables): subtract one paper per accepted lead
+        assignment_row = db.get_lead_assignment_status(lead_id)
+        if assignment_row:
+            aid = assignment_row.get("id")
+            ref = (lead.get("reference_id") or "") or ""
+            new_paper_bal = db.apply_paper_on_lead_accept(str(driver["id"]), str(aid), str(ref))
+            if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
+                if not db.paper_was_low_alert_sent(driver["id"]):
+                    db.paper_mark_low_alert_sent(driver["id"])
+                    sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
+                    if sup:
+                        try:
+                            dnm = driver.get("driver_name", "Driver")
+                            await context.bot.send_message(
+                                chat_id=int(sup),
+                                text=(
+                                    f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
+                                    "Open the Paper Investigator bot (All Drivers) to approve resupply."
+                                ),
+                            )
+                        except Exception as e:
+                            logger.warning("Could not notify paper supervisor (low paper): %s", e)
+
         # Get group info for forwarding
         group_id = lead.get('group_id')
         group = db.get_group_by_id(group_id) if group_id else None
