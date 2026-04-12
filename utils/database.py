@@ -422,6 +422,18 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting drivers: {e}")
             return []
+
+    def get_driver_by_telegram_id(self, telegram_user_id: str) -> Optional[Dict[str, Any]]:
+        """Single-row lookup by driver_telegram_id (indexed). Prefer over scanning get_all_drivers()."""
+        if not self._check_tables_exist():
+            return None
+        uid = str(telegram_user_id).strip()
+        try:
+            response = self.client.table("drivers").select("*").eq("driver_telegram_id", uid).limit(1).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"Error getting driver by telegram id: {e}")
+            return None
     
     def get_group_driver_rows_for_group(self, group_id: str) -> list:
         """All drivers linked to a group via group_drivers (any is_active)."""
@@ -692,35 +704,39 @@ class Database:
             logger.error(f"Error declining group lead offer: {e}")
             return False
 
-    def accept_lead_assignment(self, lead_id: str, driver_id: str) -> bool:
-        """Accept a lead assignment (first driver to accept)."""
+    def accept_lead_assignment(self, lead_id: str, driver_id: str) -> Optional[Dict[str, Any]]:
+        """Accept a lead assignment (first driver to accept).
+
+        Returns the accepted assignment row (at least ``id``, ``lead_id``, ``driver_id``), or ``None``
+        if the lead was already accepted by someone else, no matching pending row exists, or on error.
+        """
         if not self._check_tables_exist():
-            return False
-        
+            return None
+
         try:
-            # Check if lead is already accepted
-            existing = self.client.table("lead_assignments").select("*").eq(
+            existing = self.client.table("lead_assignments").select("id").eq(
                 "lead_id", lead_id
-            ).eq("status", "accepted").execute()
-            
+            ).eq("status", "accepted").limit(1).execute()
+
             if existing.data:
-                return False  # Already accepted by someone else
-            
-            # Update this driver's assignment to accepted
+                return None  # Already accepted by someone else
+
             self.client.table("lead_assignments").update({
                 "status": "accepted",
                 "accepted_at": "now()"
             }).eq("lead_id", lead_id).eq("driver_id", driver_id).execute()
-            
-            # Decline all other pending assignments for this lead
+
             self.client.table("lead_assignments").update({
                 "status": "declined"
             }).eq("lead_id", lead_id).eq("status", "pending").neq("driver_id", driver_id).execute()
-            
-            return True
+
+            r = self.client.table("lead_assignments").select("id, lead_id, driver_id, status").eq(
+                "lead_id", lead_id
+            ).eq("driver_id", driver_id).eq("status", "accepted").limit(1).execute()
+            return r.data[0] if r.data else None
         except Exception as e:
             logger.error(f"Error accepting lead assignment: {e}")
-            return False
+            return None
     
     def decline_lead_assignment(self, lead_id: str, driver_id: str) -> bool:
         """Decline a lead assignment."""

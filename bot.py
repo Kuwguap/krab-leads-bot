@@ -3123,182 +3123,177 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=_driver_receipt_keyboard_only(),
         )
         return
-    
-    # Check if lead is already accepted
-    assignment_status = db.get_lead_assignment_status(lead_id)
-    if assignment_status and assignment_status.get('status') == 'accepted':
-        # Another driver already accepted this lead
-        await query.message.edit_text(
-            "❌ Request Already Taken\n\n"
-            "1. Turn on❗telegram notifications🔔\n"
-            "2. Check ✅here ⏱️hourly\n"
-            "3. Go the extra🛣️mile, post ads instead of doing nothing waiting ask us how.\n\n"
-            "-Thank you 🙏\n"
-            "🏁Automated🏎️Automotive",
-            parse_mode="Markdown",
-            reply_markup=_driver_receipt_keyboard_only(),
-        )
-        return
-    
-    # Try to accept the lead assignment
-    success = db.accept_lead_assignment(lead_id, driver['id'])
-    
-    if success:
-        # Paper inventory (shared Paper Investigator tables): subtract one paper per accepted lead
-        assignment_row = db.get_lead_assignment_status(lead_id)
-        if assignment_row:
-            aid = assignment_row.get("id")
-            ref = (lead.get("reference_id") or "") or ""
-            new_paper_bal = db.apply_paper_on_lead_accept(str(driver["id"]), str(aid), str(ref))
-            if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
-                if not db.paper_was_low_alert_sent(driver["id"]):
-                    db.paper_mark_low_alert_sent(driver["id"])
-                    sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
-                    if sup:
-                        try:
-                            dnm = driver.get("driver_name", "Driver")
-                            await context.bot.send_message(
-                                chat_id=int(sup),
-                                text=(
-                                    f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
-                                    "Open the Paper Investigator bot (All Drivers) to approve resupply."
-                                ),
-                            )
-                        except Exception as e:
-                            logger.warning("Could not notify paper supervisor (low paper): %s", e)
 
-        # Get group info for forwarding
-        group_id = lead.get('group_id')
-        group = db.get_group_by_id(group_id) if group_id else None
-        
-        # Update Monday.com driver column if possible
-        monday_item_id = lead.get('monday_item_id')
-        if monday and monday_item_id:
-            try:
-                monday.update_item_driver(monday_item_id, driver.get('driver_name', ''))
-            except Exception as e:
-                logger.error(f"Error updating Monday.com driver column: {e}")
-        
-        # Send confirmation to driver (plain text — long template with payment lines from Config)
-        confirmation_message = _build_driver_lead_accepted_message_html(lead)
+    accepted_row = db.accept_lead_assignment(lead_id, driver['id'])
 
-        receipt_keyboard = _driver_receipt_keyboard_only()
-
-        await query.message.edit_text(
-            "✅ **You accepted this lead!**",
-            parse_mode="Markdown"
-        )
-        try:
-            await query.message.reply_text(
-                confirmation_message,
-                reply_markup=receipt_keyboard,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except BadRequest:
-            plain = re.sub(r"<[^>]+>", "", confirmation_message)
-            await query.message.reply_text(plain, reply_markup=receipt_keyboard)
-        pending = db.get_driver_pending_receipts(driver["id"])
-        if pending:
-            ref_buttons = [
-                [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
-                for p in pending[:10]
-            ]
-            if len(pending) >= SUSPENSION_THRESHOLD:
-                txt = (
-                    f"⛔ **You have been suspended**\n\n"
-                    f"Reason: You owe **{len(pending)}** receipt(s). "
-                    "You will not receive new leads until all outstanding receipts are uploaded.\n\n"
-                    "To view all receipts type /receipts"
-                )
-                driver_nm = driver.get("driver_name", "Unknown")
-                try:
-                    sup_txt = (
-                        f"⛔ **Driver Suspended**\n\n"
-                        f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
-                        f"Reason: {len(pending)} unpaid receipt(s)"
-                    )
-                    sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
-                    if sup_id:
-                        try:
-                            await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
-                        except BadRequest:
-                            await context.bot.send_message(chat_id=sup_id, text=sup_txt.replace("*", ""))
-                except Exception as e:
-                    logger.warning("Could not send suspension alert to supervisory: %s", e)
-            else:
-                txt = (
-                    f"⚠️ You owe **{len(pending)}** receipt(s).\n\n"
-                    f"At **{SUSPENSION_THRESHOLD}** unpaid you will be "
-                    "**temporarily suspended** from new leads.\n\n"
-                    "To view all receipts type /receipts"
-                )
-            await query.message.reply_text(
-                txt,
+    if not accepted_row:
+        st = db.get_lead_assignment_status(lead_id)
+        if st and st.get("status") == "accepted":
+            await query.message.edit_text(
+                "❌ Request Already Taken\n\n"
+                "1. Turn on❗telegram notifications🔔\n"
+                "2. Check ✅here ⏱️hourly\n"
+                "3. Go the extra🛣️mile, post ads instead of doing nothing waiting ask us how.\n\n"
+                "-Thank you 🙏\n"
+                "🏁Automated🏎️Automotive",
                 parse_mode="Markdown",
-                reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
+                reply_markup=_driver_receipt_keyboard_only(),
             )
-        # Forward acceptance message to group and supervisory (global + per-group)
-        extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
-        spec_grp = _lead_issuer_note(lead)
-        acceptance_message = (
-            "✅ **Lead Accepted**\n\n"
-            f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
-            f"📝 Extra info: {extra_safe}\n"
-            f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
-        )
-        if spec_grp:
-            acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
-        if group:
-            group_telegram_id = group.get("group_telegram_id")
-            if group_telegram_id:
-                try:
-                    await context.bot.send_message(
-                        chat_id=group_telegram_id,
-                        text=acceptance_message,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.error(f"Error forwarding acceptance to group: {e}")
-            await _send_to_supervisory_chats(
-                context,
-                group.get("supervisory_telegram_id"),
-                acceptance_message,
-            )
-        else:
-            await _send_to_supervisory_chats(context, None, acceptance_message)
-        # Schedule 28-day renewal
-        try:
-            from datetime import datetime, timedelta, timezone as _tz
-            renewal_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
-            existing_renewal = db.get_active_renewal_for_lead(lead_id)
-            if not existing_renewal:
-                db.schedule_renewal(
-                    lead_id=lead_id,
-                    group_id=group_id if group_id else None,
-                    driver_id=driver["id"],
-                    renewal_due_at=renewal_due.isoformat(),
-                )
-                logger.info("Renewal scheduled for lead %s in %d days", lead.get("reference_id", "?"), Config.RENEWAL_DAYS)
-        except Exception as e:
-            logger.warning("Could not schedule renewal: %s", e)
-
-        await _notify_lead_lifecycle(
-            context,
-            lead,
-            2,
-            "Driver accepted new lead",
-            [
-                f"Reference: `{lead.get('reference_id', 'N/A')}`",
-                f"Driver: **{driver.get('driver_name', 'Driver')}**",
-            ],
-        )
-    else:
+            return
         await query.message.edit_text(
             "❌ **Error accepting lead. Please try again.**",
             parse_mode="Markdown",
             reply_markup=_driver_receipt_keyboard_only(),
         )
+        return
+
+    # Paper inventory (shared Paper Investigator tables): subtract one paper per accepted lead
+    aid = accepted_row.get("id")
+    ref = (lead.get("reference_id") or "") or ""
+    new_paper_bal = db.apply_paper_on_lead_accept(str(driver["id"]), str(aid), str(ref))
+    if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
+        if not db.paper_was_low_alert_sent(driver["id"]):
+            db.paper_mark_low_alert_sent(driver["id"])
+            sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
+            if sup:
+                try:
+                    dnm = driver.get("driver_name", "Driver")
+                    await context.bot.send_message(
+                        chat_id=int(sup),
+                        text=(
+                            f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
+                            "Open the Paper Investigator bot (All Drivers) to approve resupply."
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning("Could not notify paper supervisor (low paper): %s", e)
+
+    # Get group info for forwarding
+    group_id = lead.get('group_id')
+    group = db.get_group_by_id(group_id) if group_id else None
+
+    # Update Monday.com driver column if possible
+    monday_item_id = lead.get('monday_item_id')
+    if monday and monday_item_id:
+        try:
+            monday.update_item_driver(monday_item_id, driver.get('driver_name', ''))
+        except Exception as e:
+            logger.error(f"Error updating Monday.com driver column: {e}")
+
+    # Send confirmation to driver (plain text — long template with payment lines from Config)
+    confirmation_message = _build_driver_lead_accepted_message_html(lead)
+
+    receipt_keyboard = _driver_receipt_keyboard_only()
+
+    await query.message.edit_text(
+        "✅ **You accepted this lead!**",
+        parse_mode="Markdown"
+    )
+    try:
+        await query.message.reply_text(
+            confirmation_message,
+            reply_markup=receipt_keyboard,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        plain = re.sub(r"<[^>]+>", "", confirmation_message)
+        await query.message.reply_text(plain, reply_markup=receipt_keyboard)
+    pending = db.get_driver_pending_receipts(driver["id"])
+    if pending:
+        ref_buttons = [
+            [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+            for p in pending[:10]
+        ]
+        if len(pending) >= SUSPENSION_THRESHOLD:
+            txt = (
+                f"⛔ **You have been suspended**\n\n"
+                f"Reason: You owe **{len(pending)}** receipt(s). "
+                "You will not receive new leads until all outstanding receipts are uploaded.\n\n"
+                "To view all receipts type /receipts"
+            )
+            driver_nm = driver.get("driver_name", "Unknown")
+            try:
+                sup_txt = (
+                    f"⛔ **Driver Suspended**\n\n"
+                    f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
+                    f"Reason: {len(pending)} unpaid receipt(s)"
+                )
+                sup_id = _parse_chat_id(Config.SUPERVISORY_TELEGRAM_ID)
+                if sup_id:
+                    try:
+                        await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
+                    except BadRequest:
+                        await context.bot.send_message(chat_id=sup_id, text=sup_txt.replace("*", ""))
+            except Exception as e:
+                logger.warning("Could not send suspension alert to supervisory: %s", e)
+        else:
+            txt = (
+                f"⚠️ You owe **{len(pending)}** receipt(s).\n\n"
+                f"At **{SUSPENSION_THRESHOLD}** unpaid you will be "
+                "**temporarily suspended** from new leads.\n\n"
+                "To view all receipts type /receipts"
+            )
+        await query.message.reply_text(
+            txt,
+            parse_mode="Markdown",
+            reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
+        )
+    # Forward acceptance message to group and supervisory (global + per-group)
+    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    spec_grp = _lead_issuer_note(lead)
+    acceptance_message = (
+        "✅ **Lead Accepted**\n\n"
+        f"🚗 Driver: {driver.get('driver_name', 'Unknown')}\n"
+        f"📝 Extra info: {extra_safe}\n"
+        f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
+    )
+    if spec_grp:
+        acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
+    if group:
+        group_telegram_id = group.get("group_telegram_id")
+        if group_telegram_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=group_telegram_id,
+                    text=acceptance_message,
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Error forwarding acceptance to group: {e}")
+        await _send_to_supervisory_chats(
+            context,
+            group.get("supervisory_telegram_id"),
+            acceptance_message,
+        )
+    else:
+        await _send_to_supervisory_chats(context, None, acceptance_message)
+    # Schedule 28-day renewal
+    try:
+        from datetime import datetime, timedelta, timezone as _tz
+        renewal_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
+        existing_renewal = db.get_active_renewal_for_lead(lead_id)
+        if not existing_renewal:
+            db.schedule_renewal(
+                lead_id=lead_id,
+                group_id=group_id if group_id else None,
+                driver_id=driver["id"],
+                renewal_due_at=renewal_due.isoformat(),
+            )
+            logger.info("Renewal scheduled for lead %s in %d days", lead.get("reference_id", "?"), Config.RENEWAL_DAYS)
+    except Exception as e:
+        logger.warning("Could not schedule renewal: %s", e)
+
+    await _notify_lead_lifecycle(
+        context,
+        lead,
+        2,
+        "Driver accepted new lead",
+        [
+            f"Reference: `{lead.get('reference_id', 'N/A')}`",
+            f"Driver: **{driver.get('driver_name', 'Driver')}**",
+        ],
+    )
 
 
 async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3557,11 +3552,8 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
 
 # Receipt submission handlers
 def _driver_row_for_telegram_user(telegram_user_id: int) -> dict | None:
-    uid = str(telegram_user_id).strip()
-    for d in db.get_all_drivers():
-        if str(d.get("driver_telegram_id", "")).strip() == uid:
-            return d
-    return None
+    """Resolve driver by Telegram user id (indexed query — avoids loading all drivers per tap)."""
+    return db.get_driver_by_telegram_id(str(telegram_user_id).strip())
 
 
 def _driver_accepted_this_lead(driver_id, lead_id: str) -> bool:
