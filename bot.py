@@ -1114,10 +1114,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             lines.append(
                 f"\n⚠️ You owe {n} receipt(s). At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended."
             )
-        lines.append(
-            "\nTo add a lead, use /lead or /client (both do the same). "
-            "You will go through the same steps as other users to upload a lead."
-        )
+        lines.append("\nTo add a lead, type /lead or /client.")
         lines.append("\nTo view all receipts type /receipts")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
