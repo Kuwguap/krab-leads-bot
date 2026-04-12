@@ -870,7 +870,7 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
     return (
         "📝 Here's how I understood your lead:\n\n"
         + _format_phase1_field_lines(state_data)
-        + "\n\nTap Accept to continue, or Make changes to fix any field."
+        + "\n\nTap Accept to continue, or tap Edit to make changes."
     )
 
 
@@ -911,7 +911,7 @@ def _phase1_review_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Accept", callback_data=PH1_REVIEW_ACCEPT),
-            InlineKeyboardButton("✏️ Make changes", callback_data=PH1_REVIEW_EDIT),
+            InlineKeyboardButton("✏️ Edit", callback_data=PH1_REVIEW_EDIT),
         ]
     ])
 
@@ -940,8 +940,8 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
 def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE),
-            InlineKeyboardButton("➡️ Done — continue lead", callback_data=PH1_EDIT_DONE),
+            InlineKeyboardButton("✏️ Edit", callback_data=PH1_EDIT_MORE),
+            InlineKeyboardButton("✅ Done", callback_data=PH1_EDIT_DONE),
         ]
     ])
 
@@ -949,7 +949,7 @@ def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
 def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm & continue lead", callback_data=PH1_FINAL_CONFIRM)],
-        [InlineKeyboardButton("✏️ Change another field", callback_data=PH1_EDIT_MORE)],
+        [InlineKeyboardButton("✏️ Edit", callback_data=PH1_EDIT_MORE)],
     ])
 
 
@@ -1141,7 +1141,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"\n⚠️ You owe {n} receipt(s). At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended."
             )
         lines.append("\nTo add a lead, type /lead or /client.")
-        lines.append("\nTo view all receipts type /receipts")
+        lines.append("\nTo view all receipts type /receipts.")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
         await update.message.reply_text(
@@ -1886,7 +1886,7 @@ async def handle_phase1_ai_review_callback(update: Update, context: ContextTypes
             return ConversationHandler.END
         context.user_data["phase1_recent_edits"] = []
         await query.message.reply_text(
-            "Pick a field to edit (each button shows label:current value):",
+            "Pick a field to edit:",
             reply_markup=_phase1_edit_fields_keyboard(state["data"]),
         )
         return STATE_AI_EDIT_MENU
