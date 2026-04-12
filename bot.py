@@ -1918,7 +1918,7 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     label = PH1_EDIT_PROMPT_LABEL[edit_key]
     await query.message.reply_text(
         f"✏️ Send new text for: {label}\n\n"
-        "Send a single minus (-) to clear that field.",
+        "Type minus (-) to clear that field.",
     )
     return STATE_AI_EDIT_INPUT
 
@@ -1957,7 +1957,7 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
         context.user_data["phase1_recent_edits"] = re_list[-15:]
     await update.message.reply_text(
         "✅ Updated.\n\n"
-        "Need another change, or continue the lead?",
+        "Need another Edit, or Done with edits?",
         reply_markup=_phase1_after_edit_keyboard(),
     )
     return STATE_AI_EDIT_INPUT
