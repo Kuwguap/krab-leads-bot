@@ -896,7 +896,7 @@ def _format_phase1_final_review_text(state_data: dict, recent_edits: list) -> st
         + _format_phase1_field_lines(state_data)
     )
     blocks.append(
-        "\nTap Confirm to continue the lead (VIN check / files), or Change another field."
+        "\nTap Done with Edits to continue the lead (VIN check / files), or Need another Edit to change a field."
     )
     return "\n".join(blocks)
 
@@ -948,8 +948,8 @@ def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
 
 def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm & continue lead", callback_data=PH1_FINAL_CONFIRM)],
-        [InlineKeyboardButton("✏️ Edit", callback_data=PH1_EDIT_MORE)],
+        [InlineKeyboardButton("✅ Done with Edits", callback_data=PH1_FINAL_CONFIRM)],
+        [InlineKeyboardButton("✏️ Need another Edit ?", callback_data=PH1_EDIT_MORE)],
     ])
 
 
