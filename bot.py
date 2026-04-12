@@ -2307,12 +2307,10 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         reference_id = lead.get("reference_id", "N/A")
-        _pg_name = primary_group.get("group_name", "N/A")
         try:
             _alert = _prefix_supervisory_html(
                 f"🆕 <b>New lead created</b>\n\n"
                 f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
-                f"Group: {html.escape(_pg_name, quote=False)}\n"
                 "Mode: Broadcast to all groups"
             )
             for _sup_cid in _global_supervisory_chat_ids():
@@ -2590,7 +2588,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             _alert = _prefix_supervisory_html(
                 f"🆕 <b>New lead created</b>\n\n"
                 f"Reference: <code>{html.escape(str(lead.get('reference_id', 'N/A')), quote=False)}</code>\n"
-                f"Group: {html.escape(_grp_name, quote=False)}"
+                f"Mode: broadcast to {html.escape(_grp_name, quote=False)}"
             )
             for _sup_cid in _global_supervisory_chat_ids():
                 try:
