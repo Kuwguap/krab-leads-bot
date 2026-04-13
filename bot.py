@@ -529,70 +529,57 @@ async def _notify_lead_lifecycle(
     photo_file_id: Optional[str] = None,
 ) -> None:
     """
-    Standard 3-step alerts to lead initiator + global supervisory ID(s).
+    Standard 3-step alerts to the lead initiator only (not global supervisory — avoids duplicate spam).
     step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
-    Deduplicates so the same chat_id never receives the same message twice.
-    Supervisory chats get the SUPERVISORY MESSAGE prefix; initiator-only does not.
     Prefer ``photo_file_id`` (same bot) over URLs so links are not broken or doubled.
     """
     lines = [f"🔔 **({step}/3)** {title_line}", ""]
     lines.extend(extra_lines or [])
     text = "\n".join(lines)
     initiator_id = lead.get("user_id")
-    # (chat_id, use_supervisory_prefix) — if same person is initiator + supervisory, one prefixed send
-    delivery: list[tuple] = []
-    by_norm: dict = {}
-    if initiator_id is not None:
-        try:
-            ic = int(initiator_id)
-            by_norm[_norm_chat_id(ic)] = (ic, False)
-        except (TypeError, ValueError):
-            logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
-    for sup_cid in _global_supervisory_chat_ids():
-        k = _norm_chat_id(sup_cid)
-        if k is not None:
-            by_norm[k] = (sup_cid, True)
-    for cid, use_sup_prefix in by_norm.values():
-        delivery.append((cid, use_sup_prefix))
-    for cid, use_sup_prefix in delivery:
-        if cid is None:
-            continue
-        out_text = _prefix_supervisory_message(text) if use_sup_prefix else text
-        try:
-            if step == 3 and (photo_file_id or photo_url):
-                safe_url = _normalize_receipt_image_url(photo_url) if photo_url else None
-                sent = False
-                if photo_file_id:
-                    try:
-                        await context.bot.send_photo(
-                            chat_id=cid, photo=photo_file_id, caption=out_text, parse_mode="Markdown"
-                        )
-                        sent = True
-                    except Exception as e:
-                        logger.warning("Lifecycle send_photo file_id failed for %s: %s", cid, e)
-                if not sent and safe_url:
-                    try:
-                        await context.bot.send_photo(
-                            chat_id=cid, photo=safe_url, caption=out_text, parse_mode="Markdown"
-                        )
-                        sent = True
-                    except Exception:
-                        pass
-                if not sent:
-                    link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
-                    try:
-                        await context.bot.send_message(
-                            chat_id=cid, text=out_text + link, parse_mode="Markdown"
-                        )
-                    except BadRequest:
-                        await context.bot.send_message(chat_id=cid, text=out_text + (f"\n{safe_url}" if safe_url else ""))
-            else:
+    if initiator_id is None:
+        return
+    try:
+        cid = int(initiator_id)
+    except (TypeError, ValueError):
+        logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
+        return
+    out_text = text
+    try:
+        if step == 3 and (photo_file_id or photo_url):
+            safe_url = _normalize_receipt_image_url(photo_url) if photo_url else None
+            sent = False
+            if photo_file_id:
                 try:
-                    await context.bot.send_message(chat_id=cid, text=out_text, parse_mode="Markdown")
+                    await context.bot.send_photo(
+                        chat_id=cid, photo=photo_file_id, caption=out_text, parse_mode="Markdown"
+                    )
+                    sent = True
+                except Exception as e:
+                    logger.warning("Lifecycle send_photo file_id failed for %s: %s", cid, e)
+            if not sent and safe_url:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=cid, photo=safe_url, caption=out_text, parse_mode="Markdown"
+                    )
+                    sent = True
+                except Exception:
+                    pass
+            if not sent:
+                link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid, text=out_text + link, parse_mode="Markdown"
+                    )
                 except BadRequest:
-                    await context.bot.send_message(chat_id=cid, text=out_text.replace("*", "").replace("`", ""))
-        except Exception as e:
-            logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
+                    await context.bot.send_message(chat_id=cid, text=out_text + (f"\n{safe_url}" if safe_url else ""))
+        else:
+            try:
+                await context.bot.send_message(chat_id=cid, text=out_text, parse_mode="Markdown")
+            except BadRequest:
+                await context.bot.send_message(chat_id=cid, text=out_text.replace("*", "").replace("`", ""))
+    except Exception as e:
+        logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
 
 
 async def _send_driver_requests_for_group(
@@ -2447,19 +2434,6 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         return ConversationHandler.END
 
     reference_id = lead.get("reference_id", "N/A")
-    try:
-        _alert = _prefix_supervisory_html(
-            f"🆕 <b>New lead created</b>\n\n"
-            f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
-            f"Mode: Single group ({html.escape(selected_group.get('group_name') or 'N/A', quote=False)})"
-        )
-        for _sup_cid in _global_supervisory_chat_ids():
-            try:
-                await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
-            except Exception as e:
-                logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
-    except Exception as e:
-        logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
     sent_n, _fail = await _post_single_group_approval(context, lead, selected_group)
     _attached = state_data.get("attached_files") or []
@@ -2548,19 +2522,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
 
         reference_id = lead.get("reference_id", "N/A")
-        try:
-            _alert = _prefix_supervisory_html(
-                f"🆕 <b>New lead created</b>\n\n"
-                f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
-                "Mode: Broadcast to all groups"
-            )
-            for _sup_cid in _global_supervisory_chat_ids():
-                try:
-                    await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
-                except Exception as e:
-                    logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
-        except Exception as e:
-            logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
         group_offer_message = (
             "🏷 NEW CLIENT\n"
@@ -2777,19 +2738,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     reference_id = lead.get("reference_id", "N/A")
-    try:
-        _alert = _prefix_supervisory_html(
-            f"🆕 <b>New lead created</b>\n\n"
-            f"Reference: <code>{html.escape(str(reference_id), quote=False)}</code>\n"
-            f"Mode: Single group ({html.escape(selected_group.get('group_name') or 'N/A', quote=False)})"
-        )
-        for _sup_cid in _global_supervisory_chat_ids():
-            try:
-                await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
-            except Exception as e:
-                logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
-    except Exception as e:
-        logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
     _sn2, _ = await _post_single_group_approval(context, lead, selected_group)
     _att_s = lead_data.get("attached_files") or []
@@ -2981,21 +2929,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
-        _grp_obj = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
-        _grp_name = (_grp_obj.get("group_name") if _grp_obj else None) or lead_data.get("selected_group", {}).get("group_name") or "N/A"
-        try:
-            _alert = _prefix_supervisory_html(
-                f"🆕 <b>New lead created</b>\n\n"
-                f"Reference: <code>{html.escape(str(lead.get('reference_id', 'N/A')), quote=False)}</code>\n"
-                f"Mode: broadcast to {html.escape(_grp_name, quote=False)}"
-            )
-            for _sup_cid in _global_supervisory_chat_ids():
-                try:
-                    await context.bot.send_message(chat_id=_sup_cid, text=_alert, parse_mode="HTML")
-                except Exception as e:
-                    logger.warning("Could not send new-lead alert to supervisory %s: %s", _sup_cid, e)
-        except Exception as e:
-            logger.warning("Could not send new-lead alert to supervisory: %s", e)
 
     had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
@@ -3776,7 +3709,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
             reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
         )
-    # Forward acceptance message to group and supervisory (global + per-group)
+    # Forward acceptance message to group chat only (not per-group / global supervisory — reduces duplicate spam).
     extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
     spec_grp = _lead_issuer_note(lead)
     acceptance_message = (
@@ -3798,13 +3731,6 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             except Exception as e:
                 logger.error(f"Error forwarding acceptance to group: {e}")
-        await _send_to_supervisory_chats(
-            context,
-            group.get("supervisory_telegram_id"),
-            acceptance_message,
-        )
-    else:
-        await _send_to_supervisory_chats(context, None, acceptance_message)
     # Schedule 28-day renewal
     try:
         from datetime import datetime, timedelta, timezone as _tz
@@ -4002,7 +3928,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         "<b>✅ Your group claimed this client</b>\n"
                         "<i>Sender already notified driver(s).</i>\n\n"
                     ),
-                    mirror_supervisory=True,
+                    mirror_supervisory=False,
                 )
             else:
                 _claimed_txt = (
@@ -4014,9 +3940,6 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     chat_id=_parse_chat_id(group.get("group_telegram_id")),
                     text=_claimed_txt,
                     parse_mode="Markdown",
-                )
-                await _send_to_supervisory_chats(
-                    context, group.get("supervisory_telegram_id"), _claimed_txt
                 )
         except Exception as e:
             logger.warning("Could not notify group after accept (assignments already exist): %s", e)
@@ -4031,7 +3954,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     group,
                     lead_for_group,
                     html_prefix="<b>✅ Your group claimed this client</b>\n\n",
-                    mirror_supervisory=True,
+                    mirror_supervisory=False,
                 )
             except Exception as e:
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
@@ -4046,18 +3969,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     text=_drv_txt,
                     parse_mode="Markdown",
                 )
-                await _send_to_supervisory_chats(
-                    context, group.get("supervisory_telegram_id"), _drv_txt
-                )
             else:
                 _fail_txt = _group_accept_notify_fail_text(reference_id, fail_reason, driver_scope)
                 await context.bot.send_message(
                     chat_id=_parse_chat_id(group.get("group_telegram_id")),
                     text=_fail_txt,
                     parse_mode="Markdown",
-                )
-                await _send_to_supervisory_chats(
-                    context, group.get("supervisory_telegram_id"), _fail_txt
                 )
 
 
