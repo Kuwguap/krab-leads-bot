@@ -248,29 +248,25 @@ async def _forward_phase1_attached_files_to_targets(
     context: ContextTypes.DEFAULT_TYPE,
     attached_files: list,
     group_chat_id: int | str | None,
-    sup_chat_ids: list,
 ) -> None:
-    """Forward Phase 1 photos/documents to group and/or supervisory chats (Telegram ``file_id``)."""
+    """Forward Phase 1 photos/documents to the group chat only (not supervisory)."""
     if not attached_files:
         return
     _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
+    if not _group_cid:
+        return
     for f in attached_files:
         ftype = f.get("type")
         fid = f.get("file_id")
         if not fid:
             continue
         try:
-            if ftype == "photo" and _group_cid:
+            if ftype == "photo":
                 await context.bot.send_photo(chat_id=_group_cid, photo=fid)
-            elif ftype == "document" and _group_cid:
+            elif ftype == "document":
                 await context.bot.send_document(chat_id=_group_cid, document=fid)
-            for _sup_cid in sup_chat_ids:
-                if ftype == "photo":
-                    await context.bot.send_photo(chat_id=_sup_cid, photo=fid)
-                elif ftype == "document":
-                    await context.bot.send_document(chat_id=_sup_cid, document=fid)
         except Exception as e:
-            logger.warning("Could not forward attached file to group/supervisory: %s", e)
+            logger.warning("Could not forward attached file to group: %s", e)
 
 
 async def _post_single_group_approval(
@@ -1502,7 +1498,7 @@ def _issuer_state_data_from_lead(lead: dict) -> dict:
         "link": lead.get("encrypted_link"),
     }
     iss = (lead.get("special_request_issuers") or lead.get("special_request_note") or "") or ""
-    return {
+    out = {
         "vehicle_details": lead.get("vehicle_details") or "",
         "delivery_details": lead.get("delivery_details") or "",
         "phone_number": lead.get("phone_number"),
@@ -1515,6 +1511,10 @@ def _issuer_state_data_from_lead(lead: dict) -> dict:
         "special_request_note": iss,
         "username": lead.get("telegram_username") or "Unknown",
     }
+    att = lead.get("phase1_attached_files")
+    if isinstance(att, list) and att:
+        out["attached_files"] = att
+    return out
 
 
 def _validate_lead_row_for_resend(lead: dict | None, *, issuer_user_id: int | None = None) -> tuple[bool, str]:
@@ -2427,6 +2427,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         "special_request_issuers": state_data.get("special_request_issuers", "") or "",
         "special_request_drivers": state_data.get("special_request_drivers", "") or "",
         "special_request_note": state_data.get("special_request_issuers", "") or "",
+        "phase1_attached_files": state_data.get("attached_files") or [],
     }
     lead = db.create_lead(final_lead_data)
     if not lead:
@@ -2435,23 +2436,13 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
 
     reference_id = lead.get("reference_id", "N/A")
 
-    sent_n, _fail = await _post_single_group_approval(context, lead, selected_group)
-    _attached = state_data.get("attached_files") or []
-    if sent_n > 0 and _attached:
-        await _forward_phase1_attached_files_to_targets(
-            context,
-            _attached,
-            selected_group.get("group_telegram_id"),
-            _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
-        )
+    await _post_single_group_approval(context, lead, selected_group)
 
     continue_data = state_data.copy()
     continue_data["lead_id"] = lead["id"]
     continue_data["group_id"] = group_id
     continue_data["selected_group"] = selected_group
     continue_data["follow_after_broadcast"] = True
-    if sent_n > 0 and _attached:
-        continue_data["approval_files_forwarded"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
 
     drivers = db.get_all_drivers()
@@ -2515,6 +2506,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
             "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
             "special_request_note": lead_data.get("special_request_issuers", "") or "",
+            "phase1_attached_files": lead_data.get("attached_files") or [],
         }
         lead = db.create_lead(final_lead_data)
         if not lead:
@@ -2569,7 +2561,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 sent_count += 1
                 _att = lead_data.get("attached_files") or []
                 if _att:
-                    await _forward_phase1_attached_files_to_targets(context, _att, chat_id, [])
+                    await _forward_phase1_attached_files_to_targets(context, _att, chat_id)
             except RetryAfter as e:
                 # Telegram is rate limiting. Wait the requested time and retry once.
                 wait_s = int(getattr(e, "retry_after", 1) or 1)
@@ -2586,7 +2578,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     sent_count += 1
                     _att = lead_data.get("attached_files") or []
                     if _att:
-                        await _forward_phase1_attached_files_to_targets(context, _att, chat_id, [])
+                        await _forward_phase1_attached_files_to_targets(context, _att, chat_id)
                 except Exception as e2:
                     logger.error("Error sending group offer to %s after retry: %s", g.get("group_name"), e2)
                     failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e2).__name__}: {e2}"))
@@ -2596,12 +2588,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
         _att_all = lead_data.get("attached_files") or []
         if _att_all:
-            await _forward_phase1_attached_files_to_targets(
-                context,
-                _att_all,
-                None,
-                _supervisory_delivery_chat_ids(primary_group.get("supervisory_telegram_id")),
-            )
+            db.update_lead(lead["id"], {"phase1_attached_files": []})
 
         # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
         continue_data = lead_data.copy()
@@ -2668,24 +2655,17 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text(f"❌ {err_row}")
             return ConversationHandler.END
         db.delete_group_lead_offers_for_lead(rid)
-        db.update_lead(rid, {"group_id": group_id})
+        db.update_lead(rid, {
+            "group_id": group_id,
+            "phase1_attached_files": lead_data.get("attached_files") or [],
+        })
         lead = db.get_lead_by_id(rid) or lead
-        _sn, _ = await _post_single_group_approval(context, lead, selected_group)
-        _att_r = lead_data.get("attached_files") or []
-        if _sn > 0 and _att_r:
-            await _forward_phase1_attached_files_to_targets(
-                context,
-                _att_r,
-                selected_group.get("group_telegram_id"),
-                _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
-            )
+        await _post_single_group_approval(context, lead, selected_group)
         continue_data = _issuer_state_data_from_lead(lead)
         continue_data["lead_id"] = rid
         continue_data["group_id"] = group_id
         continue_data["selected_group"] = selected_group
         continue_data["follow_after_broadcast"] = True
-        if _sn > 0 and _att_r:
-            continue_data["approval_files_forwarded"] = True
         db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
         active_drivers = [d for d in drivers if record_is_active(d)]
@@ -2731,6 +2711,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
         "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
+        "phase1_attached_files": lead_data.get("attached_files") or [],
     }
     lead = db.create_lead(final_lead_data)
     if not lead:
@@ -2739,23 +2720,13 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
     reference_id = lead.get("reference_id", "N/A")
 
-    _sn2, _ = await _post_single_group_approval(context, lead, selected_group)
-    _att_s = lead_data.get("attached_files") or []
-    if _sn2 > 0 and _att_s:
-        await _forward_phase1_attached_files_to_targets(
-            context,
-            _att_s,
-            selected_group.get("group_telegram_id"),
-            _supervisory_delivery_chat_ids(selected_group.get("supervisory_telegram_id")),
-        )
+    await _post_single_group_approval(context, lead, selected_group)
 
     continue_data = lead_data.copy()
     continue_data["lead_id"] = lead["id"]
     continue_data["group_id"] = group_id
     continue_data["selected_group"] = selected_group
     continue_data["follow_after_broadcast"] = True
-    if _sn2 > 0 and _att_s:
-        continue_data["approval_files_forwarded"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
     drivers = db.get_all_drivers()
     active_drivers = [d for d in drivers if record_is_active(d)]
@@ -2916,6 +2887,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
         "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
+        "phase1_attached_files": lead_data.get("attached_files") or [],
     }
 
     if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
@@ -3242,15 +3214,24 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="HTML",
     )
 
-    # Forward attached files (unless already sent with team approval — still before group Accept)
+    # Forward attached files (broadcast: already sent; single-target: deferred until group Accept)
     if not lead_data.get("approval_files_forwarded"):
-        attached_files = phase1_data.get("attached_files") or []
-        await _forward_phase1_attached_files_to_targets(
-            context,
-            attached_files,
-            group_telegram_id_raw,
-            _supervisory_delivery_chat_ids(supervisory_telegram_id),
-        )
+        lead_snap = db.get_lead_by_id(lead["id"]) or lead
+        stored = lead_snap.get("phase1_attached_files")
+        offers_n = len(db.get_group_lead_offers(lead["id"]))
+        if lead_data.get("follow_after_broadcast") and offers_n == 1:
+            attached_files = []
+        else:
+            attached_files = (
+                stored if isinstance(stored, list) and stored
+                else (phase1_data.get("attached_files") or [])
+            )
+        if attached_files:
+            await _forward_phase1_attached_files_to_targets(
+                context,
+                attached_files,
+                group_telegram_id_raw,
+            )
     
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
     lead_for_notify = db.get_lead_by_id(lead["id"]) or lead
@@ -3900,6 +3881,16 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 )
         except Exception as e:
             logger.warning("Could not edit group offer message: %s", e)
+
+    lead_for_files = db.get_lead_by_id(lead_id) or lead
+    att = lead_for_files.get("phase1_attached_files")
+    if isinstance(att, list) and att:
+        await _forward_phase1_attached_files_to_targets(
+            context,
+            att,
+            group.get("group_telegram_id"),
+        )
+        db.update_lead(lead_id, {"phase1_attached_files": []})
 
     lead_ref = db.get_lead_by_id(lead_id) or lead
     accepter = f"@{query.from_user.username}" if query.from_user.username else (query.from_user.first_name or "member")
