@@ -488,11 +488,13 @@ def _new_lead_supervisory_notice_text(
     group_name: str,
     driver_names: str,
     username: str,
+    *,
+    include_lead_issuer: bool = True,
 ) -> str:
-    """Body of the supervisory + ST DM when an issuer completes sending a lead (one DM per lead).
+    """Body when an issuer completes sending a lead.
 
-    Plain text body; callers wrap with ``_prefix_supervisory_message`` so the
-    same header line appears as for other supervisory DMs.
+    ``include_lead_issuer``: Telegram @ of submitter — **only** for group/env supervisory chats,
+    not for ``st_telegram_id`` (see ``_finish_lead_send``).
     """
     def one_line(s: str) -> str:
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
@@ -505,32 +507,16 @@ def _new_lead_supervisory_notice_text(
         by_line = un if un.startswith("@") else f"@{un}"
     else:
         by_line = "Unknown"
-    return (
-        "📬 New lead sent\n\n"
-        f"Reference: {ref}\n"
-        f"Group: {gn}\n"
-        f"Driver(s): {dn}\n"
-        f"By: {by_line}"
-    )
-
-
-def _collect_new_lead_supervisory_chat_ids(group_supervisory_raw: object) -> list:
-    """Per-group + env supervisory, plus DB st_telegram_id; deduped so each chat gets one notice."""
-    out: list = list(_supervisory_delivery_chat_ids(group_supervisory_raw))
-    seen = {_norm_chat_id(c) for c in out if _norm_chat_id(c) is not None}
-    st_raw = (db.get_setting("st_telegram_id") or "").strip()
-    if not st_raw:
-        return out
-    st_cid = _parse_chat_id(st_raw)
-    if st_cid is None:
-        return out
-    nk = _norm_chat_id(st_cid)
-    if nk is not None and nk in seen:
-        return out
-    if nk is not None:
-        seen.add(nk)
-    out.append(st_cid)
-    return out
+    lines = [
+        "📬 New lead sent",
+        "",
+        f"Reference: {ref}",
+        f"Group: {gn}",
+        f"Driver(s): {dn}",
+    ]
+    if include_lead_issuer:
+        lines.append(f"Lead issued by: {by_line}")
+    return "\n".join(lines)
 
 
 _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
@@ -3307,23 +3293,46 @@ async def _finish_lead_send(
                 monday.update_item_contact_source(int(monday_item_id), contact_source_label)
             except Exception as e:
                 logger.error(f"Error updating Monday contact source: {e}")
-    sup_body = _new_lead_supervisory_notice_text(
-        reference_id, group_name, driver_names, username or "Unknown",
+    uname = username or "Unknown"
+    body_supervisory = _new_lead_supervisory_notice_text(
+        reference_id, group_name, driver_names, uname, include_lead_issuer=True,
     )
-    sup_text = _prefix_supervisory_message(sup_body)
+    body_st_only = _new_lead_supervisory_notice_text(
+        reference_id, group_name, driver_names, uname, include_lead_issuer=False,
+    )
+    sup_text_supervisory = _prefix_supervisory_message(body_supervisory)
+    sup_text_st = _prefix_supervisory_message(body_st_only)
     group_row = None
     if lead and lead.get("group_id"):
         group_row = db.get_group_by_id(lead["group_id"])
     sup_raw = group_row.get("supervisory_telegram_id") if group_row else None
-    for sup_cid in _collect_new_lead_supervisory_chat_ids(sup_raw):
+    sup_targets = _supervisory_delivery_chat_ids(sup_raw)
+    seen_norm: set = set()
+    for sup_cid in sup_targets:
+        nk = _norm_chat_id(sup_cid)
+        if nk is not None:
+            seen_norm.add(nk)
         try:
             await context.bot.send_message(
                 chat_id=sup_cid,
-                text=sup_text,
+                text=sup_text_supervisory,
                 parse_mode=None,
             )
         except Exception as e:
             logger.warning("Could not send new-lead notice to supervisory chat %s: %s", sup_cid, e)
+    st_raw = (db.get_setting("st_telegram_id") or "").strip()
+    if st_raw:
+        st_cid = _parse_chat_id(st_raw)
+        stk = _norm_chat_id(st_cid) if st_cid is not None else None
+        if st_cid is not None and stk is not None and stk not in seen_norm:
+            try:
+                await context.bot.send_message(
+                    chat_id=st_cid,
+                    text=sup_text_st,
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.warning("Could not send new-lead notice to ST chat %s: %s", st_cid, e)
     db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
     success_text = (
         f"✅ **Lead sent successfully**\n\n"
