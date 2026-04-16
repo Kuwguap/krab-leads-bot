@@ -2770,9 +2770,13 @@ async def handle_reassign_group_pick(update: Update, context: ContextTypes.DEFAU
     if not lead_id:
         await query.message.reply_text("❌ Invalid request.")
         return ConversationHandler.END
-    lead = db.get_lead_by_id(lead_id)
+    lead = _lead_for_resend(lead_id)
     if not lead or int(lead.get("user_id") or 0) != int(user_id):
         await query.message.reply_text("❌ Not allowed.")
+        return ConversationHandler.END
+    ok_r, err_r = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
+    if not ok_r:
+        await query.message.reply_text(f"❌ {err_r}")
         return ConversationHandler.END
     data = _issuer_state_data_from_lead(lead)
     data["reassign_lead_id"] = lead_id
