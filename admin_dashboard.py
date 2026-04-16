@@ -1260,13 +1260,17 @@ def api_remove_group_assistant(group_id, telegram_id):
 
 @app.route('/api/settings', methods=['GET'])
 def api_get_settings():
-    """Get settings: assistants_choose_group, st_telegram_id."""
+    """Get settings: assistants_choose_group, st_telegram_id, receipt_detection_mode."""
     try:
         val = db.get_setting("assistants_choose_group")
         st_id = (db.get_setting("st_telegram_id") or "").strip()
+        rec_mode = (db.get_setting("receipt_detection_mode") or "lax").strip().lower()
+        if rec_mode not in ("strict", "lax"):
+            rec_mode = "lax"
         return jsonify({
             "assistants_choose_group": (val or "").lower() in ("true", "1", "yes"),
             "st_telegram_id": st_id,
+            "receipt_detection_mode": rec_mode,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1274,7 +1278,7 @@ def api_get_settings():
 
 @app.route('/api/settings', methods=['POST'])
 def api_set_settings():
-    """Update settings. Body: { \"assistants_choose_group\": true/false, \"st_telegram_id\": \"123\" } (any key optional)."""
+    """Update settings. Body: assistants_choose_group, st_telegram_id, receipt_detection_mode (strict|lax) — any key optional."""
     try:
         data = _get_json_or_form()
         if data.get("assistants_choose_group") is not None:
@@ -1282,6 +1286,11 @@ def api_set_settings():
             db.set_setting("assistants_choose_group", "true" if v in (True, "true", "1", "yes") else "false")
         if "st_telegram_id" in data:
             db.set_setting("st_telegram_id", str(data.get("st_telegram_id", "")).strip())
+        if data.get("receipt_detection_mode") is not None:
+            rm = str(data.get("receipt_detection_mode", "")).strip().lower()
+            if rm not in ("strict", "lax"):
+                rm = "lax"
+            db.set_setting("receipt_detection_mode", rm)
         return jsonify({"success": True, "message": "Settings updated!"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

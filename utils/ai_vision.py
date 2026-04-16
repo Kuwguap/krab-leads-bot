@@ -489,6 +489,7 @@ Return ONLY valid JSON (no markdown, no explanation outside JSON):
 {
   "looks_like_receipt": true or false,
   "confidence": <integer 0-100>,
+  "has_dollar_sign": true or false,
   "amounts_usd": [<numbers>],
   "note": "<one short English sentence>"
 }
@@ -496,6 +497,7 @@ Return ONLY valid JSON (no markdown, no explanation outside JSON):
 Rules:
 - looks_like_receipt: true only if this clearly shows a real payment document: printed or digital receipt, invoice, cashier slip, card/terminal receipt, payment confirmation screenshot, bank app payment detail with amount, etc.
 - Set looks_like_receipt to false for: random photos, memes, selfies, vehicle photos with no payment info, blank/blurry unusable images, chat screenshots with no payment line, unrelated documents.
+- has_dollar_sign: true only if the ASCII dollar symbol $ is clearly visible as a currency marker on the receipt or payment screen (not guessed). False if the image uses only "USD" text, foreign currency, or no currency symbol.
 - amounts_usd: list every total or payment amount in US dollars visible (e.g. 1200, 99.5). Use numbers only. If no amount is readable, use [].
 - confidence: how sure you are that this is a legitimate payment/receipt image (not random upload).
 """
@@ -505,9 +507,15 @@ def validate_driver_receipt_image(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
     expected_price_text: Optional[str] = None,
+    detection_mode: str = "lax",
 ) -> ReceiptValidationResult:
     """
-    Use OpenAI vision to ensure the image looks like a receipt and optionally matches lead price.
+    Use OpenAI vision to ensure the image looks like a receipt.
+
+    detection_mode:
+    - ``lax``: if the lead has a price, require readable USD amount(s) that match within tolerance.
+    - ``strict``: require a visible ``$`` on the image; do not compare amounts to the lead price.
+
     If OPENAI_API_KEY is not set, returns accept=True (validation skipped).
     On model/API failure to produce JSON, fails open (accept=True) with a log line.
     Raises AIVisionQuotaError on quota/rate limit (caller should ask user to retry).
@@ -556,12 +564,20 @@ def validate_driver_receipt_image(
         logger.warning("validate_driver_receipt_image: could not parse JSON; allowing upload")
         return ReceiptValidationResult(True, "")
 
+    mode = (detection_mode or "lax").strip().lower()
+    if mode not in ("strict", "lax"):
+        mode = "lax"
+
     looks = data.get("looks_like_receipt")
     confidence = data.get("confidence")
     try:
         conf_int = int(confidence) if confidence is not None else 70
     except (TypeError, ValueError):
         conf_int = 70
+
+    has_dollar = data.get("has_dollar_sign")
+    if has_dollar is not True and has_dollar is not False:
+        has_dollar = None
 
     amounts_raw = data.get("amounts_usd") or []
     amounts: list[float] = []
@@ -579,6 +595,16 @@ def validate_driver_receipt_image(
         )
         return ReceiptValidationResult(False, msg)
 
+    if mode == "strict":
+        if has_dollar is not True:
+            return ReceiptValidationResult(
+                False,
+                "❌ We need a visible **$** (dollar sign) on the receipt or payment screen.\n\n"
+                "Please upload a clearer image where the dollar symbol appears on the document.",
+            )
+        return ReceiptValidationResult(True, "")
+
+    # lax: optional amount match when lead has a price
     expected = _lead_price_to_float(expected_price_text)
     if expected is not None and expected > 0:
         if not amounts:

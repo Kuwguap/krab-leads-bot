@@ -363,7 +363,29 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
         return s
 
 
-SUPERVISORY_MESSAGE_HEADER = "SUPERVISORY MESSAGE"
+SUPERVISORY_MESSAGE_HEADER = "SUPERVISORY MESSAGE ON TOP"
+
+
+def _plain_already_has_supervisory_header(text: str) -> bool:
+    """True if body already starts with current or legacy supervisory header (avoid double prefix)."""
+    u = (text or "").strip().upper()
+    if u.startswith(SUPERVISORY_MESSAGE_HEADER.upper()):
+        return True
+    # Legacy header (before ON TOP wording)
+    if u.startswith("SUPERVISORY MESSAGE"):
+        tail = u[len("SUPERVISORY MESSAGE") : len("SUPERVISORY MESSAGE") + 6]
+        if not tail.startswith(" ON TOP"):
+            return True
+    return False
+
+
+def _html_already_has_supervisory_header(text: str) -> bool:
+    u = (text or "").strip().upper()
+    if u.startswith("<B>SUPERVISORY MESSAGE ON TOP") or u.startswith("SUPERVISORY MESSAGE ON TOP"):
+        return True
+    if u.startswith("<B>SUPERVISORY MESSAGE</B>") or u.startswith("<B>SUPERVISORY MESSAGE"):
+        return True
+    return False
 
 
 def _raw_supervisory_tokens(*sources: object) -> list[str]:
@@ -387,7 +409,7 @@ def _prefix_supervisory_message(text: str) -> str:
     t = (text or "").strip()
     if not t:
         return t
-    if t.upper().startswith(SUPERVISORY_MESSAGE_HEADER.upper()):
+    if _plain_already_has_supervisory_header(t):
         return t
     return f"{SUPERVISORY_MESSAGE_HEADER}\n\n{t}"
 
@@ -397,9 +419,7 @@ def _prefix_supervisory_html(text: str) -> str:
     t = (text or "").strip()
     if not t:
         return t
-    head = SUPERVISORY_MESSAGE_HEADER.upper()
-    tu = t.upper()
-    if tu.startswith(head) or tu.startswith("<B>SUPERVISORY MESSAGE"):
+    if _html_already_has_supervisory_header(t):
         return t
     return f"<b>{SUPERVISORY_MESSAGE_HEADER}</b>\n\n{t}"
 
@@ -449,17 +469,10 @@ def _new_lead_supervisory_notice_text(
     driver_names: str,
     username: str,
 ) -> str:
-    """Body of the supervisory + ST DM when an issuer completes sending a lead.
+    """Body of the supervisory + ST DM when an issuer completes sending a lead (one DM per lead).
 
-    This **is** the supervisory message for new leads: plain text only, no
-    ``SUPERVISORY MESSAGE`` header and no other prefix. Format::
-
-        📬 New lead sent
-
-        Reference: …
-        Group: …
-        Driver(s): …
-        By: @…
+    Plain text body; callers wrap with ``_prefix_supervisory_message`` so the
+    same header line appears as for other supervisory DMs.
     """
     def one_line(s: str) -> str:
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
@@ -3272,9 +3285,10 @@ async def _finish_lead_send(
                 monday.update_item_contact_source(int(monday_item_id), contact_source_label)
             except Exception as e:
                 logger.error(f"Error updating Monday contact source: {e}")
-    sup_text = _new_lead_supervisory_notice_text(
+    sup_body = _new_lead_supervisory_notice_text(
         reference_id, group_name, driver_names, username or "Unknown",
     )
+    sup_text = _prefix_supervisory_message(sup_body)
     group_row = None
     if lead and lead.get("group_id"):
         group_row = db.get_group_by_id(lead["group_id"])
@@ -4329,11 +4343,15 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.message.document:
         mime_for_ai = (update.message.document.mime_type or "image/jpeg").lower()
     if Config.is_ai_vision_configured():
+        _rec_mode = (db.get_setting("receipt_detection_mode") or "lax").strip().lower()
+        if _rec_mode not in ("strict", "lax"):
+            _rec_mode = "lax"
         try:
             rv = ai_vision.validate_driver_receipt_image(
                 image_bytes,
                 mime_type=mime_for_ai,
                 expected_price_text=(lead.get("price") or "").strip() or None,
+                detection_mode=_rec_mode,
             )
         except ai_vision.AIVisionQuotaError:
             await update.message.reply_text(
@@ -4537,18 +4555,19 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             stk = _norm_chat_id(st_chat_id)
             if stk is not None and stk not in _receipt_sent:
                 _receipt_sent.add(stk)
+                cap_st = _prefix_supervisory_html(cap_html)
                 try:
                     if receipt_file_id:
                         await context.bot.send_photo(
                             chat_id=st_chat_id,
                             photo=receipt_file_id,
-                            caption=cap_html,
+                            caption=cap_st,
                             parse_mode="HTML",
                         )
                     else:
                         await context.bot.send_message(
                             chat_id=st_chat_id,
-                            text=cap_html,
+                            text=cap_st,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )
@@ -4557,7 +4576,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                     try:
                         await context.bot.send_message(
                             chat_id=st_chat_id,
-                            text=cap_html,
+                            text=cap_st,
                             parse_mode="HTML",
                             disable_web_page_preview=True,
                         )

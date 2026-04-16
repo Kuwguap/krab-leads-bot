@@ -11,7 +11,11 @@ export default function AdminPanel() {
   const [groups, setGroups] = useState([]);
   const [drivers, setDrivers] = useState([]);
   const [assistantsByGroup, setAssistantsByGroup] = useState({});
-  const [settings, setSettings] = useState({ assistants_choose_group: false, st_telegram_id: '' });
+  const [settings, setSettings] = useState({
+    assistants_choose_group: false,
+    st_telegram_id: '',
+    receipt_detection_mode: 'lax',
+  });
   const [contactSources, setContactSources] = useState([]);
   const [assignments, setAssignments] = useState([]);
   const [stats, setStats] = useState({ total_leads: 0, drivers: [] });
@@ -69,7 +73,14 @@ export default function AdminPanel() {
   const fetchSettings = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/settings`);
-      if (res.ok) setSettings(await res.json());
+      if (res.ok) {
+        const data = await res.json();
+        setSettings({
+          assistants_choose_group: !!data.assistants_choose_group,
+          st_telegram_id: data.st_telegram_id || '',
+          receipt_detection_mode: data.receipt_detection_mode === 'strict' ? 'strict' : 'lax',
+        });
+      }
     } catch {}
   }, []);
 
@@ -397,6 +408,26 @@ export default function AdminPanel() {
     }
   }
 
+  async function setReceiptDetectionMode(mode) {
+    const m = mode === 'strict' ? 'strict' : 'lax';
+    try {
+      const res = await fetch(`${API}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receipt_detection_mode: m }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setSettings((s) => ({ ...s, receipt_detection_mode: m }));
+        showMessage(data.message || 'Receipt detection updated!');
+      } else {
+        showMessage(data.error || 'Failed to update receipt mode', 'error');
+      }
+    } catch {
+      showMessage('Network error.', 'error');
+    }
+  }
+
   async function saveStTelegramId(e) {
     e.preventDefault();
     const val = (e.target.st_telegram_id?.value ?? '').trim();
@@ -561,6 +592,44 @@ export default function AdminPanel() {
           <button type="button" onClick={toggleAssistantsChooseGroup} className="admin-mobile-full" style={styles.button}>
             {settings.assistants_choose_group ? 'Use assigned groups only' : 'Allow assistants to choose group'}
           </button>
+          <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid #dee2e6' }}>
+            <p style={{ marginBottom: 8, fontWeight: 700 }}>Driver receipt detection (AI)</p>
+            <p style={{ marginBottom: 12, color: '#555', fontSize: '0.95rem' }}>
+              <strong>Strict</strong>: image must look like a receipt and show a visible <strong>$</strong> (no check that the amount matches the lead).
+              {' '}
+              <strong>Lax</strong>: same receipt check, and the paid total must match the lead price when a price is set.
+            </p>
+            <p style={{ marginBottom: 12 }}>
+              <strong>Current:</strong>{' '}
+              {settings.receipt_detection_mode === 'strict' ? 'Strict ($ on receipt)' : 'Lax (match amount to lead)'}
+            </p>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                onClick={() => setReceiptDetectionMode('strict')}
+                className="admin-mobile-full"
+                style={{
+                  ...styles.button,
+                  opacity: settings.receipt_detection_mode === 'strict' ? 1 : 0.75,
+                  fontWeight: settings.receipt_detection_mode === 'strict' ? 700 : 400,
+                }}
+              >
+                Use strict ($ only)
+              </button>
+              <button
+                type="button"
+                onClick={() => setReceiptDetectionMode('lax')}
+                className="admin-mobile-full"
+                style={{
+                  ...styles.button,
+                  opacity: settings.receipt_detection_mode === 'lax' ? 1 : 0.75,
+                  fontWeight: settings.receipt_detection_mode === 'lax' ? 700 : 400,
+                }}
+              >
+                Use lax (match amount)
+              </button>
+            </div>
+          </div>
         </section>
 
         <section className="admin-section" style={styles.section}>
