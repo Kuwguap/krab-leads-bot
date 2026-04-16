@@ -69,6 +69,11 @@ export async function POST(req) {
         one_time_delete_enabled: false,
       });
       config = await getClientsPhoneConfig();
+    } else if (passphrase) {
+      // Unlock compares against Supabase `clientsphonenumber_config.passphrase`, not Render/Vercel env.
+      // Sync passphrase from the bot on every share so ONETIMESECRET_PASSPHRASE stays the source of truth.
+      await upsertClientsPhoneConfig({ passphrase });
+      config = await getClientsPhoneConfig();
     }
 
     const now = Date.now();

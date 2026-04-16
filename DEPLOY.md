@@ -37,7 +37,7 @@ This project includes a `render.yaml` Blueprint at the repo root for one-click d
 | ONETIMESECRET_API_KEY | Yes | Basic-auth key used by `clientsphonenumber` API |
 | ONETIMESECRET_URL | Yes | OneTimeSecret-compatible endpoint (e.g. `https://clientsphonenumber.com/api/v1/share`) |
 | ONETIMESECRET_LINK_BASE | Yes | Link base shown to users (e.g. `https://clientsphonenumber.com/secret/`) |
-| ONETIMESECRET_PASSPHRASE | Yes | Passphrase sent by bot when creating secret links |
+| ONETIMESECRET_PASSPHRASE | Yes | Passphrase sent by bot when creating secret links (unlock checks Supabase `clientsphonenumber_config`; share API syncs passphrase from the bot on each new secret) |
 | SUPABASE_URL | Yes | Supabase project URL |
 | SUPABASE_KEY | Yes | Supabase anon key |
 | DRIVER_TELEGRAM_ID | Optional | Legacy driver ID |
