@@ -244,6 +244,23 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     return InlineKeyboardMarkup(buttons)
 
 
+def _should_defer_phase1_files_until_group_accept(lead_data: dict, offers_n: int) -> bool:
+    """True when phase-1 files must wait for group Accept (single-group team approval flow).
+
+    - Broadcast ``select_group_all`` sets ``broadcast`` and sends files with each offer; never defer.
+    - Single-target approval sets ``follow_after_broadcast`` but not ``broadcast``; defer until Accept.
+    """
+    if lead_data.get("approval_files_forwarded"):
+        return False
+    if offers_n != 1:
+        return False
+    if lead_data.get("broadcast"):
+        return False
+    if not lead_data.get("follow_after_broadcast"):
+        return False
+    return True
+
+
 async def _forward_phase1_attached_files_to_targets(
     context: ContextTypes.DEFAULT_TYPE,
     attached_files: list,
@@ -256,7 +273,7 @@ async def _forward_phase1_attached_files_to_targets(
     if not _group_cid:
         return
     for f in attached_files:
-        ftype = f.get("type")
+        ftype = (f.get("type") or "").lower()
         fid = f.get("file_id")
         if not fid:
             continue
@@ -264,6 +281,8 @@ async def _forward_phase1_attached_files_to_targets(
             if ftype == "photo":
                 await context.bot.send_photo(chat_id=_group_cid, photo=fid)
             elif ftype == "document":
+                await context.bot.send_document(chat_id=_group_cid, document=fid)
+            else:
                 await context.bot.send_document(chat_id=_group_cid, document=fid)
         except Exception as e:
             logger.warning("Could not forward attached file to group: %s", e)
@@ -2619,6 +2638,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data["group_id"] = primary_group.get("id")
         continue_data["selected_group"] = primary_group
         continue_data["follow_after_broadcast"] = True
+        continue_data["broadcast"] = True
         continue_data.pop("resend", None)
         if _att_all:
             continue_data["approval_files_forwarded"] = True
@@ -3218,12 +3238,13 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     "Ensure the bot is added to the group and has permission to post."
                 )
     
-    # Forward attached files (broadcast: already sent; single-target: deferred until group Accept)
+    # Forward attached files (broadcast: already sent per group; single-target: only after Accept)
     if not lead_data.get("approval_files_forwarded"):
         lead_snap = db.get_lead_by_id(lead["id"]) or lead
         stored = lead_snap.get("phase1_attached_files")
         offers_n = len(db.get_group_lead_offers(lead["id"]))
-        if lead_data.get("follow_after_broadcast") and offers_n == 1:
+        defer = _should_defer_phase1_files_until_group_accept(lead_data, offers_n)
+        if defer:
             attached_files = []
         else:
             attached_files = (
