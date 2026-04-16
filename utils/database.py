@@ -8,6 +8,20 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Added in database/migration_phase1_attached_files.sql — omit if DB is behind migration.
+_OPTIONAL_LEADS_WRITE_KEYS = frozenset({"phase1_attached_files"})
+
+
+def _retry_lead_write_without_phase1_files(exc: Exception, payload: Dict[str, Any]) -> bool:
+    """True if PostgREST rejected ``phase1_attached_files`` (column missing in schema cache)."""
+    if not _OPTIONAL_LEADS_WRITE_KEYS.intersection(payload.keys()):
+        return False
+    msg = str(exc).lower()
+    if "phase1_attached_files" in msg:
+        return True
+    # PostgREST sometimes omits column name; PGRST204 = undefined column
+    return "pgrst204" in msg and "leads" in msg
+
 
 def record_is_active(row: Optional[dict], key: str = "is_active") -> bool:
     """True unless the row explicitly has ``is_active`` = False.
@@ -115,31 +129,53 @@ class Database:
         """Create a new lead record."""
         if not self._check_tables_exist():
             return None
-        
-        try:
-            response = self.client.table("leads").insert(lead_data).execute()
-            if response.data:
-                return response.data[0]
-            return None
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
-                logger.error(f"Error creating lead: {e}")
-            return None
-    
+
+        payload = dict(lead_data)
+        for attempt in (0, 1):
+            try:
+                response = self.client.table("leads").insert(payload).execute()
+                if response.data:
+                    return response.data[0]
+                return None
+            except Exception as e:
+                if attempt == 0 and _retry_lead_write_without_phase1_files(e, payload):
+                    logger.warning(
+                        "create_lead: retrying without phase1_attached_files — run "
+                        "database/migration_phase1_attached_files.sql if you need attachments on the lead row: %s",
+                        e,
+                    )
+                    payload.pop("phase1_attached_files", None)
+                    continue
+                error_msg = str(e)
+                if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+                    logger.error(f"Error creating lead: {e}")
+                return None
+        return None
+
     def update_lead(self, lead_id: str, updates: Dict[str, Any]) -> bool:
         """Update a lead record."""
         if not self._check_tables_exist():
             return False
-        
-        try:
-            self.client.table("leads").update(updates).eq("id", lead_id).execute()
-            return True
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
-                logger.error(f"Error updating lead: {e}")
-            return False
+
+        payload = dict(updates)
+        for attempt in (0, 1):
+            try:
+                self.client.table("leads").update(payload).eq("id", lead_id).execute()
+                return True
+            except Exception as e:
+                if attempt == 0 and _retry_lead_write_without_phase1_files(e, payload):
+                    logger.warning(
+                        "update_lead: retrying without phase1_attached_files — run "
+                        "database/migration_phase1_attached_files.sql: %s",
+                        e,
+                    )
+                    payload.pop("phase1_attached_files", None)
+                    continue
+                error_msg = str(e)
+                if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+                    logger.error(f"Error updating lead: {e}")
+                return False
+        return False
     
     def get_lead_by_id(self, lead_id: str) -> Optional[Dict[str, Any]]:
         """Get a lead by ID."""
@@ -237,15 +273,11 @@ class Database:
         """Update lead with receipt image URL and set status to Paid."""
         if not self._check_tables_exist():
             return False
-        # Use the same execute path as update_lead — do not rely on RETURNING rows (PostgREST
-        # may return an empty data array depending on API version / RLS, causing false failures).
-        if self.update_lead(lead_id, {
-            "receipt_image_url": receipt_image_url,
-            "monday_status": "Paid",
-        }):
-            return True
-        # Fallback if monday_status or combined update is rejected (constraint / column)
-        return self.update_lead(lead_id, {"receipt_image_url": receipt_image_url})
+        # Persist URL first so a failing monday_status/constraint does not block the receipt.
+        if not self.update_lead(lead_id, {"receipt_image_url": receipt_image_url}):
+            return False
+        self.update_lead(lead_id, {"monday_status": "Paid"})
+        return True
     
     # Group management methods
     def create_group(self, group_name: str, group_telegram_id: str, supervisory_telegram_id: str) -> bool:
