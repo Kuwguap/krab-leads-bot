@@ -1488,6 +1488,46 @@ def _issuer_state_data_from_lead(lead: dict) -> dict:
     return out
 
 
+def _resolve_lead_row_for_resend(lead: dict | None) -> dict | None:
+    """Copy of ``lead`` with ``group_id`` filled from a single group offer when missing on the row."""
+    if not lead:
+        return None
+    lid = lead.get("id")
+    if not lid or lead.get("group_id"):
+        return dict(lead)
+    gid = None
+    acc = db.get_accepted_group_for_lead(str(lid))
+    if acc and acc.get("group_id"):
+        gid = acc.get("group_id")
+    if not gid:
+        offers = db.get_group_lead_offers(str(lid))
+        if len(offers) == 1:
+            o = offers[0]
+            st = (o.get("status") or "").lower()
+            if st in ("pending", "accepted") and o.get("group_id"):
+                gid = o.get("group_id")
+    if not gid:
+        return dict(lead)
+    out = dict(lead)
+    out["group_id"] = gid
+    return out
+
+
+def _lead_for_resend(lead_id: str) -> dict | None:
+    """Load lead for Pick new driver / resend; persist ``group_id`` from offers if the row was missing it."""
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        return None
+    merged = _resolve_lead_row_for_resend(lead)
+    if merged and merged.get("group_id") and not lead.get("group_id"):
+        try:
+            db.update_lead(str(lead_id), {"group_id": merged["group_id"]})
+        except Exception as e:
+            logger.warning("_lead_for_resend: could not persist group_id for lead %s: %s", lead_id, e)
+        return db.get_lead_by_id(lead_id) or merged
+    return merged or lead
+
+
 def _validate_lead_row_for_resend(lead: dict | None, *, issuer_user_id: int | None = None) -> tuple[bool, str]:
     """Forward-step check: persisted lead row is complete before Pick new driver / Pick another group."""
     if not lead:
@@ -1504,7 +1544,8 @@ def _validate_lead_row_for_resend(lead: dict | None, *, issuer_user_id: int | No
         return False, "Missing group assignment."
     vd = (lead.get("vehicle_details") or "").strip()
     dd = (lead.get("delivery_details") or "").strip()
-    if not vd and not dd:
+    ei = (lead.get("extra_info") or "").strip()
+    if not vd and not dd and not ei:
         return False, "Missing vehicle/delivery details."
     return True, ""
 
@@ -2620,7 +2661,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
 
     rid = lead_data.get("reassign_lead_id")
     if rid:
-        lead = db.get_lead_by_id(rid)
+        lead = _lead_for_resend(rid)
         ok_row, err_row = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
         if not ok_row:
             await query.message.reply_text(f"❌ {err_row}")
@@ -2768,8 +2809,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     lead_data = state.get("data", {})
 
-    # Resend flow: lead exists, just send to new drivers (not used after broadcast-all; that uses follow_after_broadcast)
-    if lead_data.get("resend") and lead_data.get("lead_id") and not lead_data.get("follow_after_broadcast"):
+    # Resend flow: lead exists, just send to new drivers (ignore follow_after_broadcast — stale state breaks Pick new driver)
+    if lead_data.get("resend") and lead_data.get("lead_id"):
         return await _handle_resend_to_drivers(
             update, context, lead_data, query.data, user_id,
         )
@@ -3326,7 +3367,7 @@ async def _handle_resend_to_drivers(
 ) -> int:
     """Resend lead to newly selected drivers after timeout."""
     lead_id = lead_data.get("lead_id")
-    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    lead = _lead_for_resend(lead_id) if lead_id else None
     ok, err = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
     if not ok:
         await update.callback_query.message.reply_text(f"❌ {err} Use /start if this persists.")
@@ -3455,7 +3496,7 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     lead_id = query.data.replace("resend_driver_", "").strip()
     user_id = query.from_user.id
-    lead = db.get_lead_by_id(lead_id)
+    lead = _lead_for_resend(lead_id) if lead_id else None
     ok, err = _validate_lead_row_for_resend(lead, issuer_user_id=user_id)
     if not ok:
         await query.message.reply_text(f"❌ {err} Use /start to create a new lead.")
