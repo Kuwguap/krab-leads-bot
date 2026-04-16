@@ -556,67 +556,41 @@ async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, l
             logger.warning("Could not notify supervisor %s: %s", sup_cid, e)
 
 
-async def _notify_lead_lifecycle(
+async def _notify_initiator_lead_accepted_summary(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
-    step: int,
-    title_line: str,
-    extra_lines: Optional[list[str]] = None,
-    photo_url: Optional[str] = None,
-    photo_file_id: Optional[str] = None,
+    *,
+    accepting_driver_name: str,
 ) -> None:
-    """
-    Standard 3-step alerts to the lead initiator only (not global supervisory — avoids duplicate spam).
-    step 1: group / routing accepted — 2: driver accepted — 3: receipt uploaded (optional photo).
-    Prefer ``photo_file_id`` (same bot) over URLs so links are not broken or doubled.
-    """
-    lines = [f"🔔 **({step}/3)** {title_line}", ""]
-    lines.extend(extra_lines or [])
-    text = "\n".join(lines)
+    """One DM to the lead adder: Reference, Group, Driver(s) — only the driver who accepted."""
     initiator_id = lead.get("user_id")
     if initiator_id is None:
         return
     try:
         cid = int(initiator_id)
     except (TypeError, ValueError):
-        logger.warning("Invalid lead user_id for lifecycle notify: %s", initiator_id)
+        logger.warning("Invalid lead user_id for initiator summary: %s", initiator_id)
         return
-    out_text = text
+    lid = lead.get("id")
+    lead_row = db.get_lead_by_id(str(lid)) if lid else lead
+    ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
+    group_label = _group_display_name_from_lead(lead_row) or "N/A"
+    dn = _telegram_md1_escape((accepting_driver_name or "Driver").strip() or "Driver")
+    gl = _telegram_md1_escape(group_label)
+    text = (
+        f"Reference: `{ref}`\n"
+        f"Group: **{gl}**\n"
+        f"Driver(s): **{dn}**"
+    )
     try:
-        if step == 3 and (photo_file_id or photo_url):
-            safe_url = _normalize_receipt_image_url(photo_url) if photo_url else None
-            sent = False
-            if photo_file_id:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=cid, photo=photo_file_id, caption=out_text, parse_mode="Markdown"
-                    )
-                    sent = True
-                except Exception as e:
-                    logger.warning("Lifecycle send_photo file_id failed for %s: %s", cid, e)
-            if not sent and safe_url:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=cid, photo=safe_url, caption=out_text, parse_mode="Markdown"
-                    )
-                    sent = True
-                except Exception:
-                    pass
-            if not sent:
-                link = f"\n\n[Open receipt]({safe_url})" if safe_url else ""
-                try:
-                    await context.bot.send_message(
-                        chat_id=cid, text=out_text + link, parse_mode="Markdown"
-                    )
-                except BadRequest:
-                    await context.bot.send_message(chat_id=cid, text=out_text + (f"\n{safe_url}" if safe_url else ""))
-        else:
-            try:
-                await context.bot.send_message(chat_id=cid, text=out_text, parse_mode="Markdown")
-            except BadRequest:
-                await context.bot.send_message(chat_id=cid, text=out_text.replace("*", "").replace("`", ""))
+        await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
+    except BadRequest:
+        await context.bot.send_message(
+            chat_id=cid,
+            text=f"Reference: {ref}\nGroup: {group_label}\nDriver(s): {accepting_driver_name or 'Driver'}",
+        )
     except Exception as e:
-        logger.warning("Could not send lifecycle alert to %s: %s", cid, e)
+        logger.warning("Could not send initiator lead summary to %s: %s", cid, e)
 
 
 async def _send_driver_requests_for_group(
@@ -3254,19 +3228,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     
     # Phase-1 attachments: only after a group taps Accept — see handle_accept_group_offer (never here).
 
-    driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
-    lead_for_notify = db.get_lead_by_id(lead["id"]) or lead
-    await _notify_lead_lifecycle(
-        context,
-        lead_for_notify,
-        1,
-        "Issuer accepted new lead",
-        [
-            f"Reference: `{reference_id}`",
-            f"Group: **{_telegram_md1_escape(group_name_supervisory)}**",
-            f"Drivers notified: **{_telegram_md1_escape(driver_names)}**",
-        ],
-    )
+    # Lead adder gets a single summary DM when a driver accepts (see handle_accept_lead), not here.
 
     contact_sources = db.get_contact_info_sources()
     
@@ -3752,15 +3714,11 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.warning("Could not schedule renewal: %s", e)
 
-    await _notify_lead_lifecycle(
+    lead = db.get_lead_by_id(lead_id) or lead
+    await _notify_initiator_lead_accepted_summary(
         context,
         lead,
-        2,
-        "Driver accepted new lead",
-        [
-            f"Reference: `{lead.get('reference_id', 'N/A')}`",
-            f"Driver: **{driver.get('driver_name', 'Driver')}**",
-        ],
+        accepting_driver_name=str(driver.get("driver_name") or "Driver"),
     )
 
 
@@ -3918,19 +3876,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         )
         db.update_lead(lead_id, {"phase1_attached_files": []})
 
-    lead_ref = db.get_lead_by_id(lead_id) or lead
-    accepter = f"@{query.from_user.username}" if query.from_user.username else (query.from_user.first_name or "member")
-    await _notify_lead_lifecycle(
-        context,
-        lead_ref,
-        1,
-        "Issuer accepted new lead",
-        [
-            f"Reference: `{reference_id}`",
-            f"Group: **{winner_name}**",
-            f"Accepted in group chat by {accepter}",
-        ],
-    )
+    # Lead adder: one summary DM when a driver accepts (handle_accept_lead), not on group tap.
 
     # If the sender already went through driver selection, do not DM drivers again.
     if db.lead_has_assignments(lead_id):
@@ -4516,18 +4462,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e2:
                 logger.error("Fallback driver receipt confirm failed: %s", e2)
 
-        try:
-            await _notify_lead_lifecycle(
-                context,
-                lead,
-                3,
-                f"Receipt uploaded for lead ref# `{reference_id}`",
-                [f"Driver: **{_telegram_md1_escape(driver_name)}**"],
-                photo_url=stored_url,
-                photo_file_id=receipt_file_id,
-            )
-        except Exception as e:
-            logger.warning("Lifecycle notify after receipt failed: %s", e)
+        # Lead adder: single summary is sent on driver accept only (not receipt).
 
         group_id = lead.get("group_id")
         group_name = "—"
