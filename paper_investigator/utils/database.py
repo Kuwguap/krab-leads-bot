@@ -8,6 +8,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _norm_uuid_str(val) -> str:
+    """Match krableads utils.database UUID normalization for paper_* tables."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    try:
+        import uuid
+
+        return str(uuid.UUID(s))
+    except (ValueError, TypeError, AttributeError):
+        return s
+
+
 class PaperDB:
     def __init__(self):
         self.client: Client = create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY)
@@ -67,7 +82,7 @@ class PaperDB:
     # ── Paper inventory ──────────────────────────────────────────────────
 
     def get_paper_count(self, driver_id: str) -> int:
-        did = str(driver_id).strip()
+        did = _norm_uuid_str(driver_id)
         try:
             r = self.client.table("paper_inventory").select("current_count").eq("driver_id", did).limit(1).execute()
             if not r.data:
@@ -77,7 +92,7 @@ class PaperDB:
             return 0
 
     def _ensure_inventory(self, driver_id: str) -> None:
-        did = str(driver_id).strip()
+        did = _norm_uuid_str(driver_id)
         existing = self.client.table("paper_inventory").select("id").eq("driver_id", did).limit(1).execute()
         if not existing.data:
             self.client.table("paper_inventory").insert({"driver_id": did, "current_count": 0}).execute()
@@ -85,7 +100,7 @@ class PaperDB:
     def add_paper(self, driver_id: str, amount: int, created_by: int, note: str = "") -> int:
         """Add papers to a driver. Returns new balance."""
         try:
-            driver_id = str(driver_id).strip()
+            driver_id = _norm_uuid_str(driver_id)
             self._ensure_inventory(driver_id)
             current = self.get_paper_count(driver_id)
             new_balance = current + amount
@@ -109,7 +124,7 @@ class PaperDB:
     def subtract_paper(self, driver_id: str, amount: int, reference_id: str = "", note: str = "", created_by: int = 0) -> int:
         """Subtract papers from a driver (order accepted). Returns new balance, or -1 on error."""
         try:
-            driver_id = str(driver_id).strip()
+            driver_id = _norm_uuid_str(driver_id)
             self._ensure_inventory(driver_id)
             current = self.get_paper_count(driver_id)
             new_balance = max(0, current - amount)
@@ -138,7 +153,7 @@ class PaperDB:
             try:
                 inv = self.client.table("paper_inventory").select("driver_id, current_count").execute()
                 for row in (inv.data or []):
-                    rid = str(row.get("driver_id", "")).strip()
+                    rid = _norm_uuid_str(row.get("driver_id"))
                     if rid:
                         counts_by_driver[rid] = int(row.get("current_count") or 0)
             except Exception as e:
@@ -147,7 +162,7 @@ class PaperDB:
             for d in drivers:
                 if not d.get("is_active", True):
                     continue
-                did = str(d["id"]).strip()
+                did = _norm_uuid_str(d["id"])
                 count = counts_by_driver.get(did, 0)
                 addr = self.get_driver_address(did)
                 out.append({
@@ -167,14 +182,16 @@ class PaperDB:
 
     def was_low_alert_sent(self, driver_id: str) -> bool:
         try:
-            r = self.client.table("paper_inventory").select("low_alert_sent").eq("driver_id", driver_id).limit(1).execute()
+            did = _norm_uuid_str(driver_id)
+            r = self.client.table("paper_inventory").select("low_alert_sent").eq("driver_id", did).limit(1).execute()
             return bool(r.data and r.data[0].get("low_alert_sent"))
         except Exception:
             return False
 
     def mark_low_alert_sent(self, driver_id: str) -> None:
         try:
-            self.client.table("paper_inventory").update({"low_alert_sent": True}).eq("driver_id", driver_id).execute()
+            did = _norm_uuid_str(driver_id)
+            self.client.table("paper_inventory").update({"low_alert_sent": True}).eq("driver_id", did).execute()
         except Exception:
             pass
 
@@ -209,8 +226,9 @@ class PaperDB:
 
     def create_delivery_order(self, driver_id: str, quantity: int) -> Optional[dict]:
         try:
+            did = _norm_uuid_str(driver_id)
             r = self.client.table("paper_delivery_orders").insert({
-                "driver_id": driver_id,
+                "driver_id": did,
                 "quantity": quantity,
                 "status": "pending_approval",
             }).execute()
@@ -316,12 +334,12 @@ class PaperDB:
             processed = set()
             try:
                 pr = self.client.table("paper_processed_assignments").select("assignment_id").execute()
-                processed = {str(row["assignment_id"]) for row in (pr.data or [])}
+                processed = {_norm_uuid_str(row.get("assignment_id")) for row in (pr.data or [])}
             except Exception:
                 pass
             out = []
             for a in r.data:
-                aid = str(a.get("id") or "")
+                aid = _norm_uuid_str(a.get("id"))
                 if not aid or aid in processed:
                     continue
                 ref = ""
@@ -344,8 +362,8 @@ class PaperDB:
     def mark_assignment_processed(self, assignment_id: str, driver_id: str) -> None:
         try:
             self.client.table("paper_processed_assignments").insert({
-                "assignment_id": str(assignment_id).strip(),
-                "driver_id": str(driver_id).strip(),
+                "assignment_id": _norm_uuid_str(assignment_id),
+                "driver_id": _norm_uuid_str(driver_id),
             }).execute()
         except Exception:
             pass

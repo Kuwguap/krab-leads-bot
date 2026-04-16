@@ -50,6 +50,43 @@ def _parse_cid(val) -> int | None:
     except (ValueError, TypeError):
         return None
 
+async def _create_resupply_order_and_notify_paper_girl(
+    context: ContextTypes.DEFAULT_TYPE,
+    driver_id: str,
+    driver_name: str,
+    qty: int,
+) -> tuple[bool, str]:
+    """Create an approved `paper_delivery_orders` row and DM Paper Girl.
+
+    Driver inventory is **not** updated here — `add_paper` runs when Paper Girl uploads
+    a receipt (same as low-paper approve flow).
+    """
+    order = db.create_delivery_order(driver_id, qty)
+    if not order:
+        return False, "Could not create delivery order."
+    if not db.approve_delivery_order(order["id"]):
+        return False, "Could not approve delivery order."
+    addr = db.get_driver_address(driver_id)
+    addr_str = _addr_oneliner(addr)
+    pg_cid = _parse_cid(Config.PAPER_GIRL_TELEGRAM_ID)
+    if pg_cid:
+        try:
+            await context.bot.send_message(
+                chat_id=pg_cid,
+                text=(
+                    f"📦 **Paper Delivery Request**\n\n"
+                    f"👤 Driver: **{driver_name}**\n"
+                    f"📄 Quantity: **{qty}** papers\n"
+                    f"📍 Address: {addr_str}\n\n"
+                    "Upload a receipt photo after delivery."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not notify paper girl: %s", e)
+    return True, ""
+
+
 def _addr_oneliner(addr: dict | None) -> str:
     if not addr:
         return "⚠️ No address set"
@@ -329,13 +366,16 @@ async def handle_add_paper_qty(update: Update, context: ContextTypes.DEFAULT_TYP
         return ST_ADD_PAPER_QTY
     driver_id = context.user_data.get("add_paper_driver_id")
     driver_name = context.user_data.get("add_paper_driver_name", "Driver")
-    new_balance = db.add_paper(driver_id, qty, update.effective_user.id, f"Added by supervisor")
-    if new_balance < 0:
-        await update.message.reply_text("❌ Error adding paper.")
+    ok, err = await _create_resupply_order_and_notify_paper_girl(
+        context, driver_id, driver_name, qty
+    )
+    if not ok:
+        await update.message.reply_text(f"❌ {err}", reply_markup=_main_menu_keyboard())
         return ConversationHandler.END
     await update.message.reply_text(
-        f"✅ Added **{qty}** papers to **{driver_name}**\n"
-        f"New balance: **{new_balance}** papers",
+        f"✅ Delivery order created for **{qty}** papers to **{driver_name}**.\n\n"
+        "Paper Girl was notified. Their balance updates when she uploads the receipt "
+        "(same flow as low-paper resupply).",
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )
@@ -435,29 +475,15 @@ async def handle_approve_qty(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ST_APPROVE_QTY
     driver_id = context.user_data.get("approve_driver_id")
     driver_name = context.user_data.get("approve_driver_name", "Driver")
-    order = db.create_delivery_order(driver_id, qty)
-    if order:
-        db.approve_delivery_order(order["id"])
-    addr = db.get_driver_address(driver_id)
-    addr_str = _addr_oneliner(addr)
-    pg_cid = _parse_cid(Config.PAPER_GIRL_TELEGRAM_ID)
-    if pg_cid:
-        try:
-            await context.bot.send_message(
-                chat_id=pg_cid,
-                text=(
-                    f"📦 **Paper Delivery Request**\n\n"
-                    f"👤 Driver: **{driver_name}**\n"
-                    f"📄 Quantity: **{qty}** papers\n"
-                    f"📍 Address: {addr_str}\n\n"
-                    "Upload a receipt photo after delivery."
-                ),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.warning("Could not notify paper girl: %s", e)
+    ok, err = await _create_resupply_order_and_notify_paper_girl(
+        context, driver_id, driver_name, qty
+    )
+    if not ok:
+        await update.message.reply_text(f"❌ {err}", reply_markup=_main_menu_keyboard())
+        return ConversationHandler.END
     await update.message.reply_text(
-        f"✅ Order created — Paper Girl notified to send **{qty}** papers to **{driver_name}**.",
+        f"✅ Order created — Paper Girl notified to send **{qty}** papers to **{driver_name}**.\n\n"
+        "Balance updates when she uploads the delivery receipt.",
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(),
     )

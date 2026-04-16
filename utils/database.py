@@ -899,8 +899,23 @@ class Database:
     def _norm_paper_driver_id(self, driver_id: str) -> str:
         return str(driver_id).strip()
 
+    @staticmethod
+    def _norm_uuid_str(val) -> str:
+        """Normalize UUID strings so paper_inventory / paper_processed rows match across clients."""
+        if val is None:
+            return ""
+        s = str(val).strip()
+        if not s:
+            return ""
+        try:
+            import uuid
+
+            return str(uuid.UUID(s))
+        except (ValueError, TypeError, AttributeError):
+            return s
+
     def _paper_ensure_inventory_row(self, driver_id: str) -> None:
-        did = self._norm_paper_driver_id(driver_id)
+        did = self._norm_uuid_str(self._norm_paper_driver_id(driver_id))
         try:
             existing = self.client.table("paper_inventory").select("id").eq("driver_id", did).limit(1).execute()
             if not existing.data:
@@ -909,7 +924,7 @@ class Database:
             logger.error("_paper_ensure_inventory_row: %s", e)
 
     def paper_was_low_alert_sent(self, driver_id: str) -> bool:
-        did = self._norm_paper_driver_id(driver_id)
+        did = self._norm_uuid_str(self._norm_paper_driver_id(driver_id))
         try:
             r = self.client.table("paper_inventory").select("low_alert_sent").eq("driver_id", did).limit(1).execute()
             return bool(r.data and r.data[0].get("low_alert_sent"))
@@ -917,7 +932,7 @@ class Database:
             return False
 
     def paper_mark_low_alert_sent(self, driver_id: str) -> None:
-        did = self._norm_paper_driver_id(driver_id)
+        did = self._norm_uuid_str(self._norm_paper_driver_id(driver_id))
         try:
             self.client.table("paper_inventory").update({"low_alert_sent": True}).eq("driver_id", did).execute()
         except Exception:
@@ -930,8 +945,8 @@ class Database:
 
         Returns the new paper balance, or ``None`` if skipped (already counted) or paper tables unavailable.
         """
-        did = self._norm_paper_driver_id(driver_id)
-        aid = str(assignment_id).strip()
+        did = self._norm_uuid_str(self._norm_paper_driver_id(driver_id))
+        aid = self._norm_uuid_str(assignment_id)
         if not aid:
             return None
         try:

@@ -2480,16 +2480,13 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         return ConversationHandler.END
 
     driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
     ref_h = html.escape(str(reference_id), quote=False)
     await update.message.reply_text(
         "✅ Ready.\n\n"
         f"📋 Reference ID: <code>{ref_h}</code>\n"
         f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>. "
         "You can pick drivers now — no need to wait for the team.\n\n"
-        "<b>Select which driver(s) to notify:</b>\n\n"
-        f"Available drivers:\n{html.escape(driver_list, quote=False)}\n\n"
-        "Click a driver below or send to all:",
+        "Select which driver(s) to notify:",
         parse_mode="HTML",
         reply_markup=driver_keyboard,
     )
@@ -2625,8 +2622,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
             return ConversationHandler.END
         driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-        driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
-        # Plain text to avoid Telegram Markdown parse errors (driver names/usernames can contain underscores).
         try:
             summary = ""
             if failures:
@@ -2642,8 +2637,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 f"Sent to {sent_count} group(s).\n\n"
                 "You do not need to wait for a group — pick drivers next. "
                 "Groups can still accept/decline in their chats.\n\n"
-                "Select which driver(s) to notify:\n\n"
-                f"{html.escape(driver_list, quote=False)}"
+                "Select which driver(s) to notify:"
                 f"{html.escape(summary, quote=False)}"
             )
             await query.message.reply_text(
@@ -2692,7 +2686,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
             return ConversationHandler.END
         driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-        driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
         reference_id = lead.get("reference_id", "N/A")
         ref_h = html.escape(str(reference_id), quote=False)
         await query.message.reply_text(
@@ -2700,9 +2693,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>. "
             "Pick drivers when ready — no need to wait.\n\n"
-            "<b>Select which driver(s) to notify:</b>\n\n"
-            f"Available drivers:\n{html.escape(driver_list, quote=False)}\n\n"
-            "Click a driver below or send to all:",
+            "Select which driver(s) to notify:",
             parse_mode="HTML",
             reply_markup=driver_keyboard,
         )
@@ -2753,15 +2744,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
         return ConversationHandler.END
     driver_keyboard = _build_driver_keyboard(drivers, exclude_suspended=True, include_all=True)
-    driver_list = "\n".join([f"• {d.get('driver_name', 'Unknown')}" for d in drivers])
     ref_h = html.escape(str(reference_id), quote=False)
     await query.message.reply_text(
         f"✅ Group selected: <b>{html.escape(selected_group.get('group_name', 'N/A'), quote=False)}</b>\n\n"
         f"📋 Reference ID: <code>{ref_h}</code>\n"
         "Approval sent to that team. You can pick drivers now — no need to wait.\n\n"
-        "<b>Select which driver(s) to notify:</b>\n\n"
-        f"Available drivers:\n{html.escape(driver_list, quote=False)}\n\n"
-        "Click a driver below or send to all:",
+        "Select which driver(s) to notify:",
         parse_mode="HTML",
         reply_markup=driver_keyboard,
     )
@@ -4337,6 +4325,25 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         db.clear_user_state(user_id)
         return ConversationHandler.END
 
+    mime_for_ai = "image/jpeg"
+    if update.message.document:
+        mime_for_ai = (update.message.document.mime_type or "image/jpeg").lower()
+    if Config.is_ai_vision_configured():
+        try:
+            rv = ai_vision.validate_driver_receipt_image(
+                image_bytes,
+                mime_type=mime_for_ai,
+                expected_price_text=(lead.get("price") or "").strip() or None,
+            )
+        except ai_vision.AIVisionQuotaError:
+            await update.message.reply_text(
+                "❌ Receipt verification is temporarily unavailable (API limit). Please try again in a few minutes."
+            )
+            return STATE_WAITING_RECEIPT_IMAGE
+        if not rv.accept:
+            await update.message.reply_text(rv.message)
+            return STATE_WAITING_RECEIPT_IMAGE
+
     assignment_status = db.get_lead_assignment_status(lead_id)
     driver_name = "Driver"
     if assignment_status:
@@ -4366,7 +4373,39 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     success = db.update_lead_receipt(lead_id, stored_url)
     if not success:
         logger.error("update_lead_receipt failed lead_id=%s ref=%s", lead_id, reference_id)
-    
+
+    if success:
+        # Paper Investigator shared tables: idempotent catch-up if subtract-at-accept missed the row
+        # (UUID formatting, API errors, or race with PI job). Receipt proves the delivery is real.
+        try:
+            st = db.get_lead_assignment_status(lead_id)
+            if st and db._norm_uuid_str(st.get("driver_id")) == db._norm_uuid_str(dr_check.get("id")):
+                aid = st.get("id")
+                ref = (lead.get("reference_id") or "") or ""
+                new_paper_bal = db.apply_paper_on_lead_accept(
+                    str(dr_check["id"]), str(aid), str(ref)
+                )
+                if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
+                    if not db.paper_was_low_alert_sent(dr_check["id"]):
+                        db.paper_mark_low_alert_sent(dr_check["id"])
+                        sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
+                        if sup:
+                            try:
+                                dnm = dr_check.get("driver_name", "Driver")
+                                await context.bot.send_message(
+                                    chat_id=int(sup),
+                                    text=(
+                                        f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
+                                        "Open the Paper Investigator bot (All Drivers) to approve resupply."
+                                    ),
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Could not notify paper supervisor (low paper after receipt): %s", e
+                                )
+        except Exception as e:
+            logger.warning("Paper inventory sync on receipt failed: %s", e)
+
     if success and monday and monday_item_id:
         # First, try to upload the actual image file to the Monday files4 column.
         upload_ok = False
