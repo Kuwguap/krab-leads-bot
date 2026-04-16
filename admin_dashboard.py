@@ -728,6 +728,19 @@ DASHBOARD_HTML = """
                 <input type="hidden" name="value" value="{{ '0' if assistants_choose_group else '1' }}">
                 <button type="submit" style="padding: 8px 16px;">{{ 'Use assigned groups only' if assistants_choose_group else 'Allow assistants to choose group' }}</button>
             </form>
+            <div style="margin-top: 18px; padding-top: 14px; border-top: 1px solid #dee2e6;">
+                <h3 style="margin: 0 0 8px 0; font-size: 1rem;">Driver receipt detection (AI)</h3>
+                <p style="margin-bottom: 10px; color: #555; font-size: 0.95rem;"><strong>Strict</strong>: receipt image must show a visible <strong>$</strong> (no amount vs lead check). <strong>Lax</strong>: also require paid total to match the lead price when set.</p>
+                <p style="margin-bottom: 10px;"><strong>Current:</strong> {{ 'Strict ($ on receipt)' if receipt_detection_mode == 'strict' else 'Lax (match amount to lead)' }}</p>
+                <form method="POST" action="/set_receipt_detection_mode" style="display: inline; margin-right: 8px;">
+                    <input type="hidden" name="mode" value="strict">
+                    <button type="submit" style="padding: 8px 16px;">Use strict ($ only)</button>
+                </form>
+                <form method="POST" action="/set_receipt_detection_mode" style="display: inline;">
+                    <input type="hidden" name="mode" value="lax">
+                    <button type="submit" style="padding: 8px 16px;">Use lax (match amount)</button>
+                </form>
+            </div>
         </div>
         
         <!-- ST Telegram ID: notify on every successful lead send -->
@@ -1008,6 +1021,9 @@ def dashboard():
             groups_assistants[g['id']] = db.get_group_assistants(g['id'])
         assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
         st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
+        receipt_detection_mode = (db.get_setting("receipt_detection_mode") or "lax").strip().lower()
+        if receipt_detection_mode not in ("strict", "lax"):
+            receipt_detection_mode = "lax"
         contact_sources = db.get_contact_info_sources()
         bot_usage = db.get_bot_usage()
         lead_stats = db.get_lead_stats()
@@ -1018,6 +1034,7 @@ def dashboard():
             groups_assistants=groups_assistants,
             assistants_choose_group=assistants_choose_group,
             st_telegram_id=st_telegram_id,
+            receipt_detection_mode=receipt_detection_mode,
             contact_sources=contact_sources or [],
             bot_usage=bot_usage or [],
             lead_stats=lead_stats,
@@ -1103,6 +1120,19 @@ def set_st_telegram_id():
         st_id = (request.form.get("st_telegram_id") or "").strip()
         db.set_setting("st_telegram_id", st_id)
         return redirect(url_for('dashboard', message='ST Telegram ID saved!', type='success'))
+    except Exception as e:
+        return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
+
+
+@app.route('/set_receipt_detection_mode', methods=['POST'])
+def set_receipt_detection_mode():
+    """strict = visible $ on receipt; lax = match amount to lead when price set."""
+    try:
+        mode = (request.form.get("mode") or "lax").strip().lower()
+        if mode not in ("strict", "lax"):
+            mode = "lax"
+        db.set_setting("receipt_detection_mode", mode)
+        return redirect(url_for('dashboard', message='Receipt detection mode updated!', type='success'))
     except Exception as e:
         return redirect(url_for('dashboard', message=f'Error: {str(e)}', type='error'))
 
