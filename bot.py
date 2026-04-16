@@ -244,29 +244,15 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     return InlineKeyboardMarkup(buttons)
 
 
-def _should_defer_phase1_files_until_group_accept(lead_data: dict, offers_n: int) -> bool:
-    """True when phase-1 files must wait for group Accept (single-group team approval flow).
-
-    - Broadcast ``select_group_all`` sets ``broadcast`` and sends files with each offer; never defer.
-    - Single-target approval sets ``follow_after_broadcast`` but not ``broadcast``; defer until Accept.
-    """
-    if lead_data.get("approval_files_forwarded"):
-        return False
-    if offers_n != 1:
-        return False
-    if lead_data.get("broadcast"):
-        return False
-    if not lead_data.get("follow_after_broadcast"):
-        return False
-    return True
-
-
 async def _forward_phase1_attached_files_to_targets(
     context: ContextTypes.DEFAULT_TYPE,
     attached_files: list,
     group_chat_id: int | str | None,
 ) -> None:
-    """Forward Phase 1 photos/documents to the group chat only (not supervisory)."""
+    """Forward Phase 1 files to the **accepting** group chat only.
+
+    Invoked from ``handle_accept_group_offer`` after Accept — not during approval broadcast or driver pick.
+    """
     if not attached_files:
         return
     _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
@@ -2601,9 +2587,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
-                _att = lead_data.get("attached_files") or []
-                if _att:
-                    await _forward_phase1_attached_files_to_targets(context, _att, chat_id)
             except RetryAfter as e:
                 # Telegram is rate limiting. Wait the requested time and retry once.
                 wait_s = int(getattr(e, "retry_after", 1) or 1)
@@ -2618,9 +2601,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     )
                     db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
                     sent_count += 1
-                    _att = lead_data.get("attached_files") or []
-                    if _att:
-                        await _forward_phase1_attached_files_to_targets(context, _att, chat_id)
                 except Exception as e2:
                     logger.error("Error sending group offer to %s after retry: %s", g.get("group_name"), e2)
                     failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e2).__name__}: {e2}"))
@@ -2628,9 +2608,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 logger.error("Error sending group offer to %s: %s", g.get("group_name"), e)
                 failures.append((g.get("group_name") or str(gid) or "Unknown group", f"{type(e).__name__}: {e}"))
 
-        _att_all = lead_data.get("attached_files") or []
-        if _att_all:
-            db.update_lead(lead["id"], {"phase1_attached_files": []})
+        # Phase-1 attachments stay on the lead row until a group taps Accept (handle_accept_group_offer).
 
         # Continue immediately to driver selection without using resend=True (resend skips Monday, full group/ST messages, contact source).
         continue_data = lead_data.copy()
@@ -2640,8 +2618,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data["follow_after_broadcast"] = True
         continue_data["broadcast"] = True
         continue_data.pop("resend", None)
-        if _att_all:
-            continue_data["approval_files_forwarded"] = True
         db.set_user_state(user_id, "select_driver", continue_data)
         drivers = db.get_all_drivers()
         active_drivers = [d for d in drivers if record_is_active(d)]
@@ -3238,26 +3214,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     "Ensure the bot is added to the group and has permission to post."
                 )
     
-    # Forward attached files (broadcast: already sent per group; single-target: only after Accept)
-    if not lead_data.get("approval_files_forwarded"):
-        lead_snap = db.get_lead_by_id(lead["id"]) or lead
-        stored = lead_snap.get("phase1_attached_files")
-        offers_n = len(db.get_group_lead_offers(lead["id"]))
-        defer = _should_defer_phase1_files_until_group_accept(lead_data, offers_n)
-        if defer:
-            attached_files = []
-        else:
-            attached_files = (
-                stored if isinstance(stored, list) and stored
-                else (phase1_data.get("attached_files") or [])
-            )
-        if attached_files:
-            await _forward_phase1_attached_files_to_targets(
-                context,
-                attached_files,
-                group_telegram_id_raw,
-            )
-    
+    # Phase-1 attachments: only after a group taps Accept — see handle_accept_group_offer (never here).
+
     driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
     lead_for_notify = db.get_lead_by_id(lead["id"]) or lead
     await _notify_lead_lifecycle(
