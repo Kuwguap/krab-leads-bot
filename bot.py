@@ -444,7 +444,18 @@ def _new_lead_supervisory_notice_text(
     driver_names: str,
     username: str,
 ) -> str:
-    """Plain-text notice for supervisory/ST when a lead is sent (only this shape)."""
+    """Body of the supervisory + ST DM when an issuer completes sending a lead.
+
+    This **is** the supervisory message for new leads: plain text only, no
+    ``SUPERVISORY MESSAGE`` header and no other prefix. Format::
+
+        📬 New lead sent
+
+        Reference: …
+        Group: …
+        Driver(s): …
+        By: @…
+    """
     def one_line(s: str) -> str:
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
 
@@ -3303,7 +3314,11 @@ async def _finish_lead_send(
     sup_raw = group_row.get("supervisory_telegram_id") if group_row else None
     for sup_cid in _collect_new_lead_supervisory_chat_ids(sup_raw):
         try:
-            await context.bot.send_message(chat_id=sup_cid, text=sup_text)
+            await context.bot.send_message(
+                chat_id=sup_cid,
+                text=sup_text,
+                parse_mode=None,
+            )
         except Exception as e:
             logger.warning("Could not send new-lead notice to supervisory chat %s: %s", sup_cid, e)
     db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
