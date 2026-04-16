@@ -1,6 +1,8 @@
 """Configuration module for environment variables."""
 import os
 from pathlib import Path
+from typing import Optional
+
 from dotenv import load_dotenv
 
 # Explicitly load .env file from the project root
@@ -41,6 +43,8 @@ class Config:
     # AI / Vision (optional – for image → structured Phase 1)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or None
     OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o").strip() or "gpt-4o"
+    # Receipt check mode for drivers: strict ($ visible) vs lax (match amount). Env wins over Supabase settings.
+    RECEIPT_DETECTION_MODE = (os.getenv("RECEIPT_DETECTION_MODE") or "").strip().lower() or None
 
     # VIN decode: choose provider in .env (nhtsa = free, api_ninjas = premium)
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
@@ -68,6 +72,14 @@ class Config:
     def is_ai_vision_configured(cls) -> bool:
         """Whether image upload in Phase 1 can use AI to extract details."""
         return bool(cls.OPENAI_API_KEY)
+
+    @classmethod
+    def receipt_detection_mode_from_env(cls) -> Optional[str]:
+        """``strict`` | ``lax`` from env, or None to use DB ``settings.receipt_detection_mode``."""
+        v = (cls.RECEIPT_DETECTION_MODE or "").strip().lower()
+        if v in ("strict", "lax"):
+            return v
+        return None
 
     @classmethod
     def validate(cls):

@@ -60,6 +60,8 @@ services:
         sync: false
       - key: OPENAI_VISION_MODEL
         sync: false
+      - key: RECEIPT_DETECTION_MODE
+        sync: false
       - key: API_NINJAS_API_KEY
         sync: false
       - key: VIN_PROVIDER

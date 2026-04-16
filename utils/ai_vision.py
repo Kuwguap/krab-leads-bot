@@ -502,6 +502,25 @@ Rules:
 - confidence: how sure you are that this is a legitimate payment/receipt image (not random upload).
 """
 
+# Strict mode: do not prioritize matching dollar amounts — only receipt-like image + visible ASCII $ .
+RECEIPT_VISION_PROMPT_STRICT = """You verify images drivers upload as PAYMENT RECEIPTS (strict mode: dollar sign check only).
+
+Return ONLY valid JSON (no markdown, no explanation outside JSON):
+{
+  "looks_like_receipt": true or false,
+  "confidence": <integer 0-100>,
+  "has_dollar_sign": true or false,
+  "amounts_usd": [],
+  "note": "<one short English sentence>"
+}
+
+Rules:
+- looks_like_receipt: true if this clearly shows a real payment document or payment screen (receipt, invoice, terminal slip, app payment confirmation, etc.). False for unrelated images.
+- has_dollar_sign: true ONLY if the ASCII character $ appears visibly on the image as a currency marker. False if only "USD" as letters, only numbers, €, £, or no dollar sign.
+- Always set amounts_usd to [] — amounts are NOT evaluated in this mode.
+- confidence: how sure you are that this is a payment/receipt image.
+"""
+
 
 def validate_driver_receipt_image(
     image_bytes: bytes,
@@ -529,6 +548,12 @@ def validate_driver_receipt_image(
         logger.info("validate_driver_receipt_image: OPENAI_API_KEY not set; skipping AI receipt check")
         return ReceiptValidationResult(True, "")
 
+    mode = (detection_mode or "lax").strip().lower()
+    if mode not in ("strict", "lax"):
+        mode = "lax"
+    vision_prompt = RECEIPT_VISION_PROMPT_STRICT if mode == "strict" else RECEIPT_VISION_PROMPT
+    logger.info("validate_driver_receipt_image: using mode=%s (strict uses $-only prompt)", mode)
+
     b64 = base64.standard_b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
 
@@ -543,7 +568,7 @@ def validate_driver_receipt_image(
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": RECEIPT_VISION_PROMPT},
+                        {"type": "text", "text": vision_prompt},
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }
@@ -563,10 +588,6 @@ def validate_driver_receipt_image(
     if not isinstance(data, dict):
         logger.warning("validate_driver_receipt_image: could not parse JSON; allowing upload")
         return ReceiptValidationResult(True, "")
-
-    mode = (detection_mode or "lax").strip().lower()
-    if mode not in ("strict", "lax"):
-        mode = "lax"
 
     looks = data.get("looks_like_receipt")
     confidence = data.get("confidence")
@@ -604,7 +625,7 @@ def validate_driver_receipt_image(
             )
         return ReceiptValidationResult(True, "")
 
-    # lax: optional amount match when lead has a price
+    # lax: optional amount match when lead has a price (never runs in strict mode above)
     expected = _lead_price_to_float(expected_price_text)
     if expected is not None and expected > 0:
         if not amounts:

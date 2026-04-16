@@ -94,6 +94,26 @@ ots = OneTimeSecret()
 monday = MondayClient() if Config.is_monday_configured() else None
 
 
+def _resolve_receipt_detection_mode() -> str:
+    """``strict`` = visible ``$`` only; ``lax`` = match amount to lead. Env overrides Supabase ``settings``."""
+    env_mode = Config.receipt_detection_mode_from_env()
+    if env_mode:
+        logger.info("Receipt detection mode: %s (source=RECEIPT_DETECTION_MODE env)", env_mode)
+        return env_mode
+    raw = db.get_setting("receipt_detection_mode")
+    if not (raw or "").strip():
+        raw = db.get_setting("receipt_detection")  # legacy / typo key
+    v = (raw or "lax").strip().lower()
+    if v not in ("strict", "lax"):
+        v = "lax"
+    logger.info(
+        "Receipt detection mode: %s (source=settings key receipt_detection_mode, raw=%r)",
+        v,
+        raw,
+    )
+    return v
+
+
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
@@ -4335,9 +4355,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.message.document:
         mime_for_ai = (update.message.document.mime_type or "image/jpeg").lower()
     if Config.is_ai_vision_configured():
-        _rec_mode = (db.get_setting("receipt_detection_mode") or "lax").strip().lower()
-        if _rec_mode not in ("strict", "lax"):
-            _rec_mode = "lax"
+        _rec_mode = _resolve_receipt_detection_mode()
         try:
             rv = ai_vision.validate_driver_receipt_image(
                 image_bytes,
