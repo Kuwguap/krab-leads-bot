@@ -1308,18 +1308,58 @@ def _telegram_md1_escape(text: str) -> str:
     return "".join(out)
 
 
+def _authoritative_group_id_for_lead(lead: dict | None) -> Optional[str]:
+    """Winning group for this lead: accepted ``group_lead_offers`` row beats ``leads.group_id``.
+
+    Broadcast flow initially stores the assistant's *primary* group on ``leads.group_id`` while
+    offers are pending; the real winner is the offer with ``status='accepted'``. If those ever
+    drift, prefer the offer and self-heal the lead row (forward-step validation).
+    """
+    if not lead:
+        return None
+    lid = lead.get("id")
+    if lid:
+        acc = db.get_accepted_group_for_lead(str(lid))
+        if acc and acc.get("group_id"):
+            offer_gid = str(acc.get("group_id")).strip()
+            db_gid = lead.get("group_id")
+            if db_gid is not None and str(db_gid).strip() and str(db_gid).strip() != offer_gid:
+                try:
+                    db.update_lead(str(lid), {"group_id": offer_gid})
+                except Exception as e:
+                    logger.warning(
+                        "Could not align leads.group_id with accepted offer (lead=%s): %s",
+                        lid,
+                        e,
+                    )
+            return offer_gid
+    raw = lead.get("group_id")
+    if raw is None or str(raw).strip() == "":
+        return None
+    return str(raw).strip()
+
+
+def _group_display_name_from_lead(lead: dict | None) -> str:
+    """Human group name for UI / supervisory, from authoritative group id only."""
+    gid = _authoritative_group_id_for_lead(lead)
+    if not gid:
+        return ""
+    g = db.get_group_by_id(gid)
+    if g and (g.get("group_name") or "").strip():
+        return (g.get("group_name") or "").strip()
+    return ""
+
+
 def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Optional[dict]:
     """Resolve the group row for this lead.
 
-    Always prefer the persisted ``leads.group_id`` when ``lead`` is provided: after a
-    broadcast offer, the winning group is written in the DB while user state may still
-    hold the primary ``selected_group`` from broadcast setup — using state first caused
-    wrong group names in notifications.
+    When ``lead`` is provided, use ``_authoritative_group_id_for_lead`` (accepted offer wins).
+    Otherwise fall back to user state — state alone can still name the wrong group after broadcast.
     """
     gid = None
-    if lead and lead.get("group_id") is not None:
-        gid = lead.get("group_id")
-    if gid is not None:
+    if lead:
+        gid = _authoritative_group_id_for_lead(lead)
+    if gid:
         g = db.get_group_by_id(gid)
         if g:
             return g
@@ -1518,26 +1558,26 @@ def _issuer_state_data_from_lead(lead: dict) -> dict:
 
 
 def _resolve_lead_row_for_resend(lead: dict | None) -> dict | None:
-    """Copy of ``lead`` with ``group_id`` filled from a single group offer when missing on the row."""
+    """Copy of ``lead`` with canonical ``group_id`` (accepted offer first), or single-offer fallback."""
     if not lead:
         return None
-    lid = lead.get("id")
-    if not lid or lead.get("group_id"):
-        return dict(lead)
-    gid = None
-    acc = db.get_accepted_group_for_lead(str(lid))
-    if acc and acc.get("group_id"):
-        gid = acc.get("group_id")
-    if not gid:
-        offers = db.get_group_lead_offers(str(lid))
-        if len(offers) == 1:
-            o = offers[0]
-            st = (o.get("status") or "").lower()
-            if st in ("pending", "accepted") and o.get("group_id"):
-                gid = o.get("group_id")
-    if not gid:
-        return dict(lead)
     out = dict(lead)
+    lid = out.get("id")
+    auth = _authoritative_group_id_for_lead(out)
+    if auth:
+        out["group_id"] = auth
+        return out
+    if not lid or out.get("group_id"):
+        return out
+    gid = None
+    offers = db.get_group_lead_offers(str(lid))
+    if len(offers) == 1:
+        o = offers[0]
+        st = (o.get("status") or "").lower()
+        if st in ("pending", "accepted") and o.get("group_id"):
+            gid = o.get("group_id")
+    if not gid:
+        return out
     out["group_id"] = gid
     return out
 
@@ -3043,18 +3083,15 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "expiration_date": expiration_date
         }
 
-    # Reload lead + winning group from DB (broadcast sets leads.group_id; state may still hold primary group)
+    # Reload lead + winning group from DB (accepted offer is source of truth for broadcast winners)
     lead = db.get_lead_by_id(lead["id"]) or lead
     selected_group = _resolve_selected_group(lead_data, lead)
     if selected_group:
         lead_data["selected_group"] = selected_group
         lead_data["group_id"] = selected_group.get("id")
-    group_name_supervisory = (selected_group or {}).get("group_name", "N/A")
-    if lead.get("group_id"):
-        _gname_row = db.get_group_by_id(lead["group_id"])
-        if _gname_row and (_gname_row.get("group_name") or "").strip():
-            group_name_supervisory = (_gname_row.get("group_name") or "").strip()
-    
+    gn_sup = _group_display_name_from_lead(lead)
+    group_name_supervisory = gn_sup or (selected_group or {}).get("group_name", "N/A")
+
     # Prepare messages for distribution
     issue_s = (
         monday_result["issue_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
@@ -3277,6 +3314,9 @@ async def _finish_lead_send(
 ) -> None:
     """Update lead contact source (if any), sync Monday, notify ST, record usage, send success message."""
     lead = db.get_lead_by_id(lead_id)
+    resolved_gn = _group_display_name_from_lead(lead)
+    if resolved_gn:
+        group_name = resolved_gn
     if contact_source_label and lead:
         db.update_lead(lead_id, {"contact_info_source": contact_source_label})
         monday_item_id = lead.get("monday_item_id")
@@ -3341,6 +3381,10 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
     reference_id = data.get("reference_id", "")
     driver_names = data.get("driver_names", "")
     group_name = data.get("group_name", "N/A")
+    lead_row = db.get_lead_by_id(lead_id) if lead_id else None
+    gn_from_db = _group_display_name_from_lead(lead_row)
+    if gn_from_db:
+        group_name = gn_from_db
     source = db.get_contact_info_source_by_id(source_id)
     label = source.get("label", "") if source else ""
     await _finish_lead_send(
@@ -3778,9 +3822,9 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     if not accepted:
         # Someone else already accepted — refresh every group's message so Accept is gone everywhere.
         accepted_row = db.get_accepted_group_for_lead(lead_id)
-        accepted_group = db.get_group_by_id(accepted_row.get("group_id")) if accepted_row else None
+        win_gid = (accepted_row or {}).get("group_id")
+        accepted_group = db.get_group_by_id(win_gid) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
-        win_gid = accepted_row.get("group_id") if accepted_row else None
         ref_show = lead.get("reference_id", "N/A")
         for o in db.get_group_lead_offers(lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
@@ -3789,7 +3833,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if not ocid or not mid:
                 continue
             try:
-                if win_gid and ogid == win_gid:
+                if win_gid and str(ogid) == str(win_gid):
                     await context.bot.edit_message_text(
                         chat_id=ocid,
                         message_id=int(mid),
@@ -3823,16 +3867,18 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             group_id,
             acc_row,
         )
-    if not lead or str(lead.get("group_id")) != str(group_id):
+    win_gid = str((acc_row or {}).get("group_id") or group_id).strip()
+    winner_group = db.get_group_by_id(win_gid) or group
+    if not lead or str(lead.get("group_id")) != str(win_gid):
         logger.error(
             "accept_group_offer: leads.group_id not set to winner (lead=%s expected=%s got=%s)",
             lead_id,
-            group_id,
+            win_gid,
             (lead or {}).get("group_id"),
         )
 
     reference_id = lead.get("reference_id", "N/A")
-    winner_name = group.get("group_name", "Group")
+    winner_name = (winner_group.get("group_name") or "Group").strip() or "Group"
 
     # Update all group offer messages to reflect taken/accepted
     offers = db.get_group_lead_offers(lead_id)
@@ -3843,7 +3889,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         if not ocid or not mid:
             continue
         try:
-            if ogid == group_id:
+            if str(ogid) == str(win_gid):
                 await context.bot.edit_message_text(
                     chat_id=ocid,
                     message_id=int(mid),
@@ -3868,7 +3914,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         await _forward_phase1_attached_files_to_targets(
             context,
             att,
-            group.get("group_telegram_id"),
+            winner_group.get("group_telegram_id"),
         )
         db.update_lead(lead_id, {"phase1_attached_files": []})
 
@@ -3893,7 +3939,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if offers:
                 await _send_full_group_lead_to_chat(
                     context,
-                    group,
+                    winner_group,
                     lead_for_group,
                     html_prefix=(
                         "<b>✅ Your group claimed this client</b>\n"
@@ -3908,7 +3954,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     f"The sender already notified driver(s). This group is now recorded as the accepting group."
                 )
                 await context.bot.send_message(
-                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    chat_id=_parse_chat_id(winner_group.get("group_telegram_id")),
                     text=_claimed_txt,
                     parse_mode="Markdown",
                 )
@@ -3922,7 +3968,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 lead_for_group = db.get_lead_by_id(lead_id) or lead
                 await _send_full_group_lead_to_chat(
                     context,
-                    group,
+                    winner_group,
                     lead_for_group,
                     html_prefix="<b>✅ Your group claimed this client</b>\n\n",
                     mirror_supervisory=False,
@@ -3931,19 +3977,19 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
         else:
             count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
-                context, lead, group,
+                context, lead, winner_group,
             )
             if count > 0:
                 _drv_txt = f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`"
                 await context.bot.send_message(
-                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    chat_id=_parse_chat_id(winner_group.get("group_telegram_id")),
                     text=_drv_txt,
                     parse_mode="Markdown",
                 )
             else:
                 _fail_txt = _group_accept_notify_fail_text(reference_id, fail_reason, driver_scope)
                 await context.bot.send_message(
-                    chat_id=_parse_chat_id(group.get("group_telegram_id")),
+                    chat_id=_parse_chat_id(winner_group.get("group_telegram_id")),
                     text=_fail_txt,
                     parse_mode="Markdown",
                 )
