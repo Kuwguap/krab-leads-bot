@@ -438,40 +438,6 @@ def _supervisory_delivery_chat_ids(group_supervisory_raw: object) -> list:
     return out
 
 
-async def _send_to_supervisory_chats(
-    context: ContextTypes.DEFAULT_TYPE,
-    group_supervisory_raw: object,
-    text: str,
-    *,
-    parse_mode: str | None = "Markdown",
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
-    if parse_mode == "HTML":
-        text = _prefix_supervisory_html(text)
-    else:
-        text = _prefix_supervisory_message(text)
-    for cid in _supervisory_delivery_chat_ids(group_supervisory_raw):
-        try:
-            await context.bot.send_message(
-                chat_id=cid,
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-            )
-        except BadRequest as e:
-            if parse_mode and "parse" in str(e).lower():
-                try:
-                    await context.bot.send_message(
-                        chat_id=cid, text=text, reply_markup=reply_markup
-                    )
-                except Exception as e2:
-                    logger.warning("Could not send to supervisory chat %s: %s", cid, e2)
-            else:
-                logger.warning("Could not send to supervisory chat %s: %s", cid, e)
-        except Exception as e:
-            logger.warning("Could not send to supervisory chat %s: %s", cid, e)
-
-
 _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
 
 
@@ -1368,47 +1334,6 @@ def _format_group_lead_message_html(
         f"📅 Issue Date: {_h(issue_s)}\n"
         f"⏰ Expires: {_h(expiry_s)}"
     )
-
-
-def _format_supervisory_lead_html(
-    reference_id: str,
-    username: str,
-    vehicle_safe: str,
-    delivery_safe: str,
-    encrypted_link: str,
-    price,
-    issue_s: str,
-    exp_s: str,
-    issuer_note_disp: str,
-    driver_note_disp: str,
-    group_name: str,
-) -> str:
-    """HTML body for supervisory DMs: tap-to-copy reference in <code>, no Markdown parse errors."""
-    def esc(s: str) -> str:
-        return html.escape(str(s or ""), quote=False)
-
-    ref = esc(reference_id or "N/A")
-    parts = [
-        f"📋 Reference ID: <code>{ref}</code>",
-        f"👤 User: @{esc(username)}",
-        f"🚗 Vehicle:\n{esc(vehicle_safe)}",
-        f"📍 Delivery:\n{esc(delivery_safe)}",
-        f"💰 Price: {esc(price)}",
-        f"📅 Issue Date: {esc(issue_s)}",
-        f"⏰ Expires: {esc(exp_s)}",
-    ]
-    lk = (encrypted_link or "").strip()
-    if lk:
-        parts.insert(
-            4,
-            f'📞 Phone (one-time link): <a href="{html.escape(lk, quote=True)}">open encrypted link</a>',
-        )
-    if (issuer_note_disp or "").strip():
-        parts.append(f"📝 Special request (issuers / group):\n{esc(_sanitize_phones_for_send(issuer_note_disp))}")
-    if (driver_note_disp or "").strip():
-        parts.append(f"📝 Special request (drivers only):\n{esc(_sanitize_phones_for_send(driver_note_disp))}")
-    parts.append(f"👥 Group: {esc(group_name)}")
-    return "\n\n".join(parts)
 
 
 def _dt_from_lead_field(val) -> datetime | None:
@@ -3038,19 +2963,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     exp_s = (
         monday_result["expiration_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
     )
-    supervisory_message = _format_supervisory_lead_html(
-        str(reference_id or "N/A"),
-        username,
-        vehicle_safe,
-        delivery_safe,
-        encrypted_data.get("link") or "",
-        price,
-        issue_s,
-        exp_s,
-        issuer_note_disp,
-        driver_note_disp,
-        str(group_name_supervisory),
-    )
 
     # Group message – HTML with <pre> copy block; no raw phone in body outside pre
     group_message = _format_group_lead_message_html(
@@ -3204,16 +3116,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     "Ensure the bot is added to the group and has permission to post."
                 )
     
-    # Supervisory: full log with phone and price — per-group supervisory + SUPERVISORY_TELEGRAM_ID (deduped)
-    # Do not attach driver receipt buttons here (supervisory chats are not driver accounts).
-    supervisory_telegram_id = selected_group.get("supervisory_telegram_id")
-    await _send_to_supervisory_chats(
-        context,
-        supervisory_telegram_id,
-        supervisory_message,
-        parse_mode="HTML",
-    )
-
     # Forward attached files (broadcast: already sent; single-target: deferred until group Accept)
     if not lead_data.get("approval_files_forwarded"):
         lead_snap = db.get_lead_by_id(lead["id"]) or lead
