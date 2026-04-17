@@ -3484,52 +3484,6 @@ async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.warning("Could not send contact source timeout message to %s: %s", user_id, e)
 
 
-async def _send_supervisory_lead_source_followup(
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    lead_id: str,
-    reference_id: str,
-    source_label: str,
-) -> None:
-    """When source is saved after a driver already accepted — supervisory chats get a short update."""
-    ref = (reference_id or "N/A").strip()
-    src = (source_label or "").strip() or "—"
-    body = f"📊 Lead source recorded\n\nReference: {ref}\nSource: {src}"
-    sup_text = _prefix_supervisory_message(body)
-    lead = db.get_lead_by_id(lead_id)
-    group_row = None
-    if lead and lead.get("group_id"):
-        group_row = db.get_group_by_id(lead["group_id"])
-    sup_raw = group_row.get("supervisory_telegram_id") if group_row else None
-    sup_targets = _supervisory_delivery_chat_ids(sup_raw)
-    seen_norm: set = set()
-    for sup_cid in sup_targets:
-        nk = _norm_chat_id(sup_cid)
-        if nk is not None:
-            seen_norm.add(nk)
-        try:
-            await context.bot.send_message(
-                chat_id=sup_cid,
-                text=sup_text,
-                parse_mode=None,
-            )
-        except Exception as e:
-            logger.warning("Could not send lead-source follow-up to supervisory chat %s: %s", sup_cid, e)
-    st_raw = (db.get_setting("st_telegram_id") or "").strip()
-    if st_raw:
-        st_cid = _parse_chat_id(st_raw)
-        stk = _norm_chat_id(st_cid) if st_cid is not None else None
-        if st_cid is not None and stk is not None and stk not in seen_norm:
-            try:
-                await context.bot.send_message(
-                    chat_id=st_cid,
-                    text=sup_text,
-                    parse_mode=None,
-                )
-            except Exception as e:
-                logger.warning("Could not send lead-source follow-up to ST chat %s: %s", st_cid, e)
-
-
 async def _send_supervisory_new_lead_notices(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -3658,14 +3612,30 @@ async def _finish_lead_send(
                             )
                         except Exception as e:
                             logger.error("Error updating Monday contact source: %s", e)
-                if db.get_lead_assignment_status(lid):
-                    lead_f = db.get_lead_by_id(lid)
-                    await _send_supervisory_lead_source_followup(
-                        context,
-                        lead_id=lid,
-                        reference_id=str((lead_f or l2 or {}).get("reference_id") or ref_keep),
-                        source_label=label,
-                    )
+                st_row = db.get_lead_assignment_status(lid)
+                if st_row:
+                    lead_f = db.get_lead_by_id(lid) or l2
+                    acc_name = "Driver"
+                    did = st_row.get("driver_id")
+                    if did:
+                        drow = next(
+                            (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(did)),
+                            None,
+                        )
+                        if drow:
+                            acc_name = str(drow.get("driver_name") or "Driver")
+                    try:
+                        await _send_supervisory_new_lead_notices(
+                            context,
+                            username=lead_f.get("telegram_username") or "Unknown",
+                            lead_id=str(lead_f.get("id")),
+                            reference_id=str(lead_f.get("reference_id") or ref_keep),
+                            driver_names=acc_name,
+                            group_name=_group_display_name_from_lead(lead_f) or "N/A",
+                            driver_count=1,
+                        )
+                    except Exception as e:
+                        logger.warning("Supervisory full notice after lead source (refresh): %s", e)
             except Exception as e:
                 logger.warning("Background contact source sync failed: %s", e)
 
@@ -3707,11 +3677,12 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
     )
     ref_h = html.escape(str(reference_id or "N/A"), quote=False)
     lbl_h = html.escape((label or "").strip() or "—", quote=False)
+    q = html.escape(motivation.get_random_quote(), quote=False)
     await query.message.reply_text(
-        "✅ <b>Lead source saved</b>\n\n"
+        "✅ <b>Lead sent successfully</b>\n\n"
         f"📋 Reference: <code>{ref_h}</code>\n"
         f"📊 Source: {lbl_h}\n\n"
-        "Your lead is with the driver(s). You are done with this submission.\n\n"
+        f"💡 <i>{q}</i>\n\n"
         "➕ Send another lead: /lead or /client",
         parse_mode="HTML",
     )
