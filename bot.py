@@ -31,6 +31,7 @@ from utils.onetimesecret import OneTimeSecret
 from utils.monday import MondayClient
 from utils import ai_vision
 from utils import motivation
+from utils import driver_motivation
 from utils import phone_redact
 from utils import vin_lookup
 
@@ -4930,10 +4931,12 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if success:
         ref_show = html.escape(str(reference_id or "N/A"), quote=False)
+        dq = html.escape(driver_motivation.get_random_driver_quote(), quote=False)
         driver_confirm_html = (
             "✅ <b>Receipt submitted successfully</b>\n\n"
             f"Reference ID: <code>{ref_show}</code>\n"
-            "Your receipt is on file."
+            "Your receipt is on file.\n\n"
+            f"💪 <i>{dq}</i>"
         )
         try:
             await update.message.reply_text(
@@ -4944,8 +4947,9 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logger.error("Driver receipt confirmation reply failed: %s", e)
             try:
+                dqp = driver_motivation.get_random_driver_quote()
                 await update.message.reply_text(
-                    f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}",
+                    f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}\n\n{dqp}",
                     reply_markup=_driver_keyboard_lead_and_receipt(),
                 )
             except Exception as e2:
