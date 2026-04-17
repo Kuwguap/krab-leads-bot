@@ -95,23 +95,33 @@ monday = MondayClient() if Config.is_monday_configured() else None
 
 
 def _resolve_receipt_detection_mode() -> str:
-    """``strict`` = visible ``$`` only; ``lax`` = match amount to lead. Env overrides Supabase ``settings``."""
-    env_mode = Config.receipt_detection_mode_from_env()
-    if env_mode:
-        logger.info("Receipt detection mode: %s (source=RECEIPT_DETECTION_MODE env)", env_mode)
-        return env_mode
+    """``strict`` = visible ``$`` only; ``lax`` = match amount to lead.
+
+    Supabase ``settings.receipt_detection_mode`` (admin panel) wins over ``RECEIPT_DETECTION_MODE`` env
+    so dashboard changes are not ignored when Render still has env set (e.g. lax).
+    Env is used only when the setting is missing or invalid in the database.
+    """
     raw = db.get_setting("receipt_detection_mode")
     if not (raw or "").strip():
         raw = db.get_setting("receipt_detection")  # legacy / typo key
-    v = (raw or "lax").strip().lower()
-    if v not in ("strict", "lax"):
-        v = "lax"
-    logger.info(
-        "Receipt detection mode: %s (source=settings key receipt_detection_mode, raw=%r)",
-        v,
-        raw,
-    )
-    return v
+    if (raw or "").strip():
+        v = raw.strip().lower()
+        if v in ("strict", "lax"):
+            logger.info(
+                "Receipt detection mode: %s (source=Supabase settings receipt_detection_mode, raw=%r)",
+                v,
+                raw,
+            )
+            return v
+    env_mode = Config.receipt_detection_mode_from_env()
+    if env_mode:
+        logger.info(
+            "Receipt detection mode: %s (source=RECEIPT_DETECTION_MODE env; no valid DB value)",
+            env_mode,
+        )
+        return env_mode
+    logger.info("Receipt detection mode: lax (default; no DB or env)")
+    return "lax"
 
 
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
@@ -5166,6 +5176,10 @@ def main():
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
+            # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
+            # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
+            CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+            CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
         ],
         states={
             STATE_PHASE1: [

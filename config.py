@@ -43,7 +43,7 @@ class Config:
     # AI / Vision (optional – for image → structured Phase 1)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or None
     OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o").strip() or "gpt-4o"
-    # Receipt check mode for drivers: strict ($ visible) vs lax (match amount). Env wins over Supabase settings.
+    # Receipt check: fallback when DB has no valid receipt_detection_mode. Admin Supabase setting wins over this.
     RECEIPT_DETECTION_MODE = (os.getenv("RECEIPT_DETECTION_MODE") or "").strip().lower() or None
 
     # VIN decode: choose provider in .env (nhtsa = free, api_ninjas = premium)
@@ -75,7 +75,7 @@ class Config:
 
     @classmethod
     def receipt_detection_mode_from_env(cls) -> Optional[str]:
-        """``strict`` | ``lax`` from env, or None to use DB ``settings.receipt_detection_mode``."""
+        """``strict`` | ``lax`` from env when DB setting is absent; bot prefers Supabase when set."""
         v = (cls.RECEIPT_DETECTION_MODE or "").strip().lower()
         if v in ("strict", "lax"):
             return v
