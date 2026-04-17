@@ -1764,7 +1764,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         f"📝Extra info: {extra}",
         "📞 Call Client Now Confirm: 💰 Price • ⏱️ Time • 📍 Location • 🏷 Tag",
         link_line,
-        "📞 Click link 🔗 enter password to view",
+        "📞 Click link 🔗 enter password “ callclient “ to view",
         f"💰 Price: {price}",
         f"🆔 Reference ID: <code>{ref}</code>",
     ]
@@ -4863,7 +4863,7 @@ def _build_renewal_driver_message(renewal: dict) -> str:
         delivery,
         f"📝 Extra info: {extra}",
         f"📞Phone {link}",
-        "📞 Click link 🔗 enter password to view",
+        "📞 Click link 🔗 enter password “ callclient “ to view",
         f"💰 Price: {price}",
         f"🆔 Reference ID: {ref}",
     ]
