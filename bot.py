@@ -129,13 +129,19 @@ SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
-# Driver inline: add lead only on most DMs (receipts: /receipts, receipt_for_*, or driver_receipt entry if shown elsewhere)
+# Driver inline: add lead; after receipt success also offer owed-receipt flow
 _DRIVER_ADD_LEAD_BTN = InlineKeyboardButton("➕ Add new lead", callback_data="driver_add_lead")
+_DRIVER_ADD_RECEIPT_BTN = InlineKeyboardButton("🧾 Add new receipt", callback_data="driver_add_receipt")
 
 
 def _driver_add_lead_keyboard_only() -> InlineKeyboardMarkup:
     """Default driver follow-up keyboard (single action — not receipt on every message)."""
     return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN]])
+
+
+def _driver_keyboard_lead_and_receipt() -> InlineKeyboardMarkup:
+    """After receipt submitted: add another lead or open owed-receipts upload flow."""
+    return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN, _DRIVER_ADD_RECEIPT_BTN]])
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
@@ -4218,29 +4224,23 @@ def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_T
             context.user_data[key] = data[key]
 
 
-async def handle_driver_receipts_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Drivers: show every owed receipt with inline upload buttons. Commands: /receipts, /receipt, /recipts."""
-    user = update.effective_user
-    if not user or not update.message:
-        return ConversationHandler.END
-    driver = _driver_row_for_telegram_user(user.id)
-    if not driver:
-        await update.message.reply_text(
-            "❌ This Telegram account is not registered as a driver.\n"
-            "Ask an admin to add your Telegram user ID in the dashboard."
-        )
-        return ConversationHandler.END
+async def _send_driver_pending_receipts_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    reply_to_message,
+    driver: dict,
+) -> None:
+    """Show owed-receipt upload buttons, or a short message if none pending (same as /receipts)."""
     pending = db.get_driver_pending_receipts(driver["id"])
     if not pending:
-        await update.message.reply_text(
+        await reply_to_message.reply_text(
             "✅ You don't owe any receipts right now.",
-            reply_markup=_driver_add_lead_keyboard_only(),
+            reply_markup=_driver_keyboard_lead_and_receipt(),
         )
-        return ConversationHandler.END
+        return
     max_show = 90
     n_total = len(pending)
     if n_total > max_show:
-        await update.message.reply_text(
+        await reply_to_message.reply_text(
             f"You owe {n_total} receipts. Showing the first {max_show} — upload those, then send /receipts again."
         )
         pending = pending[:max_show]
@@ -4253,10 +4253,10 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
             [InlineKeyboardButton(f"📤 Upload {ref}", callback_data=f"receipt_for_{ref}")]
         )
     if not rows:
-        await update.message.reply_text(
+        await reply_to_message.reply_text(
             "⚠️ You have pending receipts but no valid reference IDs. Contact support."
         )
-        return ConversationHandler.END
+        return
     parts = []
     if n_total >= SUSPENSION_THRESHOLD:
         parts.append(
@@ -4273,16 +4273,51 @@ async def handle_driver_receipts_menu_command(update: Update, context: ContextTy
     body = "\n\n".join(parts)
     receipt_kb = _keyboard_receipt_plus_rows(rows)
     try:
-        await update.message.reply_text(
+        await reply_to_message.reply_text(
             body,
             parse_mode="HTML",
             reply_markup=receipt_kb,
         )
     except BadRequest:
-        await update.message.reply_text(
+        await reply_to_message.reply_text(
             body.replace("<b>", "").replace("</b>", ""),
             reply_markup=receipt_kb,
         )
+
+
+async def handle_driver_add_receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inline: same owed-receipt list as /receipts — short message if nothing pending."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
+    driver = _driver_row_for_telegram_user(query.from_user.id)
+    if not driver:
+        await msg.reply_text(
+            "❌ This Telegram account is not registered as a driver.\n"
+            "Ask an admin to add your Telegram user ID in the dashboard."
+        )
+        return ConversationHandler.END
+    await _send_driver_pending_receipts_menu(context, msg, driver)
+    return ConversationHandler.END
+
+
+async def handle_driver_receipts_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Drivers: show every owed receipt with inline upload buttons. Commands: /receipts, /receipt, /recipts."""
+    user = update.effective_user
+    if not user or not update.message:
+        return ConversationHandler.END
+    driver = _driver_row_for_telegram_user(user.id)
+    if not driver:
+        await update.message.reply_text(
+            "❌ This Telegram account is not registered as a driver.\n"
+            "Ask an admin to add your Telegram user ID in the dashboard."
+        )
+        return ConversationHandler.END
+    await _send_driver_pending_receipts_menu(context, update.message, driver)
     return ConversationHandler.END
 
 
@@ -4697,14 +4732,14 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(
                 driver_confirm_html,
                 parse_mode="HTML",
-                reply_markup=_driver_add_lead_keyboard_only(),
+                reply_markup=_driver_keyboard_lead_and_receipt(),
             )
         except Exception as e:
             logger.error("Driver receipt confirmation reply failed: %s", e)
             try:
                 await update.message.reply_text(
                     f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}",
-                    reply_markup=_driver_add_lead_keyboard_only(),
+                    reply_markup=_driver_keyboard_lead_and_receipt(),
                 )
             except Exception as e2:
                 logger.error("Fallback driver receipt confirm failed: %s", e2)
@@ -4733,7 +4768,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                     "✅ **Suspension lifted!**\n\n"
                     "You have cleared enough receipts. You can now receive new leads again.",
                     parse_mode="Markdown",
-                    reply_markup=_driver_add_lead_keyboard_only(),
+                    reply_markup=_driver_keyboard_lead_and_receipt(),
                 )
                 dn_esc = _telegram_md1_escape(driver_name)
                 try:
@@ -5299,6 +5334,7 @@ def main():
             CommandHandler("start", start),
             CommandHandler(["lead", "client"], begin_lead_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
+            CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
             # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
@@ -5370,6 +5406,7 @@ def main():
             CommandHandler("start", start),
             CommandHandler(["lead", "client"], begin_lead_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
+            CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
         ],
     )
@@ -5404,6 +5441,7 @@ def main():
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
             CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
+            CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
         ],
     )
 
