@@ -1518,6 +1518,30 @@ def _phase1_from_stored_lead(lead: dict) -> dict:
     return phase1
 
 
+def _client_display_name_from_lead(lead: dict) -> str:
+    """Client / registrant name from stored Phase 1 (for supervisory receipt notices)."""
+    try:
+        p1 = _phase1_from_stored_lead(lead)
+        n = (p1.get("name") or "").strip()
+        return n if n else "—"
+    except Exception:
+        return "—"
+
+
+def _lead_issue_expiry_supervisory_line(lead: dict) -> str:
+    """Issue + expiry times on one line (America/New_York) for receipt supervisory text."""
+    issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
+    ny = pytz.timezone("America/New_York")
+    if issue_dt and exp_dt:
+        i = issue_dt.astimezone(ny)
+        e = exp_dt.astimezone(ny)
+        return (
+            f"Issue {i.strftime('%Y-%m-%d %H:%M %Z')} · "
+            f"Expires {e.strftime('%Y-%m-%d %H:%M %Z')}"
+        )
+    return "—"
+
+
 def _validate_lead_data_ready_for_send(lead_data: dict) -> tuple[bool, str]:
     if not lead_data.get("phone_number"):
         return False, "Missing phone number."
@@ -4427,6 +4451,70 @@ async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.
     return STATE_WAITING_RECEIPT_IMAGE
 
 
+async def _notify_supervisory_receipt_submission(
+    context: ContextTypes.DEFAULT_TYPE,
+    update: Update,
+    lead: dict,
+    reference_id: str,
+    receipt_file_id: str | None,
+    group: dict | None,
+) -> None:
+    """SUPERVISORY MESSAGE prefix + structured text, then forward the driver's upload (fallback: resend photo)."""
+    uname = (update.effective_user.username or "").strip()
+    by_line = f"@{uname}" if uname else "Unknown"
+    client_name = _client_display_name_from_lead(lead)
+    dt_line = _lead_issue_expiry_supervisory_line(lead)
+    ref_plain = str(reference_id or "N/A")
+    body = (
+        "New receipt submitted 🧾\n\n"
+        f"Ref #{ref_plain}\n"
+        f"By {by_line}\n"
+        f"Client: {client_name}\n"
+        f"Date/times: {dt_line}"
+    )
+    notice_full = _prefix_supervisory_message(body)
+
+    async def _send_text_then_receipt_media(chat_id: int, label: str) -> None:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=notice_full, parse_mode=None)
+        except Exception as e:
+            logger.warning("Receipt supervisory notice text to %s (%s): %s", chat_id, label, e)
+            return
+        try:
+            await context.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+        except Exception as e:
+            logger.warning("Receipt forward to %s failed (%s), using photo fallback: %s", chat_id, label, e)
+            if receipt_file_id:
+                try:
+                    await context.bot.send_photo(chat_id=chat_id, photo=receipt_file_id)
+                except Exception as e2:
+                    logger.warning("Receipt photo fallback to %s failed: %s", chat_id, e2)
+
+    sent_norm: set = set()
+    sup_targets = _supervisory_delivery_chat_ids(
+        group.get("supervisory_telegram_id") if group else None
+    )
+    for sup_chat_id in sup_targets:
+        nk = _norm_chat_id(sup_chat_id)
+        if nk is not None and nk in sent_norm:
+            continue
+        await _send_text_then_receipt_media(sup_chat_id, "supervisory")
+        if nk is not None:
+            sent_norm.add(nk)
+
+    st_raw = (db.get_setting("st_telegram_id") or "").strip()
+    if st_raw:
+        st_chat_id = _parse_chat_id(st_raw)
+        stk = _norm_chat_id(st_chat_id) if st_chat_id is not None else None
+        if st_chat_id is not None and stk is not None and stk not in sent_norm:
+            await _send_text_then_receipt_media(st_chat_id, "ST")
+            sent_norm.add(stk)
+
+
 async def handle_receipt_image_stray(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """User sent text or non-image while waiting for receipt photo — nudge without leaving state."""
     msg = update.effective_message
@@ -4629,104 +4717,18 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         # Lead adder: single summary is sent on driver accept only (not receipt).
 
         group_id = lead.get("group_id")
-        group_name = "—"
         group = db.get_group_by_id(group_id) if group_id else None
-        if group:
-            group_name = group.get("group_name") or group_name
-        ref_h = html.escape(str(reference_id or ""), quote=False)
-        dn_h = html.escape(str(driver_name), quote=False)
-        gn_h = html.escape(str(group_name), quote=False)
-        safe_url = _normalize_receipt_image_url(stored_url)
-        cap_html = (
-            "🔔 <b>(3/3) Receipt uploaded</b>\n"
-            f"Ref: <code>{ref_h}</code>\n"
-            f"Driver: {dn_h}\n"
-            f"Group: {gn_h}"
-        )
-        if safe_url:
-            cap_html += f'\n<a href="{html.escape(safe_url, quote=True)}">Open receipt</a>'
-
-        _receipt_sent: set = set()
-        for raw_cid in [_parse_chat_id(lead.get("user_id"))] + _global_supervisory_chat_ids():
-            if raw_cid is None:
-                continue
-            k = _norm_chat_id(raw_cid)
-            if k is not None:
-                _receipt_sent.add(k)
-
-        sup_targets = _supervisory_delivery_chat_ids(
-            group.get("supervisory_telegram_id") if group else None
-        )
-        cap_sup = _prefix_supervisory_html(cap_html)
-        for sup_chat_id in sup_targets:
-            nk = _norm_chat_id(sup_chat_id)
-            if nk is not None and nk in _receipt_sent:
-                continue
-            if nk is not None:
-                _receipt_sent.add(nk)
-            try:
-                if receipt_file_id:
-                    await context.bot.send_photo(
-                        chat_id=sup_chat_id,
-                        photo=receipt_file_id,
-                        caption=cap_sup,
-                        parse_mode="HTML",
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=sup_chat_id,
-                        text=cap_sup,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-            except Exception as e:
-                logger.warning("Could not send receipt photo to supervisory %s: %s", sup_chat_id, e)
-                try:
-                    await context.bot.send_message(
-                        chat_id=sup_chat_id,
-                        text=cap_sup,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e2:
-                    logger.warning("Could not send receipt HTML to supervisory %s: %s", sup_chat_id, e2)
-
-        st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
-        if st_telegram_id:
-            try:
-                st_chat_id = int(st_telegram_id.strip())
-            except (ValueError, TypeError):
-                st_chat_id = None
-            stk = _norm_chat_id(st_chat_id)
-            if stk is not None and stk not in _receipt_sent:
-                _receipt_sent.add(stk)
-                cap_st = _prefix_supervisory_html(cap_html)
-                try:
-                    if receipt_file_id:
-                        await context.bot.send_photo(
-                            chat_id=st_chat_id,
-                            photo=receipt_file_id,
-                            caption=cap_st,
-                            parse_mode="HTML",
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=st_chat_id,
-                            text=cap_st,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                except Exception as e:
-                    logger.warning("Could not send receipt photo to ST %s: %s", st_telegram_id, e)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=st_chat_id,
-                            text=cap_st,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception as e2:
-                        logger.warning("Could not send receipt notification to ST %s: %s", st_telegram_id, e2)
+        try:
+            await _notify_supervisory_receipt_submission(
+                context,
+                update,
+                lead,
+                str(reference_id or ""),
+                receipt_file_id,
+                group,
+            )
+        except Exception as e:
+            logger.error("Supervisory receipt notification failed: %s", e, exc_info=True)
 
         if was_suspended and dr_check:
             pending_after = db.get_driver_pending_receipts(dr_check["id"])
