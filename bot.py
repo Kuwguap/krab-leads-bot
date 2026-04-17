@@ -3002,10 +3002,100 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     else:
         vehicle_lines_display.append("📝 No")
     vehicle_safe = f"🚗 Vehicle: {name_line_safe}\n" + "\n".join(vehicle_lines_display)
-    delivery_safe = _sanitize_phones_for_send(phase1_data.get('delivery_details', '') or '')
     extra_safe = _sanitize_phones_for_send(phase1_data.get('extra_info', '') or '')
     
-    # Create item in Monday.com (if configured)
+    driver_names = ", ".join(d.get("driver_name", "?") for d in selected_drivers)
+
+    def _bg_task_done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error("Background lead dispatch failed: %s", exc, exc_info=exc)
+
+    asyncio.create_task(
+        _background_dispatch_lead_after_driver_pick(
+            context,
+            issuer_notify_chat_id=user_id,
+            user_id=user_id,
+            username=username,
+            lead=lead,
+            lead_data=lead_data,
+            phase1_data=phase1_data,
+            selected_drivers=selected_drivers,
+            selected_group=selected_group,
+            skip_duplicate_full_group_post=skip_duplicate_full_group_post,
+            phone_number=phone_number,
+            price=price,
+            encrypted_data=encrypted_data,
+            reference_id=reference_id,
+            issuer_note_disp=issuer_note_disp,
+            driver_note_disp=driver_note_disp,
+            group_id=group_id,
+            vehicle_safe=vehicle_safe,
+            extra_safe=extra_safe,
+            driver_names=driver_names,
+        )
+    ).add_done_callback(_bg_task_done)
+
+    contact_sources = db.get_contact_info_sources()
+
+    if contact_sources:
+        db.set_user_state(
+            user_id,
+            "select_contact_source",
+            {
+                "lead_id": lead["id"],
+                "reference_id": reference_id,
+                "driver_names": driver_names,
+                "group_name": selected_group.get("group_name", "N/A"),
+                "username": username,
+            },
+        )
+        buttons = [
+            [InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"contact_source_{s['id']}")]
+            for s in contact_sources
+        ]
+        await query.message.reply_text(
+            "📊 **Where did this lead come from?**\n"
+            "Select Lead Source:**",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return STATE_SELECT_CONTACT_SOURCE
+
+    await _issuer_lead_success_and_motivation(
+        query.message, user_id, username, reference_id, driver_names, selected_group.get("group_name", "N/A"),
+    )
+    return ConversationHandler.END
+
+
+async def _background_dispatch_lead_after_driver_pick(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    issuer_notify_chat_id: int,
+    user_id: int,
+    username: str,
+    lead: dict,
+    lead_data: dict,
+    phase1_data: dict,
+    selected_drivers: list,
+    selected_group: dict,
+    skip_duplicate_full_group_post: bool,
+    phone_number,
+    price,
+    encrypted_data: dict,
+    reference_id: str,
+    issuer_note_disp: str,
+    driver_note_disp: str,
+    group_id,
+    vehicle_safe: str,
+    extra_safe: str,
+    driver_names: str,
+) -> None:
+    """Monday (non-blocking), driver DMs, group post, supervisory/ST, usage — runs after issuer continues."""
+    lead_id = lead["id"]
     monday_result = None
     if monday:
         monday_lead_data = {
@@ -3022,67 +3112,47 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                 f"🔗 Encrypted Link: {encrypted_data.get('link')}"
                 + (f"\n\n📝 Driver-only note:\n{driver_note_disp}" if driver_note_disp else "")
             ),
-            # Supervisor/group info (using group name as identifier)
             "supervisor_name": selected_group.get("group_name", ""),
         }
         try:
-            monday_result = monday.create_item(monday_lead_data, username)
+            monday_result = await asyncio.to_thread(monday.create_item, monday_lead_data, username)
         except Exception as e:
             logger.error("Monday.com create_item failed: %s", e, exc_info=True)
             monday_result = None
 
         if monday_result:
-            # Update lead with Monday.com item ID and dates from Monday
-            db.update_lead(lead["id"], {
+            db.update_lead(lead_id, {
                 "monday_item_id": monday_result["item_id"],
                 "issue_date": monday_result["issue_date"].isoformat(),
-                "expiration_date": monday_result["expiration_date"].isoformat()
+                "expiration_date": monday_result["expiration_date"].isoformat(),
             })
         else:
-            # Monday.com call failed; still compute local NY dates
             from datetime import datetime, timedelta
-            import pytz
             ny_tz = pytz.timezone("America/New_York")
             issue_date = datetime.now(ny_tz)
             expiration_date = issue_date + timedelta(days=30)
-            
-            db.update_lead(lead["id"], {
+            db.update_lead(lead_id, {
                 "issue_date": issue_date.isoformat(),
-                "expiration_date": expiration_date.isoformat()
+                "expiration_date": expiration_date.isoformat(),
             })
-            
-            monday_result = {
-                "issue_date": issue_date,
-                "expiration_date": expiration_date
-            }
+            monday_result = {"issue_date": issue_date, "expiration_date": expiration_date}
     else:
-        # Calculate dates locally if Monday.com is not configured
         from datetime import datetime, timedelta
-        import pytz
         ny_tz = pytz.timezone("America/New_York")
         issue_date = datetime.now(ny_tz)
         expiration_date = issue_date + timedelta(days=30)
-        
-        db.update_lead(lead["id"], {
+        db.update_lead(lead_id, {
             "issue_date": issue_date.isoformat(),
-            "expiration_date": expiration_date.isoformat()
+            "expiration_date": expiration_date.isoformat(),
         })
-        
-        monday_result = {
-            "issue_date": issue_date,
-            "expiration_date": expiration_date
-        }
+        monday_result = {"issue_date": issue_date, "expiration_date": expiration_date}
 
-    # Reload lead + winning group from DB (accepted offer is source of truth for broadcast winners)
-    lead = db.get_lead_by_id(lead["id"]) or lead
+    lead = db.get_lead_by_id(lead_id) or lead
     selected_group = _resolve_selected_group(lead_data, lead)
     if selected_group:
         lead_data["selected_group"] = selected_group
         lead_data["group_id"] = selected_group.get("id")
-    gn_sup = _group_display_name_from_lead(lead)
-    group_name_supervisory = gn_sup or (selected_group or {}).get("group_name", "N/A")
 
-    # Prepare messages for distribution
     issue_s = (
         monday_result["issue_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
     )
@@ -3090,7 +3160,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         monday_result["expiration_date"].strftime("%Y-%m-%d %H:%M:%S %Z") if monday_result else "N/A"
     )
 
-    # Group message – HTML with <pre> copy block; no raw phone in body outside pre
     group_message = _format_group_lead_message_html(
         reference_id,
         phase1_data,
@@ -3100,8 +3169,6 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         issuer_note_disp,
     )
 
-    # Driver assignment message (sent to selected drivers with accept/decline)
-    # NOTE: Phone and price are only revealed after driver accepts.
     d_csz_esc = _telegram_md1_escape(phase1_data.get("delivery_city_state_zip", "") or "")
     extra_esc = _telegram_md1_escape(extra_safe)
     driver_request_message = (
@@ -3116,20 +3183,19 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             "\n\n📝 Special request (driver): "
             + _telegram_md1_escape(_sanitize_phones_for_send(driver_note_disp))
         )
-    
-    accept_keyboard = _keyboard_lead_accept_decline(str(lead["id"]))
 
-    # Send to selected drivers
+    accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
+
     assigned_count = 0
     for driver in selected_drivers:
-        driver_telegram_id_raw = driver.get('driver_telegram_id')
+        driver_telegram_id_raw = driver.get("driver_telegram_id")
         if driver_telegram_id_raw:
             try:
                 driver_chat_id = int(str(driver_telegram_id_raw).strip())
             except (ValueError, TypeError):
                 driver_chat_id = driver_telegram_id_raw
             try:
-                db.create_lead_assignment(lead['id'], driver['id'], group_id)
+                db.create_lead_assignment(lead_id, driver["id"], group_id)
                 try:
                     await context.bot.send_message(
                         chat_id=driver_chat_id,
@@ -3147,7 +3213,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                     else:
                         raise
                 assigned_count += 1
-                pending = db.get_driver_pending_receipts(driver['id'])
+                pending = db.get_driver_pending_receipts(driver["id"])
                 if pending and len(pending) < SUSPENSION_THRESHOLD:
                     ref_buttons = [
                         [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
@@ -3173,37 +3239,47 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                             reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                         )
             except Exception as e:
-                logger.error(f"Error sending to driver {driver.get('driver_name')} (chat_id={driver_chat_id}): {e!r}")
-    
-    logger.info(f"Sent lead request to {assigned_count} drivers")
+                logger.error(
+                    "Error sending to driver %s (chat_id=%s): %r",
+                    driver.get("driver_name"),
+                    driver_telegram_id_raw,
+                    e,
+                )
+
+    logger.info("Sent lead request to %s drivers (background)", assigned_count)
     if assigned_count == 0:
         ref_h = html.escape(str(reference_id or "N/A"), quote=False)
-        await query.message.reply_text(
-            "⚠️ No driver received the Telegram notification (check driver chat IDs in admin or logs). "
-            "The lead was still saved.\n\n"
-            f"📋 Reference ID: <code>{ref_h}</code>",
-            parse_mode="HTML",
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=issuer_notify_chat_id,
+                text=(
+                    "⚠️ No driver received the Telegram notification (check driver chat IDs in admin or logs). "
+                    "The lead was still saved.\n\n"
+                    f"📋 Reference ID: <code>{ref_h}</code>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("Could not notify issuer about zero driver delivery: %s", e)
 
-    group_telegram_id_raw = selected_group.get("group_telegram_id")
-    # Send to Group (detailed message without user, phone, and price).
-    # Broadcast winner already received full HTML on group Accept — do not post again to another chat.
+    group_telegram_id_raw = selected_group.get("group_telegram_id") if selected_group else None
     if skip_duplicate_full_group_post:
         logger.info(
             "Skipping full group HTML post: broadcast lead %s — winner already notified on accept.",
-            lead.get("id"),
+            lead_id,
         )
-    else:
-        group_name = selected_group.get('group_name', 'N/A')
+    elif selected_group:
+        group_name = selected_group.get("group_name", "N/A")
         if not group_telegram_id_raw:
             logger.warning(
-                f"No group_telegram_id for group '{group_name}' (id={selected_group.get('id')}). "
-                "Lead not sent to group. Check the group record in admin."
+                "No group_telegram_id for group '%s' (id=%s). Lead not sent to group.",
+                group_name,
+                selected_group.get("id"),
             )
         else:
             group_chat_id = _parse_chat_id(group_telegram_id_raw)
             try:
-                logger.info(f"Sending lead to group '{group_name}' (chat_id={group_chat_id})")
+                logger.info("Sending lead to group '%s' (chat_id=%s)", group_name, group_chat_id)
                 try:
                     await context.bot.send_message(
                         chat_id=group_chat_id, text=group_message, parse_mode="HTML",
@@ -3233,76 +3309,41 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
                         f"⏰ Expires: {html.escape(exp_s, quote=False)}"
                     )
                     await context.bot.send_message(
-                        chat_id=group_chat_id, text=plain_fallback, parse_mode="HTML"
+                        chat_id=group_chat_id, text=plain_fallback, parse_mode="HTML",
                     )
-                logger.info(f"Lead sent to group '{group_name}' successfully")
+                logger.info("Lead sent to group '%s' successfully", group_name)
             except Exception as e:
                 logger.error(
-                    f"Error sending to group '{group_name}' (chat_id={group_chat_id}): {e!r}. "
-                    "Ensure the bot is added to the group and has permission to post."
+                    "Error sending to group '%s' (chat_id=%s): %r",
+                    group_name,
+                    group_chat_id,
+                    e,
                 )
-    
-    # Phase-1 attachments: only after a group taps Accept — see handle_accept_group_offer (never here).
 
-    # Lead adder gets a single summary DM when a driver accepts (see handle_accept_lead), not here.
-
-    contact_sources = db.get_contact_info_sources()
-    
-    if contact_sources:
-        db.set_user_state(
-            user_id,
-            "select_contact_source",
-            {
-                "lead_id": lead["id"],
-                "reference_id": reference_id,
-                "driver_names": driver_names,
-                "group_name": selected_group.get("group_name", "N/A"),
-                "username": username,
-            },
-        )
-        buttons = [
-            [InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"contact_source_{s['id']}")]
-            for s in contact_sources
-        ]
-        await query.message.reply_text(
-            "📊 **Where did this lead come from?**\n"
-            "Select Lead Source:**",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return STATE_SELECT_CONTACT_SOURCE
-
-    await _finish_lead_send(
-        context, query.message, user_id, username, lead["id"], reference_id,
-        driver_names, selected_group.get("group_name", "N/A"), contact_source_label=None,
+    lead = db.get_lead_by_id(lead_id) or lead
+    gn = _group_display_name_from_lead(lead) or (selected_group or {}).get("group_name", "N/A")
+    await _send_supervisory_st_and_record(
+        context,
+        user_id=user_id,
+        username=username,
+        lead_id=lead_id,
+        reference_id=reference_id,
+        driver_names=driver_names,
+        group_name=gn,
     )
-    return ConversationHandler.END
 
 
-async def _finish_lead_send(
+async def _send_supervisory_st_and_record(
     context: ContextTypes.DEFAULT_TYPE,
-    message,
+    *,
     user_id: int,
     username: str,
     lead_id: str,
     reference_id: str,
     driver_names: str,
     group_name: str,
-    contact_source_label: Optional[str] = None,
 ) -> None:
-    """Update lead contact source (if any), sync Monday, notify ST, record usage, send success message."""
-    lead = db.get_lead_by_id(lead_id)
-    resolved_gn = _group_display_name_from_lead(lead)
-    if resolved_gn:
-        group_name = resolved_gn
-    if contact_source_label and lead:
-        db.update_lead(lead_id, {"contact_info_source": contact_source_label})
-        monday_item_id = lead.get("monday_item_id")
-        if monday and monday_item_id:
-            try:
-                monday.update_item_contact_source(int(monday_item_id), contact_source_label)
-            except Exception as e:
-                logger.error(f"Error updating Monday contact source: {e}")
+    """Supervisory + ST new-lead notices and usage row (paired with outbound dispatch)."""
     uname = username or "Unknown"
     body_supervisory = _new_lead_supervisory_notice_text(
         reference_id, group_name, driver_names, uname, include_lead_issuer=True,
@@ -3312,6 +3353,7 @@ async def _finish_lead_send(
     )
     sup_text_supervisory = _prefix_supervisory_message(body_supervisory)
     sup_text_st = _prefix_supervisory_message(body_st_only)
+    lead = db.get_lead_by_id(lead_id)
     group_row = None
     if lead and lead.get("group_id"):
         group_row = db.get_group_by_id(lead["group_id"])
@@ -3344,6 +3386,17 @@ async def _finish_lead_send(
             except Exception as e:
                 logger.warning("Could not send new-lead notice to ST chat %s: %s", st_cid, e)
     db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
+
+
+async def _issuer_lead_success_and_motivation(
+    message,
+    user_id: int,
+    username: str,
+    reference_id: str,
+    driver_names: str,
+    group_name: str,
+) -> None:
+    """Immediate confirmation to issuer; outbound notifications may still be in flight."""
     success_text = (
         f"✅ **Lead sent successfully**\n\n"
         f"• Sent to driver(s): **{_telegram_md1_escape(driver_names)}**\n"
@@ -3355,7 +3408,60 @@ async def _finish_lead_send(
         await message.reply_text(success_text, parse_mode="Markdown")
     except BadRequest:
         await message.reply_text(success_text.replace("`", "").replace("*", ""))
-    # CORE: motivation after client submission (Pro Mode)
+    try:
+        motivation_text = motivation.core_after_submission()
+        await message.reply_text(motivation_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("Could not send motivation after lead: %s", e)
+    db.clear_user_state(user_id)
+
+
+async def _finish_lead_send(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    user_id: int,
+    username: str,
+    lead_id: str,
+    reference_id: str,
+    driver_names: str,
+    group_name: str,
+    contact_source_label: Optional[str] = None,
+) -> None:
+    """After lead source callback: sync Monday contact column, then issuer confirmation."""
+    lead = db.get_lead_by_id(lead_id)
+    resolved_gn = _group_display_name_from_lead(lead)
+    if resolved_gn:
+        group_name = resolved_gn
+    if contact_source_label and lead:
+        db.update_lead(lead_id, {"contact_info_source": contact_source_label})
+        if monday:
+            for _ in range(40):
+                mid = lead.get("monday_item_id") if lead else None
+                if mid:
+                    break
+                await asyncio.sleep(0.2)
+                lead = db.get_lead_by_id(lead_id) or lead
+            monday_item_id = lead.get("monday_item_id") if lead else None
+            if monday_item_id:
+                try:
+                    await asyncio.to_thread(
+                        monday.update_item_contact_source,
+                        int(monday_item_id),
+                        contact_source_label,
+                    )
+                except Exception as e:
+                    logger.error("Error updating Monday contact source: %s", e)
+    success_text = (
+        f"✅ **Lead sent successfully**\n\n"
+        f"• Sent to driver(s): **{_telegram_md1_escape(driver_names)}**\n"
+        f"• Group: {_telegram_md1_escape(group_name)}\n"
+        f"• Reference ID: `{reference_id}`\n\n"
+        "Use /start to create another lead."
+    )
+    try:
+        await message.reply_text(success_text, parse_mode="Markdown")
+    except BadRequest:
+        await message.reply_text(success_text.replace("`", "").replace("*", ""))
     try:
         motivation_text = motivation.core_after_submission()
         await message.reply_text(motivation_text, parse_mode="Markdown")
