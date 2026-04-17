@@ -649,7 +649,7 @@ async def _notify_initiator_lead_accepted_summary(
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
     dn = (accepting_driver_name or "Driver").strip() or "Driver"
-    text = f"Reference: {ref}\nGroup: {group_label}\nDriver(s): {dn}"
+    text = f"New lead\n\nReference: {ref}\nGroup: {group_label}\nDriver(s): {dn}"
     try:
         await context.bot.send_message(chat_id=cid, text=text, parse_mode=None)
     except Exception as e:
@@ -3484,6 +3484,57 @@ async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         logger.warning("Could not send contact source timeout message to %s: %s", user_id, e)
 
+    # One 📬 supervisory (Source: —) if a driver already accepted and source still empty
+    try:
+        lead_row = db.get_lead_by_id(str(expected_lead_id))
+        if (
+            lead_row
+            and not (lead_row.get("contact_info_source") or "").strip()
+            and db.get_lead_assignment_status(str(expected_lead_id))
+        ):
+            await _send_supervisory_new_lead_notices_from_lead(context, lead_row)
+    except Exception as e:
+        logger.warning("Supervisory new-lead after source timeout: %s", e)
+
+
+def _should_defer_supervisory_until_source(lead: dict) -> bool:
+    """When lead-source buttons are configured and this lead has no source yet — do not send supervisory on accept."""
+    if not db.get_contact_info_sources():
+        return False
+    return not (lead.get("contact_info_source") or "").strip()
+
+
+async def _send_supervisory_new_lead_notices_from_lead(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+) -> None:
+    """Single supervisory 📬 block from current DB row (source line reflects contact_info_source)."""
+    lid = str(lead.get("id") or "").strip()
+    if not lid:
+        return
+    st = db.get_lead_assignment_status(lid)
+    acc_name = "Driver"
+    if st and st.get("driver_id"):
+        did = st.get("driver_id")
+        drow = next(
+            (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(did)),
+            None,
+        )
+        if drow:
+            acc_name = str(drow.get("driver_name") or "Driver")
+    ref_sup = lead.get("reference_id") or "N/A"
+    gn_sup = _group_display_name_from_lead(lead) or "N/A"
+    issuer_un = lead.get("telegram_username") or "Unknown"
+    await _send_supervisory_new_lead_notices(
+        context,
+        username=issuer_un,
+        lead_id=lid,
+        reference_id=str(ref_sup),
+        driver_names=acc_name,
+        group_name=gn_sup,
+        driver_count=1,
+    )
+
 
 async def _send_supervisory_new_lead_notices(
     context: ContextTypes.DEFAULT_TYPE,
@@ -3591,52 +3642,34 @@ async def _finish_lead_send(
     if contact_source_label and lead:
         lid = str(lead_id)
         label = contact_source_label
-        ref_keep = reference_id
+        lead_fresh = db.get_lead_by_id(lid) or lead
+        if db.get_lead_assignment_status(lid):
+            try:
+                await _send_supervisory_new_lead_notices_from_lead(context, lead_fresh)
+            except Exception as e:
+                logger.warning("Supervisory after lead source: %s", e)
 
         async def _bg_contact_source_sync() -> None:
             try:
                 l2 = db.get_lead_by_id(lid) or lead
-                if monday:
-                    for _ in range(40):
-                        mid = l2.get("monday_item_id") if l2 else None
-                        if mid:
-                            break
-                        await asyncio.sleep(0.05)
-                        l2 = db.get_lead_by_id(lid) or l2
-                    monday_item_id = l2.get("monday_item_id") if l2 else None
-                    if monday_item_id:
-                        try:
-                            await asyncio.to_thread(
-                                monday.update_item_contact_source,
-                                int(monday_item_id),
-                                label,
-                            )
-                        except Exception as e:
-                            logger.error("Error updating Monday contact source: %s", e)
-                st_row = db.get_lead_assignment_status(lid)
-                if st_row:
-                    lead_f = db.get_lead_by_id(lid) or l2
-                    acc_name = "Driver"
-                    did = st_row.get("driver_id")
-                    if did:
-                        drow = next(
-                            (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(did)),
-                            None,
-                        )
-                        if drow:
-                            acc_name = str(drow.get("driver_name") or "Driver")
+                if not monday:
+                    return
+                for _ in range(40):
+                    mid = l2.get("monday_item_id") if l2 else None
+                    if mid:
+                        break
+                    await asyncio.sleep(0.05)
+                    l2 = db.get_lead_by_id(lid) or l2
+                monday_item_id = l2.get("monday_item_id") if l2 else None
+                if monday_item_id:
                     try:
-                        await _send_supervisory_new_lead_notices(
-                            context,
-                            username=lead_f.get("telegram_username") or "Unknown",
-                            lead_id=str(lead_f.get("id")),
-                            reference_id=str(lead_f.get("reference_id") or ref_keep),
-                            driver_names=acc_name,
-                            group_name=_group_display_name_from_lead(lead_f) or "N/A",
-                            driver_count=1,
+                        await asyncio.to_thread(
+                            monday.update_item_contact_source,
+                            int(monday_item_id),
+                            label,
                         )
                     except Exception as e:
-                        logger.warning("Supervisory full notice after lead source (refresh): %s", e)
+                        logger.error("Error updating Monday contact source: %s", e)
             except Exception as e:
                 logger.warning("Background contact source sync failed: %s", e)
 
@@ -3990,21 +4023,12 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lead,
         accepting_driver_name=acc_name,
     )
-    try:
-        issuer_un = lead.get("telegram_username") or "Unknown"
-        gn_sup = _group_display_name_from_lead(lead) or "N/A"
-        ref_sup = lead.get("reference_id") or "N/A"
-        await _send_supervisory_new_lead_notices(
-            context,
-            username=issuer_un,
-            lead_id=str(lead.get("id")),
-            reference_id=str(ref_sup),
-            driver_names=acc_name,
-            group_name=gn_sup,
-            driver_count=1,
-        )
-    except Exception as e:
-        logger.error("Supervisory new-lead notice on accept failed: %s", e, exc_info=True)
+    # Supervisory 📬 once: on accept if source already set or no source picker; else after source tap or 3m timeout
+    if not _should_defer_supervisory_until_source(lead):
+        try:
+            await _send_supervisory_new_lead_notices_from_lead(context, lead)
+        except Exception as e:
+            logger.error("Supervisory new-lead notice on accept failed: %s", e, exc_info=True)
 
     pending = db.get_driver_pending_receipts(driver["id"])
     if pending:
