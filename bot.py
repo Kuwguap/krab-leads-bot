@@ -10,6 +10,7 @@ import secrets
 import string
 import uuid as _uuid_mod
 import asyncio
+import time
 from datetime import datetime, time as dt_time
 import pytz
 from typing import Optional
@@ -128,6 +129,25 @@ SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
 # Lead source picker: auto-complete without source if issuer does not tap within this window
 CONTACT_SOURCE_TIMEOUT_SEC = 180
 
+# Short-lived caches so repeated taps / messages don't hammer Supabase on every callback
+_ALL_DRIVERS_CACHE: list | None = None
+_ALL_DRIVERS_CACHE_TS: float = 0.0
+_ALL_DRIVERS_TTL_SEC = 2.5
+_SUSP_DRIVER_IDS_CACHE: tuple[set[str], float] | None = None
+_SUSP_DRIVER_IDS_TTL_SEC = 2.0
+
+
+def _get_all_drivers_cached() -> list:
+    """Return all driver rows; refresh from DB at most every _ALL_DRIVERS_TTL_SEC."""
+    global _ALL_DRIVERS_CACHE, _ALL_DRIVERS_CACHE_TS
+    now = time.monotonic()
+    if _ALL_DRIVERS_CACHE is not None and (now - _ALL_DRIVERS_CACHE_TS) < _ALL_DRIVERS_TTL_SEC:
+        return _ALL_DRIVERS_CACHE
+    _ALL_DRIVERS_CACHE = db.get_all_drivers()
+    _ALL_DRIVERS_CACHE_TS = now
+    return _ALL_DRIVERS_CACHE
+
+
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
@@ -225,11 +245,19 @@ def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str
 
 def _get_suspended_driver_ids() -> set[str]:
     """Driver IDs (as str) with 3+ pending receipts — suspended from receiving new leads."""
+    global _SUSP_DRIVER_IDS_CACHE
+    now = time.monotonic()
+    if _SUSP_DRIVER_IDS_CACHE is not None:
+        cached, ts = _SUSP_DRIVER_IDS_CACHE
+        if (now - ts) < _SUSP_DRIVER_IDS_TTL_SEC:
+            return cached
     try:
-        return db.get_driver_ids_with_pending_receipt_count_at_least(SUSPENSION_THRESHOLD)
+        s = db.get_driver_ids_with_pending_receipt_count_at_least(SUSPENSION_THRESHOLD)
     except Exception as e:
         logger.warning("_get_suspended_driver_ids: %s", e)
         return set()
+    _SUSP_DRIVER_IDS_CACHE = (s, now)
+    return s
 
 
 def _norm_chat_id(cid) -> int | str | None:
@@ -650,7 +678,7 @@ async def _send_driver_requests_for_group(
         rows = linked_rows
         scope = "group_linked"
     else:
-        rows = [d for d in db.get_all_drivers() if d]
+        rows = [d for d in _get_all_drivers_cached() if d]
         scope = "all_drivers"
         if rows:
             logger.info(
@@ -1733,8 +1761,10 @@ async def _send_full_group_lead_to_chat(
         except Exception as e:
             logger.error("Could not send full lead to %s: %s", label, e)
 
-    for tid, label in targets:
-        await _post_one(tid, label)
+    await asyncio.gather(
+        *(_post_one(tid, label) for tid, label in targets),
+        return_exceptions=True,
+    )
 
 
 def _lead_issuer_note(lead: dict) -> str:
@@ -1868,7 +1898,9 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     if file.file_path and file.file_path.lower().endswith(".png"):
         mime = "image/png"
     try:
-        raw_text = ai_vision.extract_structured_from_image(image_bytes, mime_type=mime)
+        raw_text = await asyncio.to_thread(
+            lambda: ai_vision.extract_structured_from_image(image_bytes, mime_type=mime)
+        )
     except ai_vision.AIVisionQuotaError:
         await update.message.reply_text(
             "❌ Image extraction is temporarily unavailable (API quota exceeded). "
@@ -1913,7 +1945,9 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
     await file.download_to_memory(out=bio)
     pdf_bytes = bio.getvalue()
     try:
-        raw_text = ai_vision.extract_structured_from_pdf(pdf_bytes)
+        raw_text = await asyncio.to_thread(
+            lambda: ai_vision.extract_structured_from_pdf(pdf_bytes)
+        )
     except ai_vision.AIVisionQuotaError:
         await update.message.reply_text(
             "❌ Extraction is temporarily unavailable (API quota exceeded). "
@@ -1942,7 +1976,9 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if Config.is_ai_vision_configured():
         await update.message.reply_text("⏳ Processing…")
         try:
-            raw_text = ai_vision.extract_structured_from_text(message_text)
+            raw_text = await asyncio.to_thread(
+                lambda: ai_vision.extract_structured_from_text(message_text)
+            )
         except ai_vision.AIVisionQuotaError:
             await update.message.reply_text(
                 "❌ Processing is temporarily unavailable (API quota). "
@@ -2566,7 +2602,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     continue_data["follow_after_broadcast"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
 
-    drivers = db.get_all_drivers()
+    drivers = _get_all_drivers_cached()
     active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await update.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
@@ -2707,7 +2743,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data["broadcast"] = True
         continue_data.pop("resend", None)
         db.set_user_state(user_id, "select_driver", continue_data)
-        drivers = db.get_all_drivers()
+        drivers = _get_all_drivers_cached()
         active_drivers = [d for d in drivers if record_is_active(d)]
         if not active_drivers:
             await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
@@ -2769,7 +2805,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         continue_data["selected_group"] = selected_group
         continue_data["follow_after_broadcast"] = True
         db.set_user_state(user_id, "select_driver", continue_data)
-        drivers = db.get_all_drivers()
+        drivers = _get_all_drivers_cached()
         active_drivers = [d for d in drivers if record_is_active(d)]
         if not active_drivers:
             await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
@@ -2827,7 +2863,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     continue_data["selected_group"] = selected_group
     continue_data["follow_after_broadcast"] = True
     db.set_user_state(user_id, "select_driver", continue_data)
-    drivers = db.get_all_drivers()
+    drivers = _get_all_drivers_cached()
     active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await query.message.reply_text("❌ Error: No active drivers found. Please contact admin.")
@@ -2914,7 +2950,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     # Determine which drivers to notify
     # Drivers work for all groups, so get all active drivers
     callback_data = query.data
-    all_drivers = db.get_all_drivers()
+    all_drivers = _get_all_drivers_cached()
     active_drivers = [d for d in all_drivers if record_is_active(d)]
     
     suspended = _get_suspended_driver_ids()
@@ -3704,7 +3740,7 @@ async def _handle_resend_to_drivers(
         db.clear_user_state(user_id)
         return ConversationHandler.END
 
-    all_drivers = db.get_all_drivers()
+    all_drivers = _get_all_drivers_cached()
     active_drivers = [d for d in all_drivers if record_is_active(d)]
     suspended = _get_suspended_driver_ids()
     if callback_data == "select_driver_all":
@@ -3837,7 +3873,7 @@ async def handle_resend_driver(update: Update, context: ContextTypes.DEFAULT_TYP
         "resend": True,
     }
     db.set_user_state(user_id, "select_driver", resend_data)
-    drivers = db.get_all_drivers()
+    drivers = _get_all_drivers_cached()
     active_drivers = [d for d in drivers if record_is_active(d)]
     if not active_drivers:
         await query.message.reply_text("❌ No active drivers found. Please contact admin.")
@@ -4794,11 +4830,13 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     if Config.is_ai_vision_configured():
         _rec_mode = _resolve_receipt_detection_mode()
         try:
-            rv = ai_vision.validate_driver_receipt_image(
-                image_bytes,
-                mime_type=mime_for_ai,
-                expected_price_text=(lead.get("price") or "").strip() or None,
-                detection_mode=_rec_mode,
+            rv = await asyncio.to_thread(
+                lambda: ai_vision.validate_driver_receipt_image(
+                    image_bytes,
+                    mime_type=mime_for_ai,
+                    expected_price_text=(lead.get("price") or "").strip() or None,
+                    detection_mode=_rec_mode,
+                )
             )
         except ai_vision.AIVisionQuotaError:
             await update.message.reply_text(
@@ -4814,7 +4852,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     if assignment_status:
         driver_id = assignment_status.get("driver_id")
         driver = next(
-            (d for d in db.get_all_drivers() if str(d.get("id")) == str(driver_id)),
+            (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(driver_id)),
             None,
         )
         if driver:
@@ -5227,7 +5265,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     original_did = renewal.get("original_driver_id")
     original_driver = None
     if original_did:
-        all_drivers = db.get_all_drivers()
+        all_drivers = _get_all_drivers_cached()
         original_driver = next((d for d in all_drivers if str(d.get("id")) == str(original_did)), None)
 
     # Phase 2: send to original driver first
@@ -5326,7 +5364,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
     lead = renewal.get("lead") or {}
     ref = lead.get("reference_id", "N/A")
     driver = None
-    all_drivers = db.get_all_drivers()
+    all_drivers = _get_all_drivers_cached()
     driver = next((d for d in all_drivers if str(d.get("id")) == str(driver_id)), None)
     dname = driver.get("driver_name", "Driver") if driver else "Driver"
 
@@ -5437,8 +5475,6 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
 
 def main():
     """Main function to start the bot."""
-    import time
-
     logger.info("Bot starting...")
     sys.stdout.flush()
     sys.stderr.flush()
@@ -5471,8 +5507,8 @@ def main():
             logger.warning("deleteWebhook response: %s", resp.text)
     except Exception as e:
         logger.warning("Could not clear webhook (continuing): %s", e)
-    time.sleep(1)
-    
+    time.sleep(0.15)
+
     _conflict_logged = False
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
