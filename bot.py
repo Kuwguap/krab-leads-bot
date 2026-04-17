@@ -603,20 +603,10 @@ async def _notify_initiator_lead_accepted_summary(
     lead_row = db.get_lead_by_id(str(lid)) if lid else lead
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
-    dn = _telegram_md1_escape((accepting_driver_name or "Driver").strip() or "Driver")
-    gl = _telegram_md1_escape(group_label)
-    text = (
-        f"Reference: `{ref}`\n"
-        f"Group: **{gl}**\n"
-        f"Driver(s): **{dn}**"
-    )
+    dn = (accepting_driver_name or "Driver").strip() or "Driver"
+    text = f"Reference: {ref}\nGroup: {group_label}\nDriver(s): {dn}"
     try:
-        await context.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
-    except BadRequest:
-        await context.bot.send_message(
-            chat_id=cid,
-            text=f"Reference: {ref}\nGroup: {group_label}\nDriver(s): {accepting_driver_name or 'Driver'}",
-        )
+        await context.bot.send_message(chat_id=cid, text=text, parse_mode=None)
     except Exception as e:
         logger.warning("Could not send initiator lead summary to %s: %s", cid, e)
 
@@ -3366,22 +3356,13 @@ async def _background_dispatch_lead_after_driver_pick(
 
     lead = db.get_lead_by_id(lead_id) or lead
     gn = _group_display_name_from_lead(lead) or (selected_group or {}).get("group_name", "N/A")
-    await _send_supervisory_st_and_record(
-        context,
-        user_id=user_id,
-        username=username,
-        lead_id=lead_id,
-        reference_id=reference_id,
-        driver_names=driver_names,
-        group_name=gn,
-        driver_count=len(selected_drivers),
-    )
+    # Supervisory "new lead" DMs go out when a driver accepts (see handle_accept_lead).
+    db.record_bot_usage(user_id, username or "Unknown", lead_id, gn, driver_names)
 
 
-async def _send_supervisory_st_and_record(
+async def _send_supervisory_new_lead_notices(
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    user_id: int,
     username: str,
     lead_id: str,
     reference_id: str,
@@ -3389,7 +3370,7 @@ async def _send_supervisory_st_and_record(
     group_name: str,
     driver_count: Optional[int] = None,
 ) -> None:
-    """Supervisory + ST new-lead notices and usage row (paired with outbound dispatch)."""
+    """SUPERVISORY MESSAGE new-lead template to per-group + global supervisory + ST (not usage row)."""
     uname = username or "Unknown"
     lead_row = db.get_lead_by_id(lead_id)
     client_nm = _client_display_name_from_lead(lead_row) if lead_row else "—"
@@ -3445,7 +3426,6 @@ async def _send_supervisory_st_and_record(
                 )
             except Exception as e:
                 logger.warning("Could not send new-lead notice to ST chat %s: %s", st_cid, e)
-    db.record_bot_usage(user_id, username or "Unknown", lead_id, group_name, driver_names)
 
 
 async def _issuer_lead_success_and_motivation(
@@ -3456,23 +3436,7 @@ async def _issuer_lead_success_and_motivation(
     driver_names: str,
     group_name: str,
 ) -> None:
-    """Immediate confirmation to issuer; outbound notifications may still be in flight."""
-    success_text = (
-        f"✅ **Lead sent successfully**\n\n"
-        f"• Sent to driver(s): **{_telegram_md1_escape(driver_names)}**\n"
-        f"• Group: {_telegram_md1_escape(group_name)}\n"
-        f"• Reference ID: `{reference_id}`\n\n"
-        "Use /start to create another lead."
-    )
-    try:
-        await message.reply_text(success_text, parse_mode="Markdown")
-    except BadRequest:
-        await message.reply_text(success_text.replace("`", "").replace("*", ""))
-    try:
-        motivation_text = motivation.core_after_submission()
-        await message.reply_text(motivation_text, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning("Could not send motivation after lead: %s", e)
+    """End issuer flow after dispatch; summary DM goes when a driver accepts (not here)."""
     db.clear_user_state(user_id)
 
 
@@ -3511,22 +3475,6 @@ async def _finish_lead_send(
                     )
                 except Exception as e:
                     logger.error("Error updating Monday contact source: %s", e)
-    success_text = (
-        f"✅ **Lead sent successfully**\n\n"
-        f"• Sent to driver(s): **{_telegram_md1_escape(driver_names)}**\n"
-        f"• Group: {_telegram_md1_escape(group_name)}\n"
-        f"• Reference ID: `{reference_id}`\n\n"
-        "Use /start to create another lead."
-    )
-    try:
-        await message.reply_text(success_text, parse_mode="Markdown")
-    except BadRequest:
-        await message.reply_text(success_text.replace("`", "").replace("*", ""))
-    try:
-        motivation_text = motivation.core_after_submission()
-        await message.reply_text(motivation_text, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning("Could not send motivation after lead: %s", e)
     db.clear_user_state(user_id)
 
 
@@ -3920,11 +3868,27 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.warning("Could not schedule renewal: %s", e)
 
     lead = db.get_lead_by_id(lead_id) or lead
+    acc_name = str(driver.get("driver_name") or "Driver")
     await _notify_initiator_lead_accepted_summary(
         context,
         lead,
-        accepting_driver_name=str(driver.get("driver_name") or "Driver"),
+        accepting_driver_name=acc_name,
     )
+    try:
+        issuer_un = (lead.get("telegram_username") or "Unknown")
+        gn_sup = _group_display_name_from_lead(lead) or "N/A"
+        ref_sup = (lead.get("reference_id") or "N/A")
+        await _send_supervisory_new_lead_notices(
+            context,
+            username=issuer_un,
+            lead_id=str(lead.get("id")),
+            reference_id=str(ref_sup),
+            driver_names=acc_name,
+            group_name=gn_sup,
+            driver_count=1,
+        )
+    except Exception as e:
+        logger.error("Supervisory new-lead notice on accept failed: %s", e, exc_info=True)
 
 
 async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
