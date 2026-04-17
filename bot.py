@@ -2622,9 +2622,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             f"📋 Ref ID: `{reference_id}`\n\n"
             "✅ Double-check the tag for mistakes\n"
             "📲 Send tag to driver with @krabsender\n"
-            "📋 Copy/paste client phone, address, and delivery time\n\n"
-            "Tap Accept or Different Team.\n"
-            "If another group accepts first, it will show as taken."
+            "📋 Copy/paste client phone, address, and delivery time"
         )
         offer_kb_by_group: dict[str, InlineKeyboardMarkup] = {}
         short_lead = _short_uuid(lead["id"])
@@ -2712,8 +2710,6 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 "📣 Broadcast sent\n\n"
                 f"📋 Reference ID: <code>{ref_h}</code>\n"
                 f"Sent to {sent_count} group(s).\n\n"
-                "You do not need to wait for a group — pick drivers next. "
-                "Groups can still accept/decline in their chats.\n\n"
                 "Select which driver(s) to notify:"
                 f"{html.escape(summary, quote=False)}"
             )
