@@ -393,27 +393,20 @@ def _parse_chat_id(raw: str | int | None) -> int | str | None:
         return s
 
 
-SUPERVISORY_MESSAGE_HEADER = "SUPERVISORY MESSAGE ON TOP"
+SUPERVISORY_MESSAGE_HEADER = "SUPERVISORY MESSAGE"
 
 
 def _plain_already_has_supervisory_header(text: str) -> bool:
     """True if body already starts with current or legacy supervisory header (avoid double prefix)."""
     u = (text or "").strip().upper()
-    if u.startswith(SUPERVISORY_MESSAGE_HEADER.upper()):
-        return True
-    # Legacy header (before ON TOP wording)
     if u.startswith("SUPERVISORY MESSAGE"):
-        tail = u[len("SUPERVISORY MESSAGE") : len("SUPERVISORY MESSAGE") + 6]
-        if not tail.startswith(" ON TOP"):
-            return True
+        return True
     return False
 
 
 def _html_already_has_supervisory_header(text: str) -> bool:
     u = (text or "").strip().upper()
-    if u.startswith("<B>SUPERVISORY MESSAGE ON TOP") or u.startswith("SUPERVISORY MESSAGE ON TOP"):
-        return True
-    if u.startswith("<B>SUPERVISORY MESSAGE</B>") or u.startswith("<B>SUPERVISORY MESSAGE"):
+    if u.startswith("<B>SUPERVISORY MESSAGE") or u.startswith("SUPERVISORY MESSAGE"):
         return True
     return False
 
@@ -500,11 +493,15 @@ def _new_lead_supervisory_notice_text(
     username: str,
     *,
     include_lead_issuer: bool = True,
+    driver_count: Optional[int] = None,
 ) -> str:
     """Body when an issuer completes sending a lead.
 
     ``include_lead_issuer``: Telegram @ of submitter — **only** for group/env supervisory chats,
     not for ``st_telegram_id`` (see ``_finish_lead_send``).
+
+    ``driver_count``: number of drivers notified (for Send Mode). If omitted, inferred from
+    comma-separated ``driver_names``.
     """
     def one_line(s: str) -> str:
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
@@ -512,6 +509,17 @@ def _new_lead_supervisory_notice_text(
     ref = one_line(str(reference_id))
     gn = one_line(group_name)
     dn = one_line(driver_names)
+    if driver_count is None:
+        parts = [p.strip() for p in (driver_names or "").split(",") if p.strip()]
+        n = len(parts)
+    else:
+        n = int(driver_count)
+    if n <= 0:
+        send_mode = "Send Mode: —"
+    elif n == 1:
+        send_mode = "Send Mode: 1 Driver"
+    else:
+        send_mode = "Send Mode: Multiple Drivers"
     un = (username or "").strip()
     if un and un != "Unknown":
         by_line = un if un.startswith("@") else f"@{un}"
@@ -523,6 +531,7 @@ def _new_lead_supervisory_notice_text(
         f"Reference: {ref}",
         f"Group: {gn}",
         f"Driver(s): {dn}",
+        send_mode,
     ]
     if include_lead_issuer:
         lines.append(f"Lead issued by: {by_line}")
@@ -3330,6 +3339,7 @@ async def _background_dispatch_lead_after_driver_pick(
         reference_id=reference_id,
         driver_names=driver_names,
         group_name=gn,
+        driver_count=len(selected_drivers),
     )
 
 
@@ -3342,14 +3352,25 @@ async def _send_supervisory_st_and_record(
     reference_id: str,
     driver_names: str,
     group_name: str,
+    driver_count: Optional[int] = None,
 ) -> None:
     """Supervisory + ST new-lead notices and usage row (paired with outbound dispatch)."""
     uname = username or "Unknown"
     body_supervisory = _new_lead_supervisory_notice_text(
-        reference_id, group_name, driver_names, uname, include_lead_issuer=True,
+        reference_id,
+        group_name,
+        driver_names,
+        uname,
+        include_lead_issuer=True,
+        driver_count=driver_count,
     )
     body_st_only = _new_lead_supervisory_notice_text(
-        reference_id, group_name, driver_names, uname, include_lead_issuer=False,
+        reference_id,
+        group_name,
+        driver_names,
+        uname,
+        include_lead_issuer=False,
+        driver_count=driver_count,
     )
     sup_text_supervisory = _prefix_supervisory_message(body_supervisory)
     sup_text_st = _prefix_supervisory_message(body_st_only)
