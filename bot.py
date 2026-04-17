@@ -125,6 +125,8 @@ def _resolve_receipt_detection_mode() -> str:
 
 
 SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
+# Lead source picker: auto-complete without source if issuer does not tap within this window
+CONTACT_SOURCE_TIMEOUT_SEC = 180
 
 # Clears inline keyboards on broadcast offer messages after accept/decline/taken
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
@@ -499,6 +501,7 @@ def _new_lead_supervisory_notice_text(
     username: str,
     *,
     client_name: str = "—",
+    source_label: Optional[str] = None,
     include_lead_issuer: bool = True,
     driver_count: Optional[int] = None,
 ) -> str:
@@ -509,6 +512,8 @@ def _new_lead_supervisory_notice_text(
 
     ``driver_count``: number of drivers notified (for Send Mode). If omitted, inferred from
     comma-separated ``driver_names``.
+
+    ``source_label``: lead/contact source (e.g. Facebook); shown as — if not set yet.
     """
     def one_line(s: str) -> str:
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
@@ -517,6 +522,10 @@ def _new_lead_supervisory_notice_text(
     gn = one_line(group_name)
     dn = one_line(driver_names)
     cn = one_line(client_name)
+    if source_label and str(source_label).strip():
+        src = one_line(str(source_label))
+    else:
+        src = "—"
     if driver_count is None:
         parts = [p.strip() for p in (driver_names or "").split(",") if p.strip()]
         n = len(parts)
@@ -541,6 +550,7 @@ def _new_lead_supervisory_notice_text(
         f"Driver(s): {dn}",
         send_mode,
         f"Client name: {cn}",
+        f"Source: {src}",
     ]
     if include_lead_issuer:
         lines.append(f"Lead issued by: {by_line}")
@@ -3094,11 +3104,23 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             for s in contact_sources
         ]
         await query.message.reply_text(
-            "📊 **Where did this lead come from?**\n"
-            "Select Lead Source:**",
+            "📊 **Where did this lead come from?**\n\n"
+            "Tap a **lead source** below.\n"
+            f"⏱️ You have **{CONTACT_SOURCE_TIMEOUT_SEC // 60} minutes** — if you don't, we save the lead without a source.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+        if context.application.job_queue:
+            context.application.job_queue.run_once(
+                _contact_source_timeout_job,
+                when=CONTACT_SOURCE_TIMEOUT_SEC,
+                data={
+                    "user_id": user_id,
+                    "lead_id": lead["id"],
+                    "reference_id": reference_id,
+                },
+                name=f"contact_source_timeout_{user_id}_{lead['id']}",
+            )
         return STATE_SELECT_CONTACT_SOURCE
 
     await _issuer_lead_success_and_motivation(
@@ -3222,65 +3244,73 @@ async def _background_dispatch_lead_after_driver_pick(
 
     accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
 
-    assigned_count = 0
-    for driver in selected_drivers:
+    async def _notify_one_driver(driver: dict) -> bool:
+        """Deliver offer + optional receipt strike to one driver. Returns True if primary DM sent."""
         driver_telegram_id_raw = driver.get("driver_telegram_id")
-        if driver_telegram_id_raw:
+        if not driver_telegram_id_raw:
+            return False
+        try:
+            driver_chat_id = int(str(driver_telegram_id_raw).strip())
+        except (ValueError, TypeError):
+            driver_chat_id = driver_telegram_id_raw
+        try:
+            db.create_lead_assignment(lead_id, driver["id"], group_id)
             try:
-                driver_chat_id = int(str(driver_telegram_id_raw).strip())
-            except (ValueError, TypeError):
-                driver_chat_id = driver_telegram_id_raw
-            try:
-                db.create_lead_assignment(lead_id, driver["id"], group_id)
+                await context.bot.send_message(
+                    chat_id=driver_chat_id,
+                    text=driver_request_message,
+                    parse_mode="Markdown",
+                    reply_markup=accept_keyboard,
+                )
+            except BadRequest as e:
+                if "parse" in str(e).lower():
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=driver_request_message.replace("`", ""),
+                        reply_markup=accept_keyboard,
+                    )
+                else:
+                    raise
+            pending = db.get_driver_pending_receipts(driver["id"])
+            if pending and len(pending) < SUSPENSION_THRESHOLD:
+                ref_buttons = [
+                    [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
+                    for p in pending
+                ]
+                strike_txt = (
+                    f"⚠️ You owe **{len(pending)}** receipt(s):\n\n"
+                    + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending)
+                    + f"\n\nAt **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended** from new leads."
+                    + "\n\nTo view all receipts type /receipts"
+                )
                 try:
                     await context.bot.send_message(
                         chat_id=driver_chat_id,
-                        text=driver_request_message,
+                        text=strike_txt,
                         parse_mode="Markdown",
-                        reply_markup=accept_keyboard,
+                        reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                     )
-                except BadRequest as e:
-                    if "parse" in str(e).lower():
-                        await context.bot.send_message(
-                            chat_id=driver_chat_id,
-                            text=driver_request_message.replace("`", ""),
-                            reply_markup=accept_keyboard,
-                        )
-                    else:
-                        raise
-                assigned_count += 1
-                pending = db.get_driver_pending_receipts(driver["id"])
-                if pending and len(pending) < SUSPENSION_THRESHOLD:
-                    ref_buttons = [
-                        [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
-                        for p in pending
-                    ]
-                    strike_txt = (
-                        f"⚠️ You owe **{len(pending)}** receipt(s):\n\n"
-                        + "\n".join(f"• Ref `{p['reference_id']}`" for p in pending)
-                        + f"\n\nAt **{SUSPENSION_THRESHOLD}** unpaid you will be **temporarily suspended** from new leads."
-                        + "\n\nTo view all receipts type /receipts"
+                except BadRequest:
+                    await context.bot.send_message(
+                        chat_id=driver_chat_id,
+                        text=strike_txt.replace("`", "").replace("*", ""),
+                        reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
                     )
-                    try:
-                        await context.bot.send_message(
-                            chat_id=driver_chat_id,
-                            text=strike_txt,
-                            parse_mode="Markdown",
-                            reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
-                        )
-                    except BadRequest:
-                        await context.bot.send_message(
-                            chat_id=driver_chat_id,
-                            text=strike_txt.replace("`", "").replace("*", ""),
-                            reply_markup=_keyboard_receipt_plus_rows(ref_buttons),
-                        )
-            except Exception as e:
-                logger.error(
-                    "Error sending to driver %s (chat_id=%s): %r",
-                    driver.get("driver_name"),
-                    driver_telegram_id_raw,
-                    e,
-                )
+            return True
+        except Exception as e:
+            logger.error(
+                "Error sending to driver %s (chat_id=%s): %r",
+                driver.get("driver_name"),
+                driver_telegram_id_raw,
+                e,
+            )
+            return False
+
+    results = await asyncio.gather(
+        *(_notify_one_driver(d) for d in selected_drivers),
+        return_exceptions=True,
+    )
+    assigned_count = sum(1 for r in results if r is True)
 
     logger.info("Sent lead request to %s drivers (background)", assigned_count)
     if assigned_count == 0:
@@ -3362,6 +3392,108 @@ async def _background_dispatch_lead_after_driver_pick(
     db.record_bot_usage(user_id, username or "Unknown", lead_id, gn, driver_names)
 
 
+def _cancel_contact_source_timeout_job(application, user_id: int, lead_id) -> None:
+    """Remove scheduled auto-complete for lead source picker (user tapped a source)."""
+    jq = application.job_queue if application else None
+    if not jq:
+        return
+    name = f"contact_source_timeout_{user_id}_{lead_id}"
+    getter = getattr(jq, "get_jobs_by_name", None)
+    if callable(getter):
+        try:
+            for j in getter(name) or ():
+                j.schedule_removal()
+        except Exception:
+            pass
+        return
+    try:
+        for j in jq.jobs():
+            if getattr(j, "name", None) == name:
+                j.schedule_removal()
+                break
+    except Exception:
+        pass
+
+
+async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """3 minutes without tapping a lead source: clear state; lead stays without source."""
+    job = context.job
+    if not job or not job.data:
+        return
+    user_id = job.data.get("user_id")
+    expected_lead_id = job.data.get("lead_id")
+    reference_id = job.data.get("reference_id", "N/A")
+    if user_id is None or expected_lead_id is None:
+        return
+    st = db.get_user_state(user_id)
+    if not st or st.get("state") != "select_contact_source":
+        return
+    data = st.get("data") or {}
+    if str(data.get("lead_id")) != str(expected_lead_id):
+        return
+    db.clear_user_state(user_id)
+    ref_esc = _telegram_md1_escape(str(reference_id))
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "⏱️ **Lead source not selected in time**\n\n"
+                "Your lead was already sent to drivers **without** a lead source.\n\n"
+                f"📋 Reference: `{ref_esc}`\n\n"
+                "Start a new lead anytime with /lead or /client."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Could not send contact source timeout message to %s: %s", user_id, e)
+
+
+async def _send_supervisory_lead_source_followup(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    lead_id: str,
+    reference_id: str,
+    source_label: str,
+) -> None:
+    """When source is saved after a driver already accepted — supervisory chats get a short update."""
+    ref = (reference_id or "N/A").strip()
+    src = (source_label or "").strip() or "—"
+    body = f"📊 Lead source recorded\n\nReference: {ref}\nSource: {src}"
+    sup_text = _prefix_supervisory_message(body)
+    lead = db.get_lead_by_id(lead_id)
+    group_row = None
+    if lead and lead.get("group_id"):
+        group_row = db.get_group_by_id(lead["group_id"])
+    sup_raw = group_row.get("supervisory_telegram_id") if group_row else None
+    sup_targets = _supervisory_delivery_chat_ids(sup_raw)
+    seen_norm: set = set()
+    for sup_cid in sup_targets:
+        nk = _norm_chat_id(sup_cid)
+        if nk is not None:
+            seen_norm.add(nk)
+        try:
+            await context.bot.send_message(
+                chat_id=sup_cid,
+                text=sup_text,
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.warning("Could not send lead-source follow-up to supervisory chat %s: %s", sup_cid, e)
+    st_raw = (db.get_setting("st_telegram_id") or "").strip()
+    if st_raw:
+        st_cid = _parse_chat_id(st_raw)
+        stk = _norm_chat_id(st_cid) if st_cid is not None else None
+        if st_cid is not None and stk is not None and stk not in seen_norm:
+            try:
+                await context.bot.send_message(
+                    chat_id=st_cid,
+                    text=sup_text,
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.warning("Could not send lead-source follow-up to ST chat %s: %s", st_cid, e)
+
+
 async def _send_supervisory_new_lead_notices(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -3376,12 +3508,14 @@ async def _send_supervisory_new_lead_notices(
     uname = username or "Unknown"
     lead_row = db.get_lead_by_id(lead_id)
     client_nm = _client_display_name_from_lead(lead_row) if lead_row else "—"
+    src_raw = (lead_row.get("contact_info_source") or "").strip() if lead_row else ""
     body_supervisory = _new_lead_supervisory_notice_text(
         reference_id,
         group_name,
         driver_names,
         uname,
         client_name=client_nm,
+        source_label=src_raw or None,
         include_lead_issuer=True,
         driver_count=driver_count,
     )
@@ -3391,6 +3525,7 @@ async def _send_supervisory_new_lead_notices(
         driver_names,
         uname,
         client_name=client_nm,
+        source_label=src_raw or None,
         include_lead_issuer=False,
         driver_count=driver_count,
     )
@@ -3461,11 +3596,11 @@ async def _finish_lead_send(
     if contact_source_label and lead:
         db.update_lead(lead_id, {"contact_info_source": contact_source_label})
         if monday:
-            for _ in range(40):
+            for _ in range(30):
                 mid = lead.get("monday_item_id") if lead else None
                 if mid:
                     break
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
                 lead = db.get_lead_by_id(lead_id) or lead
             monday_item_id = lead.get("monday_item_id") if lead else None
             if monday_item_id:
@@ -3477,6 +3612,17 @@ async def _finish_lead_send(
                     )
                 except Exception as e:
                     logger.error("Error updating Monday contact source: %s", e)
+        try:
+            if db.get_lead_assignment_status(str(lead_id)):
+                lead_f = db.get_lead_by_id(lead_id)
+                await _send_supervisory_lead_source_followup(
+                    context,
+                    lead_id=str(lead_id),
+                    reference_id=str((lead_f or lead or {}).get("reference_id") or reference_id),
+                    source_label=contact_source_label,
+                )
+        except Exception as e:
+            logger.warning("Supervisory lead source follow-up failed: %s", e)
     db.clear_user_state(user_id)
 
 
@@ -3504,9 +3650,24 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
         group_name = gn_from_db
     source = db.get_contact_info_source_by_id(source_id)
     label = source.get("label", "") if source else ""
+    _cancel_contact_source_timeout_job(context.application, user_id, lead_id)
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
     await _finish_lead_send(
         context, query.message, user_id, username, lead_id, reference_id,
         driver_names, group_name, contact_source_label=label or None,
+    )
+    ref_h = html.escape(str(reference_id or "N/A"), quote=False)
+    lbl_h = html.escape((label or "").strip() or "—", quote=False)
+    await query.message.reply_text(
+        "✅ <b>Lead source saved</b>\n\n"
+        f"📋 Reference: <code>{ref_h}</code>\n"
+        f"📊 Source: {lbl_h}\n\n"
+        "Your lead is with the driver(s). You are done with this submission.\n\n"
+        "➕ Send another lead: /lead or /client",
+        parse_mode="HTML",
     )
     return ConversationHandler.END
 
