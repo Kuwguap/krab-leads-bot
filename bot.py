@@ -3806,11 +3806,23 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "To view all receipts type /receipts"
             )
             driver_nm = driver.get("driver_name", "Unknown")
+            ref_parts = []
+            for p in pending:
+                ref = (p.get("reference_id") or "").strip()
+                if not ref or ref.upper() == "N/A":
+                    continue
+                ref_parts.append(_telegram_md1_escape(ref))
+            refs_line = (
+                f"\nReceipt references: {', '.join(ref_parts)}"
+                if ref_parts
+                else "\nReceipt references: (none on file)"
+            )
             try:
                 sup_txt = _prefix_supervisory_message(
                     f"⛔ **Driver Suspended**\n\n"
                     f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
                     f"Reason: {len(pending)} unpaid receipt(s)"
+                    f"{refs_line}"
                 )
                 for sup_id in _global_supervisory_chat_ids():
                     try:
