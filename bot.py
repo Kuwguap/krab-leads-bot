@@ -11,7 +11,7 @@ import string
 import uuid as _uuid_mod
 import asyncio
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 import pytz
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -62,6 +62,7 @@ STATE_ADD_FILES = 12  # Ask "Do you want to add files?"
 STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
 STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issuers
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
+STATE_EDIT_FIELD_PROMPT = 29   # waiting for text input for editing a field
 
 # Phase 2 (phone + price) — shared by file-flow callbacks and must stay in sync
 PHASE2_INTRO_MESSAGE = (
@@ -950,6 +951,82 @@ def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
     ])
 
+def _extract_phone_price_notes_from_text(text: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return (phone, price, issuer_note, driver_note).
+       Stops phone from being scraped across lines; picks a line that looks like a phone.
+    """
+    # ---- 1. split into lines ----
+    lines = [line.strip() for line in text.splitlines()]
+
+    # ---- 2. find a phone line ----
+    phone = None
+    phone_line_index = None
+    # pattern for a line that is likely a phone (starts with +, or has typical phone formatting)
+    for idx, line in enumerate(lines):
+        if not line or line.startswith("$"):
+            continue
+        # check if the whole line looks like a phone candidate (no alphabetic chars, short)
+        if re.fullmatch(r'^[+\d]?[\d\s.\-()]+$', line):
+            # extract digits
+            digits = re.sub(r'\D', '', line)
+            if 9 <= len(digits) <= 12:
+                # Normalize to +1 + 10 digits
+                if digits.startswith('1') and len(digits) >= 10:
+                    digits = digits[1:]   # strip USA country code
+                if len(digits) == 10:
+                    phone = '+1' + digits
+                elif len(digits) == 9:   # missing digit – keep as is, user can fix
+                    phone = '+1' + digits
+                else:
+                    continue   # ambiguous, try next line
+                phone_line_index = idx
+                break
+
+    # if no line-based phone found, fallback to old regex (whole text)
+    if not phone:
+        pattern = r'(?:\+?1\s*[.\-]?\s*)?(?:\(\d{3}\)\s*|\d{3}[.\-]?\s*)\d{3}[.\-]?\s*\d{4}'
+        for m in re.finditer(pattern, text):
+            d = re.sub(r'\D', '', m.group())
+            if len(d) == 11 and d.startswith('1'):
+                d = d[1:]
+            if len(d) == 10:
+                phone = '+1' + d
+                break
+
+    # ---- 3. price extraction (unchanged) ----
+    price = None
+    label_price = re.search(r'(?i)^\s*Price\s*:\s*(.+?)\s*$', text, re.MULTILINE)
+    if label_price:
+        val = label_price.group(1).strip()
+        m = re.search(r'\d+(?:\.\d{2})?', val)
+        if m:
+            price = m.group() if '$' in val else '$' + m.group()
+    else:
+        m = re.search(r'\$\s*\d+(?:\.\d{2})?', text)
+        if m:
+            price = m.group().replace(' ', '')
+
+    # ---- 4. notes: remove phone line (if found) and price line ----
+    cleaned = []
+    for idx, line in enumerate(lines):
+        if idx == phone_line_index:
+            continue
+        if phone and phone in line:
+            continue
+        if price and price in line:
+            continue
+        if line.strip():
+            cleaned.append(line.strip())
+
+    issuer_note = None
+    driver_note = None
+    if len(cleaned) >= 2:
+        driver_note = cleaned[-1]
+        issuer_note = cleaned[-2]
+    elif len(cleaned) == 1:
+        driver_note = cleaned[0]
+
+    return phone, price, issuer_note, driver_note
 
 # AI Phase 1: human review — field edit keys (keep callback_data short; max 64 bytes)
 PH1_REVIEW_ACCEPT = "ph1_accept"
@@ -972,6 +1049,10 @@ PH1_EDIT_TO_STATE_KEY = {
     "ins": "insurance_company",
     "pol": "insurance_policy_number",
     "xtra": "extra_info",
+    "phone": "pending_phone_number",
+    "price": "pending_price",
+    "issuer": "special_request_issuers",
+    "driver": "special_request_drivers",
 }
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
@@ -986,6 +1067,10 @@ PH1_EDIT_PROMPT_LABEL = {
     "ins": "Insurance company",
     "pol": "Insurance policy number",
     "xtra": "Delivery date/time and extra notes",
+    "phone": "Phone number",
+    "price": "Price",
+    "issuer": "Issuer note",
+    "driver": "Driver note",
 }
 
 
@@ -1024,6 +1109,14 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
         f"Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
     ]
+    if state_data.get("pending_phone_number"):
+        lines.append(f"Phone: {state_data['pending_phone_number']}")
+    if state_data.get("pending_price"):
+        lines.append(f"Price: {state_data['pending_price']}")
+    if state_data.get("special_request_issuers"):
+        lines.append(f"Issuer note: {state_data['special_request_issuers']}")
+    if state_data.get("special_request_drivers"):
+        lines.append(f"Driver note: {state_data['special_request_drivers']}")
     return "\n".join(lines)
 
 
@@ -1069,32 +1162,101 @@ def _truncate_btn_val(val: str, max_len: int = 22) -> str:
     return (v[: max_len - 1] + "…") if len(v) > max_len else v
 
 
-def _phase1_review_keyboard() -> InlineKeyboardMarkup:
+def _build_review_keyboard_with_selections(state_data):
+    group_label = state_data.get("selected_group_name", "auto")
+    driver_label = state_data.get("selected_driver_names", "auto")
+    source_label = state_data.get("selected_source_label") or "none"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Accept", callback_data=PH1_REVIEW_ACCEPT),
+            InlineKeyboardButton(f"🏢 {group_label}", callback_data="ph1_pick_group"),
+            InlineKeyboardButton(f"🚗 {driver_label}", callback_data="ph1_pick_driver"),
+            InlineKeyboardButton(f"📊 {source_label}", callback_data="ph1_pick_source"),
+        ],
+        [
             InlineKeyboardButton("✏️ Edit", callback_data=PH1_REVIEW_EDIT),
-        ]
+            InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
+        ],
     ])
+
+async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.warning(f"Could not edit keyboard: {e}")
+
+async def _update_review_message_text(context, state_data):
+    chat_id = context.user_data.get("review_chat_id")
+    mid = context.user_data.get("review_message_id")
+    if not chat_id or not mid:
+        return
+    new_text = _format_phase1_ai_review_text(state_data)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=mid,
+            text=new_text,
+            reply_markup=_build_review_keyboard_with_selections(state_data),
+        )
+    except Exception as e:
+        logger.warning("Could not update review text: %s", e)
+
+async def _update_review_text(context, state_data):
+    # Only updates the text, not the keyboard (used in some places)
+    chat_id = context.user_data.get("review_chat_id")
+    mid = context.user_data.get("review_message_id")
+    if not chat_id or not mid:
+        return
+    new_text = _format_phase1_ai_review_text(state_data)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=mid,
+            text=new_text,
+        )
+    except Exception as e:
+        logger.warning("Could not update review text: %s", e)
 
 
 def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
-    """One button per field: Label: value (callback ph1edit_<key>)."""
     first, last = _name_parts_from_full(state_data.get("name"))
     rows = [
-        [InlineKeyboardButton(f"First name:{_truncate_btn_val(first)}", callback_data="ph1edit_fn")],
-        [InlineKeyboardButton(f"Last name:{_truncate_btn_val(last)}", callback_data="ph1edit_ln")],
-        [InlineKeyboardButton(f"Reg address:{_truncate_btn_val(state_data.get('address'))}", callback_data="ph1edit_addr")],
-        [InlineKeyboardButton(f"Reg city/ST/ZIP:{_truncate_btn_val(state_data.get('city_state_zip'))}", callback_data="ph1edit_csz")],
-        [InlineKeyboardButton(f"Deliv address:{_truncate_btn_val(state_data.get('delivery_address'))}", callback_data="ph1edit_daddr")],
-        [InlineKeyboardButton(f"Deliv city/ST/ZIP:{_truncate_btn_val(state_data.get('delivery_city_state_zip'))}", callback_data="ph1edit_dcsz")],
-        [InlineKeyboardButton(f"VIN:{_truncate_btn_val(state_data.get('vin'), 18)}", callback_data="ph1edit_vin")],
-        [InlineKeyboardButton(f"Car:{_truncate_btn_val(state_data.get('car'))}", callback_data="ph1edit_car")],
-        [InlineKeyboardButton(f"Color:{_truncate_btn_val(state_data.get('color'))}", callback_data="ph1edit_col")],
-        [InlineKeyboardButton(f"Insurance:{_truncate_btn_val(state_data.get('insurance_company'))}", callback_data="ph1edit_ins")],
-        [InlineKeyboardButton(f"Policy #:{_truncate_btn_val(state_data.get('insurance_policy_number'))}", callback_data="ph1edit_pol")],
-        [InlineKeyboardButton(f"Delivery Date/Time & Notes:{_truncate_btn_val(state_data.get('extra_info'))}", callback_data="ph1edit_xtra")],
-        [InlineKeyboardButton("⬅️ Back to summary", callback_data=PH1_EDIT_BACK)],
+        [
+            InlineKeyboardButton(f"First name: {_truncate_btn_val(first)}", callback_data="ph1edit_fn"),
+            InlineKeyboardButton(f"Last name: {_truncate_btn_val(last)}", callback_data="ph1edit_ln"),
+        ],
+        [
+            InlineKeyboardButton(f"Reg address: {_truncate_btn_val(state_data.get('address'))}", callback_data="ph1edit_addr"),
+            InlineKeyboardButton(f"Reg city/ST/ZIP: {_truncate_btn_val(state_data.get('city_state_zip'))}", callback_data="ph1edit_csz"),
+        ],
+        [
+            InlineKeyboardButton(f"Deliv address: {_truncate_btn_val(state_data.get('delivery_address'))}", callback_data="ph1edit_daddr"),
+            InlineKeyboardButton(f"Deliv city/ST/ZIP: {_truncate_btn_val(state_data.get('delivery_city_state_zip'))}", callback_data="ph1edit_dcsz"),
+        ],
+        [
+            InlineKeyboardButton(f"VIN: {_truncate_btn_val(state_data.get('vin'), 18)}", callback_data="ph1edit_vin"),
+            InlineKeyboardButton(f"Car: {_truncate_btn_val(state_data.get('car'))}", callback_data="ph1edit_car"),
+        ],
+        [
+            InlineKeyboardButton(f"Color: {_truncate_btn_val(state_data.get('color'))}", callback_data="ph1edit_col"),
+            InlineKeyboardButton(f"Insurance: {_truncate_btn_val(state_data.get('insurance_company'))}", callback_data="ph1edit_ins"),
+        ],
+        [
+            InlineKeyboardButton(f"Policy #: {_truncate_btn_val(state_data.get('insurance_policy_number'))}", callback_data="ph1edit_pol"),
+            InlineKeyboardButton(f"Date/Time: {_truncate_btn_val(state_data.get('extra_info'))}", callback_data="ph1edit_xtra"),
+        ],
+        [
+            InlineKeyboardButton(f"Phone: {_truncate_btn_val(state_data.get('pending_phone_number') or '-', 18)}", callback_data="ph1edit_phone"),
+            InlineKeyboardButton(f"Price: {_truncate_btn_val(state_data.get('pending_price') or '-', 12)}", callback_data="ph1edit_price"),
+        ],
+        [
+            InlineKeyboardButton(f"Issuer note: {_truncate_btn_val(state_data.get('special_request_issuers') or '-')}", callback_data="ph1edit_issuer"),
+            InlineKeyboardButton(f"Driver note: {_truncate_btn_val(state_data.get('special_request_drivers') or '-')}", callback_data="ph1edit_driver"),
+        ],
+        [InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK)],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1115,11 +1277,44 @@ def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def _send_phase1_ai_review(target_message, state_data: dict) -> None:
-    await target_message.reply_text(
+async def _send_phase1_ai_review(target_message, state_data: dict, context, user_id) -> None:
+    # Set default selections
+    groups = db.get_all_groups()
+    active_groups = [g for g in groups if record_is_active(g)]
+    if active_groups:
+        user_tg = str(user_id)
+        group = db.get_group_by_assistant_telegram_id(user_tg)
+        if not group or not record_is_active(group):
+            group = active_groups[0]
+        state_data["selected_group_id"] = group["id"]
+        state_data["selected_group_name"] = group.get("group_name", "?")
+    else:
+        state_data["selected_group_id"] = None
+        state_data["selected_group_name"] = "None"
+
+    drivers = _get_all_drivers_cached()
+    active_drivers = [d for d in drivers if record_is_active(d)]
+    suspended = _get_suspended_driver_ids()
+    eligible = [d for d in active_drivers if str(d.get("id")) not in suspended]
+    if eligible:
+        d0 = eligible[0]
+        state_data["selected_driver_ids"] = [d0["id"]]
+        state_data["selected_driver_names"] = d0.get("driver_name", "?")
+    else:
+        state_data["selected_driver_ids"] = []
+        state_data["selected_driver_names"] = "None"
+
+    state_data["selected_source_label"] = ""
+
+    db.set_user_state(user_id, "phase1", state_data)
+
+    keyboard = _build_review_keyboard_with_selections(state_data)
+    msg = await target_message.reply_text(
         _format_phase1_ai_review_text(state_data),
-        reply_markup=_phase1_review_keyboard(),
+        reply_markup=keyboard,
     )
+    context.user_data["review_message_id"] = msg.message_id
+    context.user_data["review_chat_id"] = msg.chat_id
 
 
 async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
@@ -1138,11 +1333,12 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
         context.user_data["vin_choice_api_car"] = api_car
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
-        await message.reply_text(
+        vin_msg = await message.reply_text(
             _vin_conflict_body(stated_car, api_car),
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
+        context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
         return STATE_VIN_CHOICE
     if alert_msg:
         await message.reply_text(alert_msg)
@@ -1202,6 +1398,8 @@ def _clean_vin_and_car(state_data: dict) -> None:
         state_data.get("name"),
         state_data.get("address"),
         state_data.get("city_state_zip"),
+        state_data.get("delivery_address") or "-",
+        state_data.get("delivery_city_state_zip") or "-",
         state_data.get("vin"),
         state_data.get("car"),
         state_data.get("color"),
@@ -1209,7 +1407,7 @@ def _clean_vin_and_car(state_data: dict) -> None:
         state_data.get("insurance_policy_number"),
         state_data.get("extra_info"),
     ]
-    state_data["vehicle_details"] = "\n".join([l for l in vehicle_lines if l])
+    state_data["vehicle_details"] = "\n".join(vehicle_lines)
     delivery_lines = [
         state_data.get("delivery_address"),
         state_data.get("delivery_city_state_zip"),
@@ -1235,21 +1433,23 @@ async def _begin_lead_flow(
     db.set_user_state(user_id, "phase1", {})
 
     phase1_instruction = (
-        "Congratulations 🎊\n\n"
-        "**Step 1:**\n"
-        "📤 Send me\n"
-        "👤 Name\n"
-        "🏠 Reg Addr\n"
-        "📍 Delivery Addr\n"
-        "🔢 VIN #\n"
-        "🚘 Car (Y/M/M)\n"
-        "🎨 Color\n"
-        "🛡 Insurance #\n"
-        "🕒 Date & Time\n\n"
-        "Send ✍️ Text or 📸 Screenshot\n\n"
-        f"{motivation.get_random_quote()}\n\n"
-        "🏁Automated🏎Automotive"
-    )
+    "📤 **Send all information at once**\n\n"
+    "👤 Name\n"
+    "🏠 Registration Address\n"
+    "📍 Delivery Address\n"
+    "🔢 VIN #\n"
+    "🚘 Car (Year/Make/Model)\n"
+    "🎨 Color\n"
+    "🛡 Insurance Company & Policy #\n"
+    "🕒 Date & Time\n"
+    "📞 Phone Number\n"
+    "💲 Price\n"
+    "📝 Special request for issuers (optional)\n"
+    "📝 Special request for drivers (optional)\n\n"
+    "You can attach files after this step.\n\n"
+    f"{motivation.get_random_quote()}\n\n"
+    "🏁Automated🏎Automotive"
+)
     await reply_message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
 
 
@@ -1539,11 +1739,42 @@ def _issue_and_expiration_for_group_display(lead: dict) -> tuple[datetime | None
 
 
 def _phase1_from_stored_lead(lead: dict) -> dict:
-    """Rebuild phase1 field dict from a persisted leads row (for group HTML message)."""
+    """Rebuild phase1 field dict directly from the lead row.
+       Always produces correct fields, even if stored string was misaligned."""
     vd = (lead.get("vehicle_details") or "").strip()
     dd = (lead.get("delivery_details") or "").strip()
     extra = (lead.get("extra_info") or "").strip()
-    phase1 = parse_phase1_structured(vd) if vd else parse_phase1_structured("")
+
+    # Split into lines, pad to at least 11 lines
+    lines = [ln.strip() for ln in vd.splitlines()]
+    while len(lines) < 11:
+        lines.append("-")
+
+    # Force VIN into line index 5 (6th line) if we can find a real VIN in the raw string
+    vin_found = _extract_vin_17(vd)
+    if vin_found:
+        lines[5] = vin_found
+
+    # Force extra_info into line 10 if we have it separately
+    if extra:
+        lines[10] = extra
+
+    # Now build the dict directly from the fixed lines
+    phase1 = {
+        "name": lines[0] if lines[0] != "-" else "",
+        "address": lines[1] if lines[1] != "-" else "",
+        "city_state_zip": lines[2] if lines[2] != "-" else "",
+        "delivery_address": lines[3] if lines[3] != "-" else "",
+        "delivery_city_state_zip": lines[4] if lines[4] != "-" else "",
+        "vin": lines[5] if lines[5] != "-" else "",
+        "car": lines[6] if lines[6] != "-" else "",
+        "color": lines[7] if lines[7] != "-" else "",
+        "insurance_company": lines[8] if lines[8] != "-" else "",
+        "insurance_policy_number": lines[9] if lines[9] != "-" else "",
+        "extra_info": extra or lines[10] if lines[10] != "-" else "",
+    }
+
+    # Override delivery details from the dedicated column
     if dd:
         phase1["delivery_details"] = dd
         dlines = [L.strip() for L in dd.splitlines() if L.strip()]
@@ -1551,8 +1782,7 @@ def _phase1_from_stored_lead(lead: dict) -> dict:
             phase1["delivery_address"] = dlines[0]
         if len(dlines) >= 2:
             phase1["delivery_city_state_zip"] = dlines[1]
-    if extra:
-        phase1["extra_info"] = extra
+
     return phase1
 
 
@@ -1842,6 +2072,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
 
 async def _phase1_finish_vision_extraction(
     update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     raw_text: Optional[str],
     *,
@@ -1873,8 +2104,56 @@ async def _phase1_finish_vision_extraction(
             "Please send the details as text in the required 11-line structure, or try another photo or PDF."
         )
         return STATE_PHASE1
+    # Parse extra fields (phone, price, notes) from lines 12-15
+    phone = price = issuer_note = driver_note = None
+    extra_lines = lines[ai_vision.PHASE1_LINE_COUNT:]
+    for line in extra_lines:
+        l = line.strip()
+        if not l or l == "-":
+            continue
+        if l.lower().startswith("phone:"):
+            phone = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("price:"):
+            price = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("issuer note:"):
+            issuer_note = l.split(":", 1)[1].strip()
+            if issuer_note.lower() in ("-", "none", "n/a", "na"):
+                issuer_note = None
+        elif l.lower().startswith("driver note:"):
+            driver_note = l.split(":", 1)[1].strip()
+            if driver_note.lower() in ("-", "none", "n/a", "na"):
+                driver_note = None
+
+    if phone and price:
+        state_data["pending_phone_number"] = phone
+        state_data["pending_price"] = price
+        if issuer_note:
+            state_data["special_request_issuers"] = issuer_note
+        if driver_note:
+            state_data["special_request_drivers"] = driver_note
+
+    # Robust VIN extraction from whole raw output
+    vin_from_raw = _extract_vin_17(raw_text)
+    if vin_from_raw:
+        state_data["vin"] = vin_from_raw
+
+    # Rebuild vehicle_details with correct VIN
+    state_data["vehicle_details"] = "\n".join([
+        state_data.get("name", "-"),
+        state_data.get("address", "-"),
+        state_data.get("city_state_zip", "-"),
+        state_data.get("delivery_address", "-"),
+        state_data.get("delivery_city_state_zip", "-"),
+        state_data.get("vin", "-"),
+        state_data.get("car", "-"),
+        state_data.get("color", "-"),
+        state_data.get("insurance_company", "-"),
+        state_data.get("insurance_policy_number", "-"),
+        state_data.get("extra_info", "-"),
+    ])
+
     db.set_user_state(user_id, "phase1", state_data)
-    await _send_phase1_ai_review(update.message, state_data)
+    await _send_phase1_ai_review(update.message, state_data, context, user_id)
     return STATE_AI_REVIEW
 
 
@@ -1908,7 +2187,7 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Please send the details as text in the required structure."
         )
         return STATE_PHASE1
-    return await _phase1_finish_vision_extraction(update, user_id, raw_text, source_label="photo")
+    return await _phase1_finish_vision_extraction(update, context, user_id, raw_text, source_label="photo")
 
 
 async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1961,7 +2240,7 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
             "Try another PDF, send a photo/screenshot, or type the details."
         )
         return STATE_PHASE1
-    return await _phase1_finish_vision_extraction(update, user_id, raw_text, source_label="PDF")
+    return await _phase1_finish_vision_extraction(update, context, user_id, raw_text, source_label="photo")
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2006,13 +2285,64 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             return STATE_PHASE1
         db.set_user_state(user_id, "phase1", state_data)
-        await _send_phase1_ai_review(update.message, state_data)
+        message_text = update.message.text or update.message.caption or ""
+
+        # ═════════════════════════════════════════════════
+        #  1. Always use the AI's own labels for phone, price, and notes (lines 12–15)
+        #     These are authoritative – no guesswork needed.
+        # ═════════════════════════════════════════════════
+        extra_lines = lines[ai_vision.PHASE1_LINE_COUNT:]   # index 11..end
+        for line in extra_lines:
+            l = line.strip()
+            if not l or l == "-":
+                continue
+            if l.lower().startswith("phone:"):
+                state_data["pending_phone_number"] = l.split(":", 1)[1].strip()
+            elif l.lower().startswith("price:"):
+                state_data["pending_price"] = l.split(":", 1)[1].strip()
+            elif l.lower().startswith("issuer note:"):
+                note = l.split(":", 1)[1].strip()
+                if note.lower() not in ("-", "none", "n/a", "na"):
+                    state_data["special_request_issuers"] = note
+                else:
+                    state_data["special_request_issuers"] = ""   # explicitly clear
+            elif l.lower().startswith("driver note:"):
+                note = l.split(":", 1)[1].strip()
+                if note.lower() not in ("-", "none", "n/a", "na"):
+                    state_data["special_request_drivers"] = note
+                else:
+                    state_data["special_request_drivers"] = ""
+
+        # ═════════════════════════════════════════════════
+        #  2. Fallback: if the AI did NOT give us a phone or price,
+        #     try the raw text parser (but NEVER for notes).
+        # ═════════════════════════════════════════════════
+        if not state_data.get("pending_phone_number") or not state_data.get("pending_price"):
+            phone, price, _, _ = _extract_phone_price_notes_from_text(message_text)
+            if not state_data.get("pending_phone_number") and phone:
+                state_data["pending_phone_number"] = phone
+            if not state_data.get("pending_price") and price:
+                state_data["pending_price"] = price
+
+        db.set_user_state(user_id, "phase1", state_data)
+        await _send_phase1_ai_review(update.message, state_data, context, user_id)
         return STATE_AI_REVIEW
     else:
         # No AI: require the 11-line structure
         state_data = parse_phase1_structured(message_text)
         _apply_single_address_as_both(state_data)
         db.set_user_state(user_id, "phase1", state_data)
+        message_text = update.message.text or update.message.caption or ""
+        phone, price, issuer_note, driver_note = _extract_phone_price_notes_from_text(message_text)
+        if phone and price:
+            state_data["pending_phone_number"] = phone
+            state_data["pending_price"] = price
+            if issuer_note:
+                state_data["special_request_issuers"] = issuer_note
+            if driver_note:
+                state_data["special_request_drivers"] = driver_note
+            db.set_user_state(user_id, "phase1", state_data)
+        await _send_phase1_ai_review(update.message, state_data, context, user_id)
         alert_msg, conflict = _vin_check_after_phase1(state_data)
         if conflict:
             api_car, stated_car = conflict
@@ -2028,6 +2358,8 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         if alert_msg:
             await update.message.reply_text(alert_msg)
         missing = ai_vision.detect_missing_fields(state_data, message_text)
+        OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
+        missing = [f for f in missing if f not in OPTIONAL_FIELDS]
         if missing:
             prompts = ai_vision.MISSING_FIELD_PROMPTS
             msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
@@ -2037,6 +2369,39 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             return STATE_MISSING_FIELD
         return await _ask_add_files(update.message, context)
 
+
+async def handle_edit_field_text(update, context):
+    user_id = update.effective_user.id
+    ek = context.user_data.get("phase1_pending_edit_key")
+    if not ek:
+        return STATE_AI_REVIEW
+
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        return ConversationHandler.END
+    state_data = state["data"]
+
+    text = (update.message.text or "").strip()
+    _apply_single_phase1_edit(state_data, ek, text)
+    _apply_single_address_as_both(state_data)
+    _clean_vin_and_car(state_data)
+    db.set_user_state(user_id, "phase1", state_data)
+
+    # Delete user message and prompt
+    try:
+        await update.message.delete()
+    except:
+        pass
+    prompt_id = context.user_data.pop("edit_prompt_msg_id", None)
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_id)
+        except:
+            pass
+
+    # Update the review message
+    await _update_review_message_text(context, state_data)
+    return STATE_AI_REVIEW
 
 async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ask user if they want to add files; returns STATE_ADD_FILES."""
@@ -2057,9 +2422,9 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
     if query.data == "add_files_no":
         state = db.get_user_state(user_id)
         if state and state.get("data"):
-            d = state["data"].copy()
-            d["attached_files"] = context.user_data.get("phase1_attached_files") or []
-            db.set_user_state(user_id, "phase1", d)
+            data = state["data"]
+            if data.get("pending_phone_number") and data.get("pending_price"):
+                return await _submit_lead_from_review(query.message, context, user_id, data)
         await query.message.reply_text(PHASE2_INTRO_MESSAGE)
         return STATE_PHASE2
     # add_files_yes
@@ -2159,31 +2524,177 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             d = state["data"].copy()
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
-        await query.message.reply_text(PHASE2_INTRO_MESSAGE)
-        return STATE_PHASE2
+            if d.get("pending_phone_number") and d.get("pending_price"):
+                return await _submit_lead_from_review(query.message, context, user_id, d)
+            await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+            return STATE_PHASE2
     await query.message.reply_text("📎 Send the file (photo or document).")
     return STATE_WAITING_FILE
 
 
-async def handle_phase1_ai_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Accept AI Phase 1 interpretation or open field editor."""
+async def handle_phase1_ai_review_callback(update, context):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if query.data == PH1_REVIEW_ACCEPT:
+    data = query.data
+
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await query.message.reply_text("❌ Data lost.")
+        return ConversationHandler.END
+
+    state_data = state["data"]
+
+    if data == PH1_REVIEW_ACCEPT:
         context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
-    if query.data == PH1_REVIEW_EDIT:
-        state = db.get_user_state(user_id)
-        if not state or not state.get("data"):
-            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
-            return ConversationHandler.END
+
+    elif data == "edit_cancel":
+        try:
+            await query.message.delete()
+        except:
+            pass
+        chat_id = context.user_data.get("review_chat_id")
+        mid = context.user_data.get("review_message_id")
+        if chat_id and mid:
+            await _edit_message_keyboard(context, chat_id, mid, _phase1_edit_fields_keyboard(state_data))
+        return STATE_AI_REVIEW
+
+    elif data == PH1_REVIEW_EDIT:
         context.user_data["phase1_recent_edits"] = []
-        await query.message.reply_text(
-            "Pick a field to edit:",
-            reply_markup=_phase1_edit_fields_keyboard(state["data"]),
+        await _edit_message_keyboard(
+            context,
+            context.user_data["review_chat_id"],
+            context.user_data["review_message_id"],
+            _phase1_edit_fields_keyboard(state_data)
         )
-        return STATE_AI_EDIT_MENU
+        return STATE_AI_REVIEW
+
+    elif data.startswith("ph1edit_"):
+        edit_key = data.replace("ph1edit_", "", 1)
+        context.user_data["phase1_pending_edit_key"] = edit_key
+        label = PH1_EDIT_PROMPT_LABEL.get(edit_key, edit_key)
+        prompt = await query.message.reply_text(
+            f"✏️ Send new text for: {label}\n\n"
+            "Type minus (-) to clear.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")
+            ]])
+        )
+        context.user_data["edit_prompt_msg_id"] = prompt.message_id
+        return STATE_EDIT_FIELD_PROMPT
+
+    elif data == PH1_EDIT_BACK:
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_pick_group":
+        groups = db.get_all_groups()
+        active = [g for g in groups if record_is_active(g)]
+        if not active:
+            await query.answer("No groups.")
+            return STATE_AI_REVIEW
+        buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"selgrp_{g['id']}")] for g in active]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+        await _edit_message_keyboard(
+            context,
+            context.user_data["review_chat_id"],
+            context.user_data["review_message_id"],
+            InlineKeyboardMarkup(buttons)
+        )
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_pick_driver":
+        chat_id = context.user_data.get("review_chat_id")
+        mid = context.user_data.get("review_message_id")
+        if not chat_id or not mid:
+            return STATE_AI_REVIEW
+        all_drivers = _get_all_drivers_cached()
+        active = [d for d in all_drivers if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        buttons = []
+        for d in active:
+            did = d.get("id")
+            name = d.get("driver_name", "Unknown")
+            if str(did) in suspended:
+                buttons.append([InlineKeyboardButton(f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
+        elig = [d for d in active if str(d.get("id")) not in suspended]
+        if elig:
+            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+        await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_pick_source":
+        sources = db.get_contact_info_sources()
+        if not sources:
+            return STATE_AI_REVIEW
+        buttons = [[InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"selsrc_{s['id']}")] for s in sources]
+        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+        await _edit_message_keyboard(
+            context,
+            context.user_data["review_chat_id"],
+            context.user_data["review_message_id"],
+            InlineKeyboardMarkup(buttons)
+        )
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_sel_back":
+        state = db.get_user_state(user_id)
+        if state and state.get("data"):
+            await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    elif data.startswith("driver_suspended_"):
+        driver_id = data.replace("driver_suspended_", "")
+        driver = next((d for d in _get_all_drivers_cached() if str(d.get("id")) == driver_id), None)
+        name = driver.get("driver_name", "Driver") if driver else "Driver"
+        await query.answer(f"{name} is suspended (PENALTY).", show_alert=False)
+        return STATE_AI_REVIEW
+
+    elif data.startswith("selgrp_"):
+        group_id = data.replace("selgrp_", "")
+        group = db.get_group_by_id(group_id)
+        if group:
+            state_data["selected_group_id"] = group_id
+            state_data["selected_group_name"] = group.get("group_name", "?")
+            db.set_user_state(user_id, "phase1", state_data)
+            await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    elif data.startswith("seldrv_") or data == "seldrv_all":
+        drivers = _get_all_drivers_cached()
+        active = [d for d in drivers if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        if data == "seldrv_all":
+            selected = [d for d in active if str(d["id"]) not in suspended]
+            names = ", ".join(d.get("driver_name", "?") for d in selected)
+            ids = [d["id"] for d in selected]
+        else:
+            driver_id = data.replace("seldrv_", "")
+            d = next((d for d in active if str(d.get("id")) == driver_id), None)
+            if not d:
+                return STATE_AI_REVIEW
+            selected = [d]
+            names = d.get("driver_name", "?")
+            ids = [d["id"]]
+        state_data["selected_driver_ids"] = ids
+        state_data["selected_driver_names"] = names
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    elif data.startswith("selsrc_"):
+        source_id = data.replace("selsrc_", "")
+        source = db.get_contact_info_source_by_id(source_id)
+        label = source.get("label", "") if source else ""
+        state_data["selected_source_label"] = label
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
     return STATE_AI_REVIEW
 
 
@@ -2198,9 +2709,12 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
             await query.message.reply_text("❌ Lead data not found. Please start over with /start")
             return ConversationHandler.END
         context.user_data.pop("phase1_recent_edits", None)
-        await query.message.reply_text(
-            _format_phase1_ai_review_text(state["data"]),
-            reply_markup=_phase1_review_keyboard(),
+        # Restore the review keyboard with current selections
+        await _edit_message_keyboard(
+            context,
+            context.user_data.get("review_chat_id"),
+            context.user_data.get("review_message_id"),
+            _build_review_keyboard_with_selections(state["data"]),
         )
         return STATE_AI_REVIEW
     if not query.data.startswith("ph1edit_"):
@@ -2361,6 +2875,17 @@ async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAU
     else:
         context.user_data.pop("vin_choice_api_car", None)
         context.user_data.pop("vin_choice_stated_car", None)
+        
+    vin_msg_id = context.user_data.pop("vin_conflict_msg_id", None)
+    if vin_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=vin_msg_id)
+        except:
+            pass
+    # re-fetch state and update review
+    state = db.get_user_state(user_id)
+    if state and state.get("data"):
+        await _update_review_message_text(context, state["data"])
     return await _ask_add_files(query.message, context)
 
 
@@ -2569,6 +3094,19 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     )
 
     phase1_data = {k: v for k, v in state_data.items() if k not in _PHASE1_STATE_EXCLUDE}
+    phase1_data["vehicle_details"] = "\n".join([
+    phase1_data.get("name", "-"),
+    phase1_data.get("address", "-"),
+    phase1_data.get("city_state_zip", "-"),
+    phase1_data.get("delivery_address", "-"),
+    phase1_data.get("delivery_city_state_zip", "-"),
+    phase1_data.get("vin", "-"),
+    phase1_data.get("car", "-"),
+    phase1_data.get("color", "-"),
+    phase1_data.get("insurance_company", "-"),
+    phase1_data.get("insurance_policy_number", "-"),
+    phase1_data.get("extra_info", "-"),
+])
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": username,
@@ -2622,6 +3160,104 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     )
     return STATE_SELECT_DRIVER
 
+async def _submit_lead_from_review(message, context, user_id, data):
+    phone = data.pop("pending_phone_number", None)
+    price = data.pop("pending_price", None)
+    if not phone or not price:
+        await message.reply_text("❌ Missing phone/price. Start over.")
+        return ConversationHandler.END
+
+    group_id = data.get("selected_group_id")
+    group = db.get_group_by_id(group_id) if group_id else None
+    if not group:
+        await message.reply_text("❌ No group selected. Please select a group in the review screen.")
+        return STATE_AI_REVIEW
+
+    # Encrypt
+    enc = await asyncio.to_thread(ots.encrypt_phone, phone)
+    if not enc:
+        await message.reply_text("❌ Encryption failed.")
+        return ConversationHandler.END
+
+    ref_id = generate_reference_id()
+    username = data.get("username", "Unknown")
+
+    # Build vehicle_details as 11 lines
+    vd = "\n".join([
+        data.get("name", "-"), data.get("address", "-"), data.get("city_state_zip", "-"),
+        data.get("delivery_address", "-"), data.get("delivery_city_state_zip", "-"),
+        data.get("vin", "-"), data.get("car", "-"), data.get("color", "-"),
+        data.get("insurance_company", "-"), data.get("insurance_policy_number", "-"),
+        data.get("extra_info", "-"),
+    ])
+
+    lead = db.create_lead({
+        "user_id": user_id, "telegram_username": username,
+        "vehicle_details": vd,
+        "delivery_details": data.get("delivery_details", ""),
+        "phone_number": phone, "price": price,
+        "encrypted_link": enc.get("link"),
+        "onetimesecret_token": enc.get("secret_key"),
+        "onetimesecret_secret_key": enc.get("metadata_key"),
+        "reference_id": ref_id, "group_id": group_id,
+        "extra_info": data.get("extra_info", ""),
+        "special_request_issuers": data.get("special_request_issuers", ""),
+        "special_request_drivers": data.get("special_request_drivers", ""),
+        "contact_info_source": data.get("selected_source_label", ""),
+        "phase1_attached_files": data.get("attached_files") or [],
+    })
+    if not lead:
+        await message.reply_text("❌ Could not save lead.")
+        return ConversationHandler.END
+
+    # Dispatch to drivers
+    driver_ids = data.get("selected_driver_ids", [])
+    drivers_list = [d for d in _get_all_drivers_cached() if str(d.get("id")) in driver_ids]
+    def _safe(s: str) -> str:
+        return _sanitize_phones_for_send(s or "") or "-"
+
+    vin_only = (data.get("vin") or "").strip() or "-"
+    car_only = (data.get("car") or "").strip() or "-"
+    name_line_safe = _safe(data.get("name"))
+    vehicle_lines_display = [
+        _safe(data.get("address")),
+        _safe(data.get("city_state_zip")),
+        vin_only,
+        car_only,
+        _safe(data.get("color")),
+        _safe(data.get("insurance_company")),
+        _safe(data.get("insurance_policy_number")),
+        _safe(data.get("extra_info")),
+    ]
+    issuer_note = data.get("special_request_issuers") or ""
+    if issuer_note.strip():
+        vehicle_lines_display.append(_safe("📝 " + issuer_note))
+    else:
+        vehicle_lines_display.append("📝 No")
+    vehicle_safe = f"🚗 Vehicle: {name_line_safe}\n" + "\n".join(vehicle_lines_display)
+    extra_safe = _sanitize_phones_for_send(data.get('extra_info', '') or '')
+    asyncio.create_task(_background_dispatch_lead_after_driver_pick(
+        context, issuer_notify_chat_id=user_id, user_id=user_id, username=username,
+        lead=lead, lead_data=data, phase1_data=data, selected_drivers=drivers_list,
+        selected_group=group, skip_duplicate_full_group_post=False, phone_number=phone,
+        price=price, encrypted_data=enc, reference_id=ref_id,
+        issuer_note_disp=data.get("special_request_issuers", ""),
+        driver_note_disp=data.get("special_request_drivers", ""),
+        group_id=group_id, vehicle_safe=vehicle_safe, extra_safe=extra_safe,
+        driver_names=",".join(d.get("driver_name") for d in drivers_list)
+    ))
+
+    # Send group approval (full lead HTML)
+    await _post_single_group_approval(context, lead, group)
+
+    db.clear_user_state(user_id)
+    context.user_data.pop("phase1_attached_files", None)
+    context.user_data.pop("review_message_id", None)
+    await message.reply_text(
+        f"✅ **Lead created & sent!**\n📋 Reference: `{ref_id}`\n\nUse /lead to add another.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
 
 async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle group selection when assistants_choose_group is on; then show driver picker."""
@@ -2831,6 +3467,19 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
+    phase1_data["vehicle_details"] = "\n".join([
+    phase1_data.get("name", "-"),
+    phase1_data.get("address", "-"),
+    phase1_data.get("city_state_zip", "-"),
+    phase1_data.get("delivery_address", "-"),
+    phase1_data.get("delivery_city_state_zip", "-"),
+    phase1_data.get("vin", "-"),
+    phase1_data.get("car", "-"),
+    phase1_data.get("color", "-"),
+    phase1_data.get("insurance_company", "-"),
+    phase1_data.get("insurance_policy_number", "-"),
+    phase1_data.get("extra_info", "-"),
+    ])
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": (query.from_user.username or "Unknown"),
@@ -2941,6 +3590,19 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         )
     
     phase1_data = {k: v for k, v in lead_data.items() if k not in _PHASE1_STATE_EXCLUDE}
+    phase1_data["vehicle_details"] = "\n".join([
+    phase1_data.get("name", "-"),
+    phase1_data.get("address", "-"),
+    phase1_data.get("city_state_zip", "-"),
+    phase1_data.get("delivery_address", "-"),
+    phase1_data.get("delivery_city_state_zip", "-"),
+    phase1_data.get("vin", "-"),
+    phase1_data.get("car", "-"),
+    phase1_data.get("color", "-"),
+    phase1_data.get("insurance_company", "-"),
+    phase1_data.get("insurance_policy_number", "-"),
+    phase1_data.get("extra_info", "-"),
+    ])
     phone_number = lead_data.get('phone_number')
     price = lead_data.get('price')
     encrypted_data = lead_data.get('encrypted_data', {})
@@ -5582,7 +6244,10 @@ def main():
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
             ],
             STATE_AI_REVIEW: [
-                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=f"^({PH1_REVIEW_ACCEPT}|{PH1_REVIEW_EDIT})$"),
+                CallbackQueryHandler(
+                    handle_phase1_ai_review_callback,
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                ),
             ],
             STATE_AI_EDIT_MENU: [
                 CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1edit_[a-z]+)$"),
@@ -5593,6 +6258,10 @@ def main():
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
                 ),
+            ],
+            STATE_EDIT_FIELD_PROMPT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
+                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
             STATE_ADD_FILES: [
@@ -5902,4 +6571,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
