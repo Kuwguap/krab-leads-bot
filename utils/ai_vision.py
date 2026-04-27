@@ -30,17 +30,18 @@ class AIVisionQuotaError(Exception):
     pass
 
 # Expected output: exactly 11 lines in this order (used by parse_phase1_structured)
-STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details from an image or PDF page (screenshot, scan, or form).
+STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details, plus the client's phone number and price, from an image or PDF page (screenshot, scan, or form).
 
 STRICT RULES:
-- Output ONLY a plain text block with exactly 11 lines. One line per field—nothing else on that line.
-- Each line must contain ONLY the value for that field. No phone numbers in any line (phone is collected separately later). No URLs, no extra text.
+- Output ONLY a plain text block with exactly 15 lines. One line per field—nothing else on that line.
+- Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
 - Line 8 (Color): ONLY the vehicle color. DMV/registration forms often show exactly THREE letters (e.g. GRY=gray, BLK=black, WHT=white, SIL=silver). Copy those three letters exactly in UPPERCASE—never drop a letter (wrong: GY; correct: GRY). Full words like Silver or Black are fine. If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
 - If a value is missing or unreadable, put a single dash "-" for that line.
+- Lines 12-15 must contain the phone number, price, and any special notes, each on its own line with the exact labels shown below. If a value is not visible, put a single dash "-".
 
-Order (one value per line, no labels):
+Order and labels (one value per line, no extra text):
 1) Full Name
 2) Registration Address (street only)
 3) Registration City, State, ZIP
@@ -52,6 +53,13 @@ Order (one value per line, no labels):
 9) Insurance company
 10) Insurance policy number
 11) Delivery Date/Time and any extra info
+12) Phone: <phone number>  (e.g. Phone: +1234567890)
+13) Price: <price>  (e.g. Price: $250)
+14) Issuer note: <note or ->  (e.g. Issuer note: Please double-check VIN)
+15) Driver note: <note or ->  (e.g. Driver note: Call before arrival)
+
+- For City, State, ZIP: use the standard two‑letter state abbreviation (e.g., "NY" not "New York"). Format as "City, ST 12345" (no extra comma before ZIP). Correct obvious misspellings only if you are certain (e.g., "Laurelton" not "Laurenton"). If you see a separate ZIP code line, merge it into the City line.
+- For addresses: capitalise as appropriate, but do not invent missing parts.
 
 Example (replace with actual values):
 John Doe
@@ -65,21 +73,26 @@ Silver
 State Farm
 123-456-789
 Tomorrow 2pm, gate code 1234
+Phone: +1234567890
+Price: $150
+Issuer note: -
+Driver note: Ring the bell
 
-Output nothing else—no explanation, no markdown, no line numbers. Only these 11 lines."""
+Output nothing else—no explanation, no markdown, no line numbers. Only these 15 lines."""
 
 # For freeform text: user can send any format; we ask the model to identify and rearrange into 11 lines
-TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc.
+TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc. It also includes a phone number, a price (maybe with a $ sign), and possibly two notes (one for the tag issuer, one for the driver).
 
 STRICT RULES:
-- Output ONLY a plain text block with exactly 11 lines. One line per field—nothing else on that line.
-- Each line must contain ONLY the value for that field. Do NOT put phone numbers in any of these 11 lines (phone is collected separately). No URLs. No extra text.
-- Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
-- Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else on that line.
-- Line 8 (Color): ONLY the vehicle color. Forms often use three-letter codes (GRY, BLK, WHT, SIL, etc.)—output exactly three letters when shown, never truncate to two. Full color names like Silver or Black are fine. If the user did NOT state a color, use "-". Never put city names (e.g. Brick, Jersey), addresses, or insurance names in the color field.
+- Output ONLY a plain text block with exactly 15 lines. One line per field—nothing else on that line.
+- Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
+- Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing.
+- Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
+- Line 8 (Color): ONLY the vehicle color. Three-letter DMV codes (GRY, BLK, etc.) are fine. If missing, use "-". Never put city names, addresses, or insurance names in color.
 - If something is missing, put a single dash "-" for that line.
+- Lines 12-15 must contain the phone number, price, and any notes, each with the labels exactly as shown below. If a value is not present, put a single dash "-".
 
-Order of the 11 lines (one value per line, no labels):
+Order (one value per line, with labels for lines 12-15):
 1) Full Name
 2) Registration Address (street only)
 3) Registration City, State, ZIP
@@ -91,8 +104,15 @@ Order of the 11 lines (one value per line, no labels):
 9) Insurance company
 10) Insurance policy number
 11) Delivery Date/Time and any extra info
+12) Phone: <phone number>  (e.g. Phone: +1234567890)
+13) Price: <price>  (e.g. Price: $250)
+14) Issuer note: <note or ->  (e.g. Issuer note: Please double-check VIN)
+15) Driver note: <note or ->  (e.g. Driver note: Call before arrival)
 
-Output nothing else—no explanation, no markdown, no line numbers. Only these 11 lines.
+- For City, State, ZIP: use the standard two‑letter state abbreviation (e.g., "NY" not "New York"). Format as "City, ST 12345". Correct obvious misspellings only if you are certain.
+- For addresses: capitalise appropriately, but do not invent missing parts.
+
+Output nothing else—no explanation, no markdown, no line numbers. Only these 15 lines.
 
 User message:
 """
